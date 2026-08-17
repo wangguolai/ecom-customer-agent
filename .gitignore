@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Qdrant 本地向量库（生成产物，可随时重建）
+data/qdrant/
+
+# 环境变量
+.env
+
+# IDE
+.vscode/
