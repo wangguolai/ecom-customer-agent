@@ -36,22 +36,26 @@ def build_knowledge_base():
     # 3. 向量化
     vectors = embed_texts(chunks)
 
-    # 4. 造 payload（每个商品块 → dict）
+    # 4. 造 payload（每个商品块 → dict，含 category 供过滤检索）
     payloads = []
     for i, chunk in enumerate(chunks):
         m = re.match(r"## (.+)", chunk)
         title = m.group(1).strip() if m else "products"
+        cm = re.search(r"类别：(\S+)", chunk)
+        category = cm.group(1).strip() if cm else ""
         payloads.append({
             "chunk_id": f"products:{i}",
             "text": chunk,
             "title": title,
+            "category": category,
             "source_file": "products.md",
             "chunk_index": i,
         })
 
-    # 5. 写入 Qdrant
+    # 5. 写入 Qdrant（先删旧数据再写入，保证幂等、清残留）
     store = QdrantStore()
     store.ensure_collections()
+    store.delete_by_source("product_knowledge", "products.md")
     store.upsert_knowledge(payloads, vectors)
 
     info = store.collection_info("product_knowledge")

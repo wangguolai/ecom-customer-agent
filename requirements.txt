@@ -1,0 +1,6 @@
+openai
+qdrant-client
+sentence-transformers
+python-dotenv
+jieba
+rank-bm25

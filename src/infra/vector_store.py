@@ -1,23 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Qdrant 向量存储 —— 本地文件模式，3 个 Collection
+"""Qdrant 向量存储 —— 本地文件模式，电商客服商品知识库 RAG
 
 Collection:
-  scene_experiences  — 历史场景→提示词语义检索
-  knowledge_base     — references/ 参考文档 RAG
-  failure_patterns   — 失败模式语义匹配
+  product_knowledge  — 商品知识库（products.md 分块后的商品语义检索）
 
 用法：
-  store = QdrantStore("guolaimokaStudio/qdrant_data")
+  store = QdrantStore()          # 默认 data/qdrant/
   store.ensure_collections()
-  store.upsert_scenes(payloads, vectors)
-  results = store.search_scenes(query_vec, limit=5)
+  store.upsert_knowledge(payloads, vectors)
+  results = store.search_knowledge(query_vec, limit=5)
 """
 
 import sys
 import os
 import uuid
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 # 确保项目根目录在 Python 路径中
@@ -31,7 +29,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 COLLECTIONS = {
     "product_knowledge": {
         "description": "宠物商品知识库 RAG",
-        "payload_schema": ["chunk_id", "text", "title", "source_file", "category", "chunk_index"],
+        "payload_schema": ["chunk_id", "text", "title", "category", "source_file", "chunk_index"],
     },
 }
 
@@ -41,6 +39,15 @@ class SearchHit:
     """单条搜索结果"""
     score: float
     payload: dict
+
+
+# 稳定 point id 的命名空间（固定值，保证 chunk_id → UUID 映射稳定可复现）
+_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "ecom-customer-agent:product_knowledge")
+
+
+def _point_id(chunk_id: str) -> str:
+    """由 chunk_id 生成确定性 UUID —— 同一条内容永远得到同一个 id，upsert 时覆盖旧向量（幂等）"""
+    return str(uuid.uuid5(_ID_NAMESPACE, chunk_id))
 
 
 class QdrantStore:
@@ -86,7 +93,7 @@ class QdrantStore:
         }
 
     def delete_by_source(self, collection: str, source_file: str):
-        """按 source_file 删除指定文件的所有分块向量"""
+        """按 source_file 删除指定文件的所有分块向量（重建索引前清空旧数据用）"""
         from qdrant_client.models import Filter, FieldCondition, MatchValue
         self._client.delete(
             collection_name=collection,
@@ -95,133 +102,21 @@ class QdrantStore:
             ),
         )
 
-    def get_source_mtimes(self, collection: str) -> dict:
-        """获取 collection 中每个 source_file 的 file_mtime 映射
-
-        Returns:
-            {source_file: file_mtime}
-        """
-        if not self._client.collection_exists(collection):
-            return {}
-        mtimes = {}
-        offset = None
-        while True:
-            points, next_offset = self._client.scroll(
-                collection_name=collection, limit=100, offset=offset,
-                with_payload=["source_file", "file_mtime"],
-            )
-            for p in points:
-                if p.payload and "source_file" in p.payload:
-                    src = p.payload["source_file"]
-                    if src not in mtimes:
-                        mtimes[src] = p.payload.get("file_mtime", 0)
-            if next_offset is None:
-                break
-            offset = next_offset
-        return mtimes
-
     def drop_collection(self, name: str):
         """删除 Collection（调试用）"""
         self._client.delete_collection(name)
 
-    # ── 分层检索 ────────────────────────────────────────────
-
-    def search_with_tiers(
-        self,
-        collection: str,
-        query_vector: list[float],
-        limit: int = 5,
-        series_name: str = None,
-        category: str = None,
-    ) -> dict:
-        """分层检索——高置信度 (>0.6) + 低置信度 (0.5-0.6)
-
-        Returns:
-            {"high": [...], "low": [...]}
-        """
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-
-        query_filter = None
-        conditions = []
-        if series_name:
-            conditions.append(FieldCondition(key="series_name", match=MatchValue(value=series_name)))
-        if category:
-            conditions.append(FieldCondition(key="category", match=MatchValue(value=category)))
-        if conditions:
-            query_filter = Filter(must=conditions)
-
-        # 一次查询拿全部，再分层
-        results = self._client.query_points(
-            collection_name=collection,
-            query=query_vector,
-            query_filter=query_filter,
-            limit=limit * 2,  # 多拿一倍，确保每层都有
-            score_threshold=0.5,
-        )
-
-        high = [SearchHit(score=r.score, payload=r.payload) for r in results.points if r.score > 0.6]
-        low = [SearchHit(score=r.score, payload=r.payload) for r in results.points if 0.5 <= r.score <= 0.6]
-
-        return {"high": high[:limit], "low": low[:limit]}
-
-    # ── 场景经验 CRUD ────────────────────────────────────────
-
-    def upsert_scenes(self, payloads: list[dict], vectors: list[list[float]]):
-        """批量写入场景经验
-
-        Args:
-            payloads: 每条含 scene_id, description, characters, felt_intent 等
-            vectors: 对应向量列表，长度需与 payloads 一致
-        """
-        from qdrant_client.models import PointStruct
-
-        points = []
-        for i, (p, v) in enumerate(zip(payloads, vectors)):
-            point_id = str(uuid.uuid4())
-            points.append(PointStruct(id=point_id, vector=v, payload=p))
-
-        self._client.upsert(collection_name="scene_experiences", points=points)
-
-    def search_scenes(
-        self,
-        query_vector: list[float],
-        series_name: str = None,
-        limit: int = 5,
-        score_threshold: float = 0.5,
-    ) -> list[SearchHit]:
-        """语义搜索场景经验
-
-        score 含义（BGE normalize 后）：
-          > 0.6  语义相关，直接使用
-          0.5-0.6 边缘相关，低置信度
-          < 0.5  不相关，已丢弃（score_threshold=0.5）
-        """
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-
-        query_filter = None
-        if series_name:
-            query_filter = Filter(
-                must=[FieldCondition(key="series_name", match=MatchValue(value=series_name))]
-            )
-
-        results = self._client.query_points(
-            collection_name="scene_experiences",
-            query=query_vector,
-            query_filter=query_filter,
-            limit=limit,
-            score_threshold=score_threshold,
-        )
-        return [SearchHit(score=r.score, payload=r.payload) for r in results.points]
-
     # ── 知识库 CRUD ──────────────────────────────────────────
 
     def upsert_knowledge(self, payloads: list[dict], vectors: list[list[float]]):
-        """批量写入知识库块"""
+        """批量写入商品知识库块（用 payload 的 chunk_id 作 point id，同 id 覆盖，保证幂等）"""
         from qdrant_client.models import PointStruct
 
         points = []
         for i, (p, v) in enumerate(zip(payloads, vectors)):
-            point_id = str(uuid.uuid4())
+            # 稳定 id：由 chunk_id 生成确定性 UUID，重复写入覆盖旧向量（幂等）
+            chunk_id = p.get("chunk_id")
+            point_id = _point_id(chunk_id) if chunk_id else str(uuid.uuid4())
             points.append(PointStruct(id=point_id, vector=v, payload=p))
 
         self._client.upsert(collection_name="product_knowledge", points=points)
@@ -231,9 +126,9 @@ class QdrantStore:
         query_vector: list[float],
         category: str = None,
         limit: int = 5,
-        score_threshold: float = 0.5,
+        score_threshold: Optional[float] = 0.5,
     ) -> list[SearchHit]:
-        """语义搜索知识库"""
+        """语义搜索商品知识库，可按 category 过滤"""
         from qdrant_client.models import Filter, FieldCondition, MatchValue
 
         query_filter = None
@@ -242,52 +137,38 @@ class QdrantStore:
                 must=[FieldCondition(key="category", match=MatchValue(value=category))]
             )
 
+        # score_threshold=None 时不过滤（混合检索需要全量返回，保证排名对称）
+        kwargs = {}
+        if score_threshold is not None:
+            kwargs["score_threshold"] = score_threshold
         results = self._client.query_points(
             collection_name="product_knowledge",
             query=query_vector,
             query_filter=query_filter,
             limit=limit,
-            score_threshold=score_threshold,
+            **kwargs,
         )
         return [SearchHit(score=r.score, payload=r.payload) for r in results.points]
 
-    # ── 失败模式 CRUD ────────────────────────────────────────
-
-    def upsert_failures(self, payloads: list[dict], vectors: list[list[float]]):
-        """批量写入失败模式"""
-        from qdrant_client.models import PointStruct
-
-        points = []
-        for i, (p, v) in enumerate(zip(payloads, vectors)):
-            point_id = str(uuid.uuid4())
-            points.append(PointStruct(id=point_id, vector=v, payload=p))
-
-        self._client.upsert(collection_name="failure_patterns", points=points)
-
-    def search_failures(
-        self,
-        query_vector: list[float],
-        series_name: str = None,
-        limit: int = 5,
-        score_threshold: float = 0.5,
-    ) -> list[SearchHit]:
-        """语义搜索失败模式"""
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-
-        query_filter = None
-        if series_name:
-            query_filter = Filter(
-                must=[FieldCondition(key="series_name", match=MatchValue(value=series_name))]
+    def scroll_all(self, collection: str = "product_knowledge") -> list:
+        """scroll 出所有 chunk 的 (chunk_id, text)，用于 BM25 建索引"""
+        results = []
+        offset = None
+        while True:
+            points, next_offset = self._client.scroll(
+                collection_name=collection, limit=100, offset=offset,
+                with_payload=["chunk_id", "text"],
             )
-
-        results = self._client.query_points(
-            collection_name="failure_patterns",
-            query=query_vector,
-            query_filter=query_filter,
-            limit=limit,
-            score_threshold=score_threshold,
-        )
-        return [SearchHit(score=r.score, payload=r.payload) for r in results.points]
+            for p in points:
+                if p.payload:
+                    cid = p.payload.get("chunk_id")
+                    text = p.payload.get("text")
+                    if cid and text:  # 过滤缺失字段，避免 None 混入下游分词
+                        results.append((cid, text))
+            if next_offset is None:
+                break
+            offset = next_offset
+        return results
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -295,7 +176,7 @@ class QdrantStore:
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    from src.memory.embedding import get_embedding_model, embed_texts
+    from src.infra.embedding import get_embedding_model, embed_texts
 
     print("=" * 50)
     print("Qdrant 向量存储自测")
@@ -303,43 +184,47 @@ if __name__ == "__main__":
 
     # 1. 加载模型 + 初始化 Qdrant
     model = get_embedding_model()
-    store = QdrantStore("guolaimokaStudio/qdrant_data")
+    store = QdrantStore()
     store.ensure_collections(vector_size=512)
 
-    # 2. 写入测试数据
+    # 2. 写入测试数据（source_file 用 test.md，与正式 products.md 隔离）
     texts = [
-        "橘猫在窗台上晒太阳，眯着眼睛打盹",
-        "美短追着激光笔的光点满屋子跑",
+        "幼犬成长粮（贝乐牌），鸡肉糙米配方，2-12 月龄幼犬适用",
+        "猫薄荷玩具球，内置猫薄荷，吸引猫咪玩耍",
     ]
     vecs = embed_texts(texts)
 
-    store.upsert_scenes(
+    store.upsert_knowledge(
         payloads=[
-            {"scene_id": 1, "description": texts[0], "characters": ["过来"],
-             "felt_intent": "满足放松", "series_name": "work_diary"},
-            {"scene_id": 2, "description": texts[1], "characters": ["摩卡"],
-             "felt_intent": "兴奋好奇", "series_name": "work_diary"},
+            {"chunk_id": "test:0", "text": texts[0], "title": "幼犬成长粮",
+             "category": "狗粮", "source_file": "test.md", "chunk_index": 0},
+            {"chunk_id": "test:1", "text": texts[1], "title": "猫薄荷玩具球",
+             "category": "玩具", "source_file": "test.md", "chunk_index": 1},
         ],
         vectors=vecs,
     )
     print(f"  ✅ 写入 {len(texts)} 条测试数据")
 
     # 3. 语义搜索
-    query = "猫咪在阳光下睡觉"
+    query = "小狗吃什么粮"
     query_vec = model.encode(query, normalize_embeddings=True).tolist()
-    results = store.search_scenes(query_vec, series_name="work_diary", limit=2)
+    results = store.search_knowledge(query_vec, limit=2)
 
-    print(f"\n  🔍 查询: \"{query}\"")
+    print(f'\n  🔍 查询: "{query}"')
     for i, r in enumerate(results):
-        desc = r.payload.get("description", "")[:60]
-        chars = ", ".join(r.payload.get("characters", []))
-        print(f"     {i+1}. (score={r.score:.3f}) [{chars}] {desc}")
+        title = r.payload.get("title", "")
+        category = r.payload.get("category", "")
+        print(f"     {i+1}. (score={r.score:.3f}) [{category}] {title}")
 
-    # 4. Collection 状态
-    print(f"\n  📊 Collections:")
+    # 4. 清理测试数据
+    store.delete_by_source("product_knowledge", "test.md")
+    print("\n  🧹 已清理测试数据")
+
+    # 5. Collection 状态
+    print("\n  📊 Collections:")
     for name in COLLECTIONS:
         info = store.collection_info(name)
         print(f"     {name}: {info['points_count']} points")
 
-    print(f"\n  ✅ Qdrant 向量存储正常")
+    print("\n  ✅ Qdrant 向量存储正常")
     print(f"  数据目录: {store._path.resolve()}")
