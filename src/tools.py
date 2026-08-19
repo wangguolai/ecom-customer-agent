@@ -195,12 +195,43 @@ def _get_hybrid_retriever():
     return _hybrid_retriever
 
 
+# 类别关键词表（意图识别 → category 映射；识别不出返回 None，不过滤保召回）
+CATEGORY_KEYWORDS = {
+    "猫粮": ["猫粮", "幼猫", "成猫", "奶糕", "美毛", "泌尿", "牛磺酸", "老年猫", "布偶", "英短"],
+    "狗粮": ["狗粮", "幼犬", "成犬", "骨骼", "钙磷", "老年犬", "大型犬", "小型犬"],
+    "猫砂": ["猫砂", "结团", "除臭", "膨润土", "松木", "水晶"],
+    "零食": ["零食", "冻干", "磨牙棒", "洁齿", "化毛膏", "猫条", "训练饼干"],
+    "玩具": ["玩具", "猫薄荷", "橡胶球", "飞盘", "逗猫棒", "猫抓板", "漏食球"],
+    "用品": ["饮水机", "航空箱", "梳毛", "牵引绳", "猫窝", "狗窝", "猫爬架", "食盆"],
+}
+
+
+def detect_category(query: str):
+    """从 query 提取明确类别；多类别并列或识别不出返回 None（不过滤，保召回）"""
+    best_cat = None
+    best_count = 0
+    tie = False
+    for cat, words in CATEGORY_KEYWORDS.items():
+        count = sum(1 for w in words if w in query)
+        if count > best_count:
+            best_cat = cat
+            best_count = count
+            tie = False
+        elif count == best_count and count > 0:
+            tie = True
+    # 并列（多个类别同样命中数）或没命中 → 不明确，不过滤
+    if tie or best_count == 0:
+        return None
+    return best_cat
+
+
 def search_products(query: str, top_k: int = 3) -> str:
-    """商品知识库检索（RAG）——混合检索（BM25 + 向量 + RRF）"""
-    results = _get_hybrid_retriever().search(query, top_k=top_k)
+    """商品知识库检索（RAG）——混合检索 + category 预过滤（锁类别优先）"""
+    category = detect_category(query)
+    results = _get_hybrid_retriever().search(query, top_k=top_k, category=category)
 
     if not results:
-        return "未在知识库中查到相关商品。"
+        return "知识库检索无高置信度匹配。请如实告知用户暂未找到相关信息、可建议联系人工客服，不要编造商品信息。"
 
     parts = []
     for i, (cid, score, text) in enumerate(results, 1):
