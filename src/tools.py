@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
-"""工具定义 —— 5 个工具的 Function Calling schema + mock 数据 + 执行函数
+"""工具定义 —— 7 个工具的 Function Calling schema + 执行函数
 
 工具列表（来自 REQUIREMENTS.md）：
+  search_products   商品知识库检索（只读，RAG）
   search_orders     订单查询（只读）
   search_logistics  物流追踪（只读）
   check_stock       库存查询（只读，含价格）
   get_return_policy 退货政策（只读）
+  refund_order      退款申请（写，待人工审批）
   transfer_to_human 转人工（写，demo 阶段无权限开关）
 """
 
 import sys
 import os
 import uuid
+from urllib.parse import quote
+
+import requests
 
 # 确保项目根目录在 Python 路径中
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -93,6 +98,21 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "refund_order",
+            "description": "为订单申请退款（写操作：只生成待人工审批的工单，不直接退款，需提供订单号和退款金额）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {"type": "string", "description": "订单号，如 20240818001"},
+                    "amount": {"type": "number", "description": "退款金额（元）"}
+                },
+                "required": ["order_id", "amount"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "transfer_to_human",
             "description": "把问题转给人工客服，生成工单",
             "parameters": {
@@ -111,26 +131,10 @@ TOOL_SCHEMAS = [
 # mock 数据（订单/物流/库存没有真实数据源，先用内存 mock）
 # ═══════════════════════════════════════════════════════════════
 
-MOCK_ORDERS = {
-    "20240818001": {"状态": "已发货", "下单时间": "2024-08-18 10:23", "商品": "幼犬成长粮（贝乐牌）1.5kg", "金额": "¥89"},
-    "20240817002": {"状态": "待付款", "下单时间": "2024-08-17 15:40", "商品": "豆腐猫砂 6L", "金额": "¥32"},
-    "20240816003": {"状态": "已完成", "下单时间": "2024-08-16 09:12", "商品": "猫薄荷玩具球", "金额": "¥19"},
-}
-
-MOCK_LOGISTICS = {
-    "20240818001": [
-        {"时间": "2024-08-18 12:00", "地点": "杭州分拨中心", "状态": "已揽收"},
-        {"时间": "2024-08-18 18:30", "地点": "杭州转运中心", "状态": "运输中"},
-        {"时间": "2024-08-19 08:00", "地点": "上海转运中心", "状态": "派送中"},
-    ],
-}
-
-MOCK_STOCK = {
-    "幼犬成长粮": {"库存": 120, "价格": "¥89 / ¥219"},
-    "成犬均衡粮": {"库存": 80, "价格": "¥119 / ¥399"},
-    "猫薄荷玩具球": {"库存": 45, "价格": "¥19"},
-    "豆腐猫砂": {"库存": 0, "价格": "¥32"},
-}
+# 订单/物流/库存已迁到后端（src/backend/main.py 的 SQLite），工具走 HTTP 查询，不再是内存 mock。
+# 后端未启动/超时 → 工具返回友好错误，不静默降级（让失败可见，可以说明「真实工具的失败处理」）。
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+REQUEST_TIMEOUT = 2.0  # 秒
 
 RETURN_POLICY = (
     "退换货政策：\n"
@@ -146,30 +150,48 @@ RETURN_POLICY = (
 # ═══════════════════════════════════════════════════════════════
 
 def search_orders(order_id: str) -> str:
-    """订单查询"""
-    order = MOCK_ORDERS.get(order_id)
-    if order is None:
+    """订单查询（真实后端接口）"""
+    try:
+        resp = requests.get(f"{BACKEND_URL}/orders/{order_id}", timeout=REQUEST_TIMEOUT)
+    except (requests.ConnectionError, requests.Timeout):
+        return "订单查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
+    if resp.status_code == 404:
         return f"未查到订单号 {order_id}，请核对订单号。"
-    return f"订单 {order_id}：状态={order['状态']}，商品={order['商品']}，金额={order['金额']}，下单时间={order['下单时间']}"
+    if resp.status_code != 200:
+        return f"订单查询失败（状态码 {resp.status_code}），请稍后重试。"
+    d = resp.json()
+    return f"订单 {d['order_id']}：状态={d['status']}，商品={d['product']}，金额={d['amount']}，下单时间={d['created_at']}"
 
 
 def search_logistics(order_id: str) -> str:
-    """物流追踪"""
-    traces = MOCK_LOGISTICS.get(order_id)
-    if traces is None:
+    """物流追踪（真实后端接口）"""
+    try:
+        resp = requests.get(f"{BACKEND_URL}/logistics/{order_id}", timeout=REQUEST_TIMEOUT)
+    except (requests.ConnectionError, requests.Timeout):
+        return "物流查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
+    if resp.status_code == 404:
         return f"未查到订单号 {order_id} 的物流信息。"
-    lines = [f"{t['时间']} {t['地点']} {t['状态']}" for t in traces]
+    if resp.status_code != 200:
+        return f"物流查询失败（状态码 {resp.status_code}），请稍后重试。"
+    d = resp.json()
+    lines = [f"{t['time']} {t['location']} {t['status']}" for t in d["traces"]]
     return "物流轨迹：\n" + "\n".join(lines)
 
 
 def check_stock(product_name: str) -> str:
-    """库存查询（含价格）"""
-    item = MOCK_STOCK.get(product_name)
-    if item is None:
+    """库存查询（真实后端接口，含价格）"""
+    try:
+        resp = requests.get(f"{BACKEND_URL}/stock/{quote(product_name)}", timeout=REQUEST_TIMEOUT)
+    except (requests.ConnectionError, requests.Timeout):
+        return "库存查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
+    if resp.status_code == 404:
         return f"未查到商品「{product_name}」，请确认商品名。"
-    if item["库存"] <= 0:
-        return f"「{product_name}」暂时缺货，价格 {item['价格']}。"
-    return f"「{product_name}」有货，库存 {item['库存']} 件，价格 {item['价格']}。"
+    if resp.status_code != 200:
+        return f"库存查询失败（状态码 {resp.status_code}），请稍后重试。"
+    d = resp.json()
+    if d["qty"] <= 0:
+        return f"「{product_name}」暂时缺货，价格 {d['price']}。"
+    return f"「{product_name}」有货，库存 {d['qty']} 件，价格 {d['price']}。"
 
 
 def get_return_policy() -> str:
@@ -181,6 +203,37 @@ def transfer_to_human(problem: str) -> str:
     """转人工（生成工单）"""
     ticket_id = f"TK{uuid.uuid4().hex[:8].upper()}"
     return f"已为您创建工单 {ticket_id}，人工客服将尽快联系您。问题：{problem}"
+
+
+# 写工具集合（代码级标记：写操作要过权限门槛，读工具随便调）
+# Prompt Injection 防线之一：读/写分离，写工具的行为在代码层被约束，不随 LLM 意图走
+WRITE_TOOLS = {"refund_order", "transfer_to_human"}
+
+
+def refund_order(order_id: str, amount: float) -> str:
+    """退款（写工具，代码级防御：只提交「待人工审批」工单，不直接退款）。
+
+    关键：LLM 只有「建议权」（提交退款申请），没有「执行权」（真正退款在人工审批）。
+    Prompt Injection 诱导 LLM 调 refund，最多生成一个待审批工单，金额非法会被后端参数校验拦下。
+    """
+    try:
+        resp = requests.post(
+            f"{BACKEND_URL}/refund",
+            json={"order_id": order_id, "amount": amount},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except (requests.ConnectionError, requests.Timeout):
+        return "退款服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
+    if resp.status_code == 404:
+        return f"未查到订单 {order_id}，无法退款。"
+    if resp.status_code == 400:
+        return f"退款请求被拒绝：{resp.json().get('detail', '参数非法')}"
+    if resp.status_code != 200:
+        return f"退款失败（状态码 {resp.status_code}），请稍后重试。"
+    d = resp.json()
+    if d.get("duplicate"):
+        return f"退款工单已存在（{d['ticket_id']}），金额 ¥{d['amount']}，状态：{d['status']}。已去重，未重复创建。"
+    return f"已生成退款工单 {d['ticket_id']}，订单 {d['order_id']}，金额 ¥{d['amount']}，状态：{d['status']}。真正的退款需人工审批后执行。"
 
 
 _hybrid_retriever = None
@@ -225,19 +278,29 @@ def detect_category(query: str):
     return best_cat
 
 
-def search_products(query: str, top_k: int = 3) -> str:
-    """商品知识库检索（RAG）——混合检索 + category 预过滤（锁类别优先）"""
-    category = detect_category(query)
-    results = _get_hybrid_retriever().search(query, top_k=top_k, category=category)
+# 策略映射层（硬编码规则）：四维置信度 label → 给 LLM 的话术提示
+STRATEGY_HINTS = {
+    "双高": "检索高置信度命中，可直接推荐给用户（确定语气）。",
+    "单高一致": "检索中等置信度，用确认语气推荐（如「您是不是想要…」），并说明这是推测、可让用户确认。",
+    "单高冲突": "检索结果存在冲突，列出候选让用户选择，优先推荐第 1 条（精确词匹配那一路）。",
+}
 
-    if not results:
+
+def search_products(query: str, top_k: int = 3) -> str:
+    """商品知识库检索（RAG）——混合检索 + category 预过滤 + 四维置信度策略映射"""
+    category = detect_category(query)
+    label, results = _get_hybrid_retriever().search(query, top_k=top_k, category=category)
+
+    if label == "双低":
         return "知识库检索无高置信度匹配。请如实告知用户暂未找到相关信息、可建议联系人工客服，不要编造商品信息。"
 
     parts = []
     for i, (cid, score, text) in enumerate(results, 1):
         title = text.split("\n")[0].strip("# ").strip() if text else ""
         parts.append(f"[{i}] {title}\n{text}")
-    return "\n\n".join(parts)
+
+    # 策略提示（系统生成的受信任指令）+ 检索结果（外部数据），分开标注，不混进「数据/指令分离」的防御里
+    return f"[检索策略：{label}]\n{STRATEGY_HINTS[label]}\n\n" + "\n\n".join(parts)
 
 
 # 工具名白名单映射（幻觉工具校验 + 派发执行）
@@ -248,4 +311,5 @@ TOOL_MAP = {
     "check_stock": check_stock,
     "get_return_policy": get_return_policy,
     "transfer_to_human": transfer_to_human,
+    "refund_order": refund_order,
 }

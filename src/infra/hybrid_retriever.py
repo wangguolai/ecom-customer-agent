@@ -27,8 +27,19 @@ DEFAULT_TOP_K = 3
 RERANK_CANDIDATE_N = 20  # RRF 融合后先取这么多候选，交给 Rerank 精排
 VEC_SCORE_LOW = 0.4  # 召回层双低拒答：向量 top1 分数 < 此值且 BM25 无召回 → 判超知识库，拒答
 
-# 品牌名等专有名词加进 jieba 词典，避免被切成单字（如「贝乐牌」→「贝/乐/牌」）
-_CUSTOM_WORDS = ["贝乐牌", "优宠牌", "喵趣牌"]
+# 品牌名 + 品类词加进 jieba 词典，避免在 query 语境里被切成单字/错误切分，导致 BM25 跨类误匹配。
+# 依据：放进「我想买{词}」语境实测（不是单独测词——单独测会漏掉「化毛膏」这类单独完整、语境里碎成「买化/毛膏」的）。
+# 切成合理多词的（如「训练饼干」→训练/饼干）不补，两边 token 一致照样匹配。
+_CUSTOM_WORDS = [
+    # 品牌名
+    "贝乐牌", "优宠牌", "喵趣牌",
+    # 品类词（语境实测会碎）
+    "猫粮", "狗粮", "猫砂", "钙磷",
+    "磨牙棒", "猫薄荷", "逗猫棒", "猫抓板",
+    "猫窝", "猫爬架",
+    "老年猫", "老年犬", "小型犬",
+    "化毛膏", "洁齿", "猫条", "漏食球", "梳毛",
+]
 for _w in _CUSTOM_WORDS:
     jieba.add_word(_w)
 
@@ -54,9 +65,11 @@ class HybridRetriever:
         self._tokenized = [jieba.lcut(t) for t in self._chunk_texts]
         self._bm25 = BM25Okapi(self._tokenized)
 
-    def search(self, query: str, top_k: int = DEFAULT_TOP_K, category: str = None) -> list:
-        """混合检索，返回 [(chunk_id, score, text)]。
+    def search(self, query: str, top_k: int = DEFAULT_TOP_K, category: str = None):
+        """混合检索，返回 (label, results)。
 
+        label ∈ {'双高','单高一致','单高冲突','双低'} —— 四维置信度（判断层），上层据此做策略映射。
+        results = [(chunk_id, score, text)]，双低时为空列表。
         category 不为 None 时，向量 + BM25 都只在指定类别内检索（锁类别优先，避免跨类误命中）。
         注意：score 语义随路径变化——rerank 可用时是 sigmoid 概率(0-1)，降级时是 RRF 分数(~1/(60+rank))。
         下游只依赖相对排序，不要依赖 score 的绝对阈值。top_k 超出 RERANK_CANDIDATE_N 会被截断。
@@ -67,7 +80,8 @@ class HybridRetriever:
         hits = self._store.search_knowledge(q_vec, limit=20, score_threshold=None, category=category)
         vec_rank = {h.payload.get("chunk_id"): rank
                     for rank, h in enumerate(hits) if h.payload.get("chunk_id")}
-        vec_top1_score = hits[0].score if hits else 0.0  # 向量 top1 的 cosine 分数，供「双低拒答」判断
+        vec_top1_score = hits[0].score if hits else 0.0  # 向量 top1 的 cosine 分数，供四维判断
+        vec_top1 = hits[0].payload.get("chunk_id") if hits else None  # 向量 top1 的 chunk_id
 
         # 2. BM25 检索（知识库空 / token 空则跳过，退化为纯向量）
         tokens = jieba.lcut(query)
@@ -83,12 +97,14 @@ class HybridRetriever:
                         continue
                     bm25_rank[self._chunk_ids[idx]] = rank
                     rank += 1  # 紧凑计数，保证和向量侧过滤后的连续 rank 语义一致
+        bm25_top1 = min(bm25_rank, key=bm25_rank.get) if bm25_rank else None  # BM25 top1 的 chunk_id
 
-        # 召回层双低拒答：向量 + BM25 都认为不相关 → 判超知识库，直接返回空。
+        # 3. 四维置信度判断（判断层）——召回层从「双低拒答」升级为「四维分类」
         # 不用 rerank 分数做绝对阈值——口语 query 的 rerank 分数整体偏低（贴 0.5），绝对阈值会误杀。
         # 「召回优先、拒答兜底」：只要有一路命中就继续，只有双低才拒答。
-        if vec_top1_score < VEC_SCORE_LOW and not bm25_rank:
-            return []
+        label = self._classify(vec_top1, vec_top1_score, bm25_top1)
+        if label == "双低":
+            return label, []
 
         # 3. RRF 融合（取两个检索器结果的并集）
         all_cids = set(bm25_rank.keys()) | set(vec_rank.keys())
@@ -107,14 +123,33 @@ class HybridRetriever:
         candidates = fused[:top_n]
         reranked = self._rerank(query, candidates, top_k, text_map)
         if reranked is not None:
-            # Rerank 只负责排序，不做绝对分数阈值拒答（拒答已移到召回层双低判断）。
-            return reranked
+            # Rerank 只负责排序，不做绝对分数阈值拒答（拒答已移到召回层四维判断）。
+            return label, reranked
 
-        # 5. 降级：Rerank 不可用则退回 RRF 排序（附 text）
+        # 6. 降级：Rerank 不可用则退回 RRF 排序（附 text）
         result = []
         for cid, score in candidates[:top_k]:
             result.append((cid, score, text_map.get(cid, "")))
-        return result
+        return label, result
+
+    def _classify(self, vec_top1: str, vec_top1_score: float, bm25_top1: str) -> str:
+        """四维置信度判断（判断层，硬编码规则，与策略映射/话术生成分层）。
+
+        - 双高：向量≥VEC_SCORE_LOW 且 BM25 有召回 且两路 top1 相同 → 直接推
+        - 单高一致：只有一路强（向量高 BM25 无，或两路 top1 一致但向量弱）→ 软推 + 确认
+        - 单高冲突：两路都有 top1 但不同 → 列候选 / 优先信精确词那一路
+        - 双低：向量<VEC_SCORE_LOW 且 BM25 无 → 拒答 / 转人工
+        """
+        vec_high = vec_top1_score >= VEC_SCORE_LOW
+        bm25_has = bm25_top1 is not None
+
+        if not vec_high and not bm25_has:
+            return "双低"
+        if not bm25_has:
+            return "单高一致"  # 只有向量一路强
+        if vec_top1 == bm25_top1:
+            return "双高" if vec_high else "单高一致"
+        return "单高冲突"  # 两路 top1 不同
 
     def _rerank(self, query: str, candidates: list, top_k: int, text_map: dict):
         """CrossEncoder 精排候选，返回 [(chunk_id, rerank_score, text)]；不可用返回 None"""
@@ -138,6 +173,8 @@ if __name__ == "__main__":
     for q in ["贝乐牌有哪些粮", "肠胃敏感的粮", "幼犬吃什么"]:
         print("=" * 50)
         print(f"Q: {q}")
-        for cid, score, text in retriever.search(q):
+        label, results = retriever.search(q)
+        print(f"  置信度: {label}")
+        for cid, score, text in results:
             title = text.split("\n")[0].strip("# ").strip() if text else ""
             print(f"  ({score:.4f}) {title}")

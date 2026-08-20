@@ -102,7 +102,7 @@ def run_eval():
 
         # 3. 混合 + 预过滤 + Rerank（完整链路）
         category = detect_category(query)
-        hybrid_results = retriever.search(query, top_k=3, category=category)
+        _, hybrid_results = retriever.search(query, top_k=3, category=category)
         hybrid_titles = [t.split("\n")[0].strip("# ").strip() for _, _, t in hybrid_results]
 
         for method, titles in zip(methods, [vec_titles, bm25_titles, hybrid_titles]):

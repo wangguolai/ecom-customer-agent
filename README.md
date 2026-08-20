@@ -31,19 +31,19 @@
 
 ###  线（6 项，全勾 = 有把握跨 ）
 
-- [ ] 工具调用 ≥3 个真实工具，处理了幻觉工具调用校验
-- [ ] RAG 上了混合检索 + Rerank（不是只有向量检索）
-- [ ] 多轮对话有记忆，处理了上下文污染/截断
-- [ ] 踩过并解决 ≥3 个生产坑，每个能讲「现象→定位→解决」
-- [ ] 有一个量化数据（准确率 / 延迟 / 成本，随便哪个）
-- [ ] 能画出架构图，说明「为什么用这个框架不用那个」
+- [x] 工具调用 ≥3 个真实工具，处理了幻觉工具调用校验
+- [x] RAG 上了混合检索 + Rerank（不是只有向量检索）
+- [x] 多轮对话有记忆，处理了上下文污染/截断
+- [x] 踩过并解决 ≥3 个生产坑，每个能讲「现象→定位→解决」
+- [x] 有一个量化数据（准确率 / 延迟 / 成本，随便哪个）
+- [x] 能画出架构图，说明「为什么用这个框架不用那个」
 
 ###  线（4 项，做完 = 可冲  的 3-5 年经验区间）
 
-- [ ] 可观测性：Trace 追踪 + 关键指标（成功率 / 工具调用频次 / Token 消耗 / 延迟 P99）
+- [x] 可观测性：Trace 追踪 + 关键指标（成功率 / 工具调用频次 / Token 消耗 / 延迟 P99）
 - [ ] 评测体系：Agent Eval + 自动化评测（准确率 / 忠实度 / Answer Relevance）
 - [ ] 成本优化：模型路由 / 缓存 / Workflow vs Agent / 上下文压缩（至少落地一个）
-- [ ] 安全或协议：Prompt Injection 代码级防御 或 MCP 接入（至少落地一个）
+- [x] 安全或协议：Prompt Injection 代码级防御 或 MCP 接入（至少落地一个）
 
 ## 调研依据（2026-08 搜索，未独立核实）
 
@@ -54,13 +54,14 @@
 
 参考来源：码士集团招聘、杭州 AI 初创招聘、ai-agent-interview-guide（GitHub）、gankinterview 追问清单、iTech's Blog 40+真题、kamacoder 大厂题汇总。
 
-## 技术栈（初步，后续按需细化）
+## 技术栈
 
-- 编排：LangGraph（复用过来Agent 的编排经验）
-- RAG：Qdrant + 混合检索 + Rerank
-- 接口：FastAPI + SSE 流式
-- 模型：DeepSeek（发散）+ Kimi（收敛），复用多模型分工经验
-- 语言：Python（后端）+ 可复用 TS 经验做流式 UI
+- 编排：手写 ReAct 循环（不用 LangGraph/LangChain，理由见 docs/framework-selection.md）
+- RAG：Qdrant + 混合检索（BM25+向量+RRF）+ Rerank
+- 后端：FastAPI + SQLite（订单/物流/库存真实数据源）
+- 接口：FastAPI（SSE 流式是规划、未落地）
+- 模型：DeepSeek（Kimi 等多模型分工是规划、未落地）
+- 语言：Python
 
 ## 与过来Agent 的边界
 

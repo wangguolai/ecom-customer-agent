@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """RAG 检索 → 生成 最小闭环
 
-流程：用户问题 → 向量化 → Qdrant 检索 top-k → 拼 prompt → DeepSeek 生成 → 带引用回答
+流程：用户问题 → 混合检索（BM25+向量+RRF+Rerank+category 预过滤）→ 拼 prompt → DeepSeek 生成 → 带引用回答
+和 agent 的 search_products 走同一条检索路径（HybridRetriever），消除两套并存。
 """
 
 import sys
@@ -14,19 +15,28 @@ if _project_root not in sys.path:
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from src.infra.embedding import get_embedding_model
-from src.infra.vector_store import QdrantStore
+from src.infra.hybrid_retriever import HybridRetriever
 from src.infra.llm import chat
+from src.tools import detect_category
 
 TOP_K = 3
 
+_retriever = None
 
-def _build_prompt(question: str, hits: list) -> str:
+
+def _get_retriever():
+    """懒加载单例——BM25 索引 + embedding 模型只建一次"""
+    global _retriever
+    if _retriever is None:
+        _retriever = HybridRetriever()
+    return _retriever
+
+
+def _build_prompt(question: str, results: list) -> str:
     """拼 prompt：检索到的商品资料放【数据区】，用户问题放底部（数据/指令分离）"""
     parts = []
-    for i, h in enumerate(hits, 1):
-        title = h.payload.get("title", "")
-        text = h.payload.get("text", "")
+    for i, (cid, score, text) in enumerate(results, 1):
+        title = text.split("\n")[0].strip("# ").strip() if text else ""
         parts.append(f"[{i}] {title}\n{text}")
     context = "\n\n".join(parts)
 
@@ -42,24 +52,20 @@ def _build_prompt(question: str, hits: list) -> str:
 
 
 def answer(question: str, top_k: int = TOP_K) -> str:
-    """端到端 RAG 问答：向量化 → 检索 → 生成"""
-    model = get_embedding_model()
-    store = QdrantStore()
+    """端到端 RAG 问答：混合检索（含预过滤 + Rerank）→ 生成"""
+    retriever = _get_retriever()
+    category = detect_category(question)
 
-    # 1. 向量化
-    print("📍 [1/3] 向量化 — 问题转向量中...")
-    q_vec = model.encode(question, normalize_embeddings=True).tolist()
+    # 1. 混合检索（和 agent 的 search_products 同一条路径）
+    print("📍 [1/2] 混合检索 — BM25+向量+RRF+Rerank+预过滤 中...")
+    label, results = retriever.search(question, top_k=top_k, category=category)
 
-    # 2. 检索
-    print("📍 [2/3] 检索 — Qdrant 语义检索中...")
-    hits = store.search_knowledge(q_vec, limit=top_k)
-
-    if not hits:
+    if label == "双低":
         return "抱歉，没有在知识库中找到相关商品信息。"
 
-    # 3. 生成
-    print("📍 [3/3] 生成 — DeepSeek 生成回答中...")
-    prompt = _build_prompt(question, hits)
+    # 2. 生成
+    print("📍 [2/2] 生成 — DeepSeek 生成回答中...")
+    prompt = _build_prompt(question, results)
     return chat([
         {"role": "system", "content": "你是宠物电商客服。"},
         {"role": "user", "content": prompt},

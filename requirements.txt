@@ -4,3 +4,6 @@ sentence-transformers
 python-dotenv
 jieba
 rank-bm25
+fastapi
+uvicorn
+requests
