@@ -30,12 +30,14 @@ def main():
     print("=" * 64)
     print("Trace 明细：")
     print()
-    for _, elapsed, tokens in trace.steps:
+    for _, elapsed, tokens, _prompt in trace.steps:
         print(f"  [LLM 决策] 耗时 {elapsed:.3f}s, token {tokens}")
     print()
     for name, elapsed, step, is_empty in trace.tool_calls:
         flag = "（空返回）" if is_empty else ""
         print(f"  [工具调用 第{step}步] {name} 耗时 {elapsed:.3f}s{flag}")
+    for elapsed, p_tokens, c_tokens in trace.summaries:
+        print(f"  [摘要压缩] 耗时 {elapsed:.3f}s, 输入 {p_tokens} token, 输出 {c_tokens} token")
     print()
     print(f"  结束原因：{trace.end_reason}")
     print("=" * 64)

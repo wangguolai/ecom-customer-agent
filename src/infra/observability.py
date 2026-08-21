@@ -18,19 +18,27 @@ class Trace:
 
     def __init__(self):
         self.start = time.perf_counter()
-        self.steps = []       # [(step, elapsed, tokens)] 每次 LLM 决策
+        self.steps = []       # [(step, elapsed, tokens, prompt_tokens)] 每次 LLM 决策
         self.tool_calls = []  # [(name, elapsed, step, is_empty)] 每次工具调用
+        self.summaries = []   # [(elapsed, prompt_tokens, completion_tokens)] 摘要压缩调用
         self.end_reason = "未知"  # 正常 / 死循环 / 超步数 / 异常
 
-    def add_llm(self, step: int, elapsed: float, tokens):
-        self.steps.append((step, elapsed, tokens or 0))  # tokens 可能为 None，防御
+    def add_llm(self, step: int, elapsed: float, tokens, prompt_tokens=None):
+        self.steps.append((step, elapsed, tokens or 0, prompt_tokens or 0))  # tokens 可能为 None，防御
 
     def add_tool(self, name: str, elapsed: float, step: int, is_empty: bool):
         self.tool_calls.append((name, elapsed, step, is_empty))
 
+    def add_summary(self, elapsed: float, prompt_tokens, completion_tokens):
+        """记录一次摘要压缩调用（输入 prompt_tokens + 输出 completion_tokens，用于算摘要成本）"""
+        self.summaries.append((elapsed, prompt_tokens or 0, completion_tokens or 0))
+
     def summary(self) -> dict:
         total_time = time.perf_counter() - self.start
         total_tokens = sum(s[2] for s in self.steps)
+        prompt_tokens = sum(s[3] for s in self.steps)
+        summary_in = sum(p for _, p, _ in self.summaries)
+        summary_out = sum(c for _, _, c in self.summaries)
         tool_freq = {}
         empty_count = 0
         for name, _, _, is_empty in self.tool_calls:
@@ -39,8 +47,12 @@ class Trace:
                 empty_count += 1
         return {
             "总耗时(秒)": round(total_time, 3),
-            "LLM 调用次数": len(self.steps),
-            "总 token 消耗": total_tokens,  # 计费规范：各步求和（含重复历史），非去重上下文规模
+            "LLM 调用次数": len(self.steps) + len(self.summaries),  # 含摘要调用，和「总 token 消耗」规范一致
+            "总 token 消耗": total_tokens + summary_in + summary_out,  # 计费规范：主循环各步 + 摘要（含重复历史）
+            "输入 token 规模": prompt_tokens,  # 主循环各步 prompt_tokens 求和（含重复历史），压缩率分析用
+            "摘要调用次数": len(self.summaries),
+            "摘要输入 token": summary_in,  # 把旧历史发给摘要 LLM 花的 prompt token
+            "摘要输出 token": summary_out,  # 摘要正文 completion token
             "工具调用次数": len(self.tool_calls),
             "工具频次": tool_freq,
             "召回端空返回次数": empty_count,

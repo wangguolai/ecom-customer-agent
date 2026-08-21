@@ -37,7 +37,7 @@ def get_client():
     return _client
 
 
-def chat_with_usage(messages: list[dict], tools: Optional[list[dict]] = None, model: Optional[str] = None, temperature: float = 0.0):
+def chat_with_usage(messages: list[dict], tools: Optional[list[dict]] = None, model: Optional[str] = None, temperature: float = 0.0, max_tokens: Optional[int] = None):
     """单轮对话，返回 (message, usage)。usage 含 prompt_tokens/completion_tokens/total_tokens，供可观测记录 token 消耗"""
     if model is None:
         model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
@@ -48,6 +48,8 @@ def chat_with_usage(messages: list[dict], tools: Optional[list[dict]] = None, mo
     }
     if tools:
         params["tools"] = tools
+    if max_tokens is not None:
+        params["max_tokens"] = max_tokens
     resp = get_client().chat.completions.create(**params)
     return resp.choices[0].message, resp.usage
 

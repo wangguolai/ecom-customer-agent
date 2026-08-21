@@ -39,7 +39,7 @@ def test_幻觉工具_错误回灌():
     def fake_chat(messages, **kwargs):
         seen_messages.append(messages)
         msg = fake_hallucination if len(seen_messages) == 1 else fake_final
-        return msg, mock.Mock(total_tokens=0)
+        return msg, mock.Mock(total_tokens=0, prompt_tokens=0)
 
     with mock.patch('src.agent.chat_with_usage', side_effect=fake_chat):
         result = agent.run_agent("测试")
@@ -55,7 +55,7 @@ def test_幻觉工具_错误回灌():
 def test_死循环_连续三次相同():
     """LLM 连续 3 次调同一工具 → 判死循环"""
     same = _resp(tool_calls=[_tool_call("check_stock", '{"product_name": "幼犬成长粮"}')])
-    with mock.patch('src.agent.chat_with_usage', side_effect=[(same, mock.Mock(total_tokens=0))] * 10):
+    with mock.patch('src.agent.chat_with_usage', side_effect=[(same, mock.Mock(total_tokens=0, prompt_tokens=0))] * 10):
         result = agent.run_agent("测试")
     assert "死循环" in result, result
     print("✅ 死循环防护：", result)
