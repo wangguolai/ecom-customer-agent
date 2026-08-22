@@ -10,7 +10,7 @@ import sys
 import os
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
 
 # 确保项目根目录在 Python 路径中
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -87,16 +87,16 @@ def _trim_history(messages: list, max_tokens: int) -> list:
     return messages
 
 
-def _summarize(history_messages: list):
+async def _summarize(history_messages: list):
     """把旧轮次压成 LLM 摘要。返回 (summary_text, usage, elapsed)"""
     t0 = time.perf_counter()
     msgs = [{"role": "system", "content": SUMMARY_INSTRUCTION}] + history_messages
-    resp, usage = chat_with_usage(msgs, temperature=0.0, max_tokens=SUMMARY_MAX_TOKENS)
+    resp, usage = await chat_with_usage(msgs, temperature=0.0, max_tokens=SUMMARY_MAX_TOKENS)
     elapsed = time.perf_counter() - t0
     return (resp.content or ""), usage, elapsed
 
 
-def _compress_history(messages: list, max_tokens: int, trace: Trace = None) -> list:
+async def _compress_history(messages: list, max_tokens: int, trace: Trace = None) -> list:
     """超预算时，把「最近一轮完成对话之外」的旧轮压成 LLM 摘要（保留最近一轮 + 当前轮）。
 
     和 _trim_history 的区别：丢轮次会丢关键实体（订单号），摘要保留实体 + 指代消解。
@@ -126,7 +126,7 @@ def _compress_history(messages: list, max_tokens: int, trace: Trace = None) -> l
     if not to_compress:
         return messages
 
-    summary_text, usage, elapsed = _summarize(to_compress)
+    summary_text, usage, elapsed = await _summarize(to_compress)
     if not summary_text or not summary_text.strip():
         print("⚠️ 摘要为空，跳过压缩（保留原历史），避免静默丢关键信息。")
         return messages
@@ -143,7 +143,7 @@ def _compress_history(messages: list, max_tokens: int, trace: Trace = None) -> l
     return messages
 
 
-def _react_loop(messages: list, trace: Trace = None) -> str:
+async def _react_loop(messages: list, trace: Trace = None) -> str:
     """核心循环：LLM 决策 → 代码执行 → 回灌，直到最终答案。原地修改 messages，返回最终答案"""
     last_action = None
     repeat_count = 0
@@ -152,7 +152,7 @@ def _react_loop(messages: list, trace: Trace = None) -> str:
         print(f"📍 [step {step+1}] LLM 决策中...")
         t0 = time.perf_counter()
         try:
-            resp, usage = chat_with_usage(messages, tools=TOOL_SCHEMAS)
+            resp, usage = await chat_with_usage(messages, tools=TOOL_SCHEMAS)
         except Exception as e:
             # API 超时/网络错误：标记异常结束，返回友好错误，不让异常穿透（trace 才有机会 summary）
             if trace:
@@ -191,9 +191,11 @@ def _react_loop(messages: list, trace: Trace = None) -> str:
                 return "连续 3 次调用同一工具同一参数，判定死循环，已停止。"
             parsed.append((tc, args))
 
-        # 2. 并行执行工具（Function Calling 多 tool_calls 语义上应并发，此前串行 for 是坑）
+        # 2. 并行执行工具（Function Calling 多 tool_calls 语义上应并发）。
+        # 协程方案：asyncio.gather 替代 ThreadPoolExecutor——工具已是 async（httpx 等待/检索走 to_thread），
+        # 等待 I/O 时事件循环去跑别的协程，单线程并发，切换成本比线程池更低。
         # 计时从 _exec 入口开始，幻觉工具/非法参数/参数不匹配也计入 trace（这些事件可观测才能排查五类坑）
-        def _exec(item):
+        async def _exec(item):
             tc, args = item
             name = tc.function.name
             t0 = time.perf_counter()
@@ -203,7 +205,7 @@ def _react_loop(messages: list, trace: Trace = None) -> str:
                 result = f"错误：工具 {name} 不存在，可用工具：{list(TOOL_MAP)}"
             else:
                 try:
-                    result = TOOL_MAP[name](**args)
+                    result = await TOOL_MAP[name](**args)
                 except (TypeError, KeyError) as e:
                     result = f"工具 {name} 参数不匹配：{e}"
             result = truncate(result)
@@ -213,11 +215,7 @@ def _react_loop(messages: list, trace: Trace = None) -> str:
                 trace.add_tool(name, elapsed, step + 1, is_empty)
             return result
 
-        if len(parsed) == 1:
-            results = [_exec(parsed[0])]
-        else:
-            with ThreadPoolExecutor(max_workers=len(parsed)) as pool:
-                results = list(pool.map(_exec, parsed))
+        results = await asyncio.gather(*[_exec(item) for item in parsed])
 
         # 3. 按原顺序回灌结果（tool_call_id 一一对应，顺序不乱）
         for (tc, _), result in zip(parsed, results):
@@ -239,13 +237,13 @@ class AgentSession:
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self._last_trace = None
 
-    def chat(self, user_msg: str) -> str:
+    async def chat(self, user_msg: str) -> str:
         """一轮对话：追加用户消息，先建 trace，再超预算压缩（摘要成本进 trace），最后跑 ReAct"""
         self.messages.append({"role": "user", "content": user_msg})
         trace = Trace()
         self._last_trace = trace
-        _compress_history(self.messages, MAX_HISTORY_TOKENS, trace)
-        result = _react_loop(self.messages, trace)
+        await _compress_history(self.messages, MAX_HISTORY_TOKENS, trace)
+        result = await _react_loop(self.messages, trace)
         METRICS.record(trace)
         print(trace)  # 每次对话打印 trace 摘要（可观测）
         return result
@@ -255,21 +253,25 @@ class AgentSession:
         return self._last_trace
 
 
-def run_agent(user_msg: str) -> str:
+async def run_agent(user_msg: str) -> str:
     """单轮便捷接口（单元测试用）"""
-    return AgentSession().chat(user_msg)
+    return await AgentSession().chat(user_msg)
 
 
-if __name__ == "__main__":
+async def _demo():
     session = AgentSession()
     # 商品咨询 → 应调 search_products（RAG）
     print("=" * 60)
     print("Q1: 幼犬粮适合我家 2 岁金毛吗？（商品咨询 → RAG）")
     print("-" * 60)
-    print(session.chat("幼犬粮适合我家 2 岁金毛吗？"))
+    print(await session.chat("幼犬粮适合我家 2 岁金毛吗？"))
     print()
     # 订单查询 → 应调 search_logistics（工具）
     print("=" * 60)
     print("Q2: 我的订单 20240818001 到哪了？（订单 → 工具）")
     print("-" * 60)
-    print(session.chat("我的订单 20240818001 到哪了？"))
+    print(await session.chat("我的订单 20240818001 到哪了？"))
+
+
+if __name__ == "__main__":
+    asyncio.run(_demo())

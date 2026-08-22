@@ -14,9 +14,10 @@
 import sys
 import os
 import uuid
+import asyncio
 from urllib.parse import quote
 
-import requests
+import httpx
 
 # 确保项目根目录在 Python 路径中
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -149,11 +150,12 @@ RETURN_POLICY = (
 # 工具执行函数（LLM 只输出调用意图，真正执行的是这里的代码）
 # ═══════════════════════════════════════════════════════════════
 
-def search_orders(order_id: str) -> str:
+async def search_orders(order_id: str) -> str:
     """订单查询（真实后端接口）"""
     try:
-        resp = requests.get(f"{BACKEND_URL}/orders/{order_id}", timeout=REQUEST_TIMEOUT)
-    except (requests.ConnectionError, requests.Timeout):
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            resp = await client.get(f"{BACKEND_URL}/orders/{order_id}")
+    except (httpx.ConnectError, httpx.TimeoutException):
         return "订单查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
     if resp.status_code == 404:
         return f"未查到订单号 {order_id}，请核对订单号。"
@@ -163,11 +165,12 @@ def search_orders(order_id: str) -> str:
     return f"订单 {d['order_id']}：状态={d['status']}，商品={d['product']}，金额={d['amount']}，下单时间={d['created_at']}"
 
 
-def search_logistics(order_id: str) -> str:
+async def search_logistics(order_id: str) -> str:
     """物流追踪（真实后端接口）"""
     try:
-        resp = requests.get(f"{BACKEND_URL}/logistics/{order_id}", timeout=REQUEST_TIMEOUT)
-    except (requests.ConnectionError, requests.Timeout):
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            resp = await client.get(f"{BACKEND_URL}/logistics/{order_id}")
+    except (httpx.ConnectError, httpx.TimeoutException):
         return "物流查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
     if resp.status_code == 404:
         return f"未查到订单号 {order_id} 的物流信息。"
@@ -178,11 +181,12 @@ def search_logistics(order_id: str) -> str:
     return "物流轨迹：\n" + "\n".join(lines)
 
 
-def check_stock(product_name: str) -> str:
+async def check_stock(product_name: str) -> str:
     """库存查询（真实后端接口，含价格）"""
     try:
-        resp = requests.get(f"{BACKEND_URL}/stock/{quote(product_name)}", timeout=REQUEST_TIMEOUT)
-    except (requests.ConnectionError, requests.Timeout):
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            resp = await client.get(f"{BACKEND_URL}/stock/{quote(product_name)}")
+    except (httpx.ConnectError, httpx.TimeoutException):
         return "库存查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
     if resp.status_code == 404:
         return f"未查到商品「{product_name}」，请确认商品名。"
@@ -194,12 +198,12 @@ def check_stock(product_name: str) -> str:
     return f"「{product_name}」有货，库存 {d['qty']} 件，价格 {d['price']}。"
 
 
-def get_return_policy() -> str:
+async def get_return_policy() -> str:
     """退货政策"""
     return RETURN_POLICY
 
 
-def transfer_to_human(problem: str) -> str:
+async def transfer_to_human(problem: str) -> str:
     """转人工（生成工单）"""
     ticket_id = f"TK{uuid.uuid4().hex[:8].upper()}"
     return f"已为您创建工单 {ticket_id}，人工客服将尽快联系您。问题：{problem}"
@@ -210,19 +214,19 @@ def transfer_to_human(problem: str) -> str:
 WRITE_TOOLS = {"refund_order", "transfer_to_human"}
 
 
-def refund_order(order_id: str, amount: float) -> str:
+async def refund_order(order_id: str, amount: float) -> str:
     """退款（写工具，代码级防御：只提交「待人工审批」工单，不直接退款）。
 
     关键：LLM 只有「建议权」（提交退款申请），没有「执行权」（真正退款在人工审批）。
     Prompt Injection 诱导 LLM 调 refund，最多生成一个待审批工单，金额非法会被后端参数校验拦下。
     """
     try:
-        resp = requests.post(
-            f"{BACKEND_URL}/refund",
-            json={"order_id": order_id, "amount": amount},
-            timeout=REQUEST_TIMEOUT,
-        )
-    except (requests.ConnectionError, requests.Timeout):
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            resp = await client.post(
+                f"{BACKEND_URL}/refund",
+                json={"order_id": order_id, "amount": amount},
+            )
+    except (httpx.ConnectError, httpx.TimeoutException):
         return "退款服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
     if resp.status_code == 404:
         return f"未查到订单 {order_id}，无法退款。"
@@ -286,8 +290,8 @@ STRATEGY_HINTS = {
 }
 
 
-def search_products(query: str, top_k: int = 3) -> str:
-    """商品知识库检索（RAG）——混合检索 + category 预过滤 + 四维置信度策略映射"""
+def _search_products_sync(query: str, top_k: int) -> str:
+    """search_products 的同步实现。embedding + rerank 是 CPU/GPU 密集，丢线程池跑（to_thread），不阻塞事件循环。"""
     category = detect_category(query)
     label, results = _get_hybrid_retriever().search(query, top_k=top_k, category=category)
 
@@ -301,6 +305,11 @@ def search_products(query: str, top_k: int = 3) -> str:
 
     # 策略提示（系统生成的受信任指令）+ 检索结果（外部数据），分开标注，不混进「数据/指令分离」的防御里
     return f"[检索策略：{label}]\n{STRATEGY_HINTS[label]}\n\n" + "\n\n".join(parts)
+
+
+async def search_products(query: str, top_k: int = 3) -> str:
+    """商品知识库检索（RAG）——混合检索 + category 预过滤 + 四维置信度策略映射"""
+    return await asyncio.to_thread(_search_products_sync, query, top_k)
 
 
 # 工具名白名单映射（幻觉工具校验 + 派发执行）

@@ -7,6 +7,7 @@
 
 import sys
 import os
+import asyncio
 
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
@@ -17,11 +18,11 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from src.agent import AgentSession
 
 
-def main():
+async def main():
     question = sys.argv[1] if len(sys.argv) > 1 else "我的订单 20240818001 到哪了"
 
     session = AgentSession()
-    answer = session.chat(question)
+    answer = await session.chat(question)
     trace = session.get_last_trace()
 
     print("=" * 64)
@@ -44,4 +45,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

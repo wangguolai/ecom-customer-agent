@@ -3,6 +3,7 @@
 
 import sys
 import os
+import asyncio
 from unittest import mock
 
 # 确保项目根目录在 Python 路径中
@@ -36,13 +37,13 @@ def test_幻觉工具_错误回灌():
     fake_hallucination = _resp(tool_calls=[_tool_call("不存在的工具", "{}")])
     fake_final = _resp(tool_calls=None, content="好的")
 
-    def fake_chat(messages, **kwargs):
+    async def fake_chat(messages, **kwargs):
         seen_messages.append(messages)
         msg = fake_hallucination if len(seen_messages) == 1 else fake_final
         return msg, mock.Mock(total_tokens=0, prompt_tokens=0)
 
     with mock.patch('src.agent.chat_with_usage', side_effect=fake_chat):
-        result = agent.run_agent("测试")
+        result = asyncio.run(agent.run_agent("测试"))
 
     # 第二次调用时 messages 里应有「不存在」的错误回灌
     second = seen_messages[1]
@@ -55,8 +56,12 @@ def test_幻觉工具_错误回灌():
 def test_死循环_连续三次相同():
     """LLM 连续 3 次调同一工具 → 判死循环"""
     same = _resp(tool_calls=[_tool_call("check_stock", '{"product_name": "幼犬成长粮"}')])
-    with mock.patch('src.agent.chat_with_usage', side_effect=[(same, mock.Mock(total_tokens=0, prompt_tokens=0))] * 10):
-        result = agent.run_agent("测试")
+
+    async def fake_chat(messages, **kwargs):
+        return same, mock.Mock(total_tokens=0, prompt_tokens=0)
+
+    with mock.patch('src.agent.chat_with_usage', side_effect=fake_chat):
+        result = asyncio.run(agent.run_agent("测试"))
     assert "死循环" in result, result
     print("✅ 死循环防护：", result)
 

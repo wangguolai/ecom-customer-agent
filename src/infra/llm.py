@@ -20,7 +20,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from dotenv import load_dotenv
 load_dotenv(Path(_project_root) / ".env", encoding="utf-8")
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 _client = None
 
@@ -33,11 +33,11 @@ def get_client():
         base_url = os.getenv("DEEPSEEK_BASE_URL")
         if not api_key:
             raise RuntimeError("未找到 DEEPSEEK_API_KEY，请检查 .env")
-        _client = OpenAI(api_key=api_key, base_url=base_url)
+        _client = AsyncOpenAI(api_key=api_key, base_url=base_url)
     return _client
 
 
-def chat_with_usage(messages: list[dict], tools: Optional[list[dict]] = None, model: Optional[str] = None, temperature: float = 0.0, max_tokens: Optional[int] = None):
+async def chat_with_usage(messages: list[dict], tools: Optional[list[dict]] = None, model: Optional[str] = None, temperature: float = 0.0, max_tokens: Optional[int] = None):
     """单轮对话，返回 (message, usage)。usage 含 prompt_tokens/completion_tokens/total_tokens，供可观测记录 token 消耗"""
     if model is None:
         model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
@@ -50,11 +50,11 @@ def chat_with_usage(messages: list[dict], tools: Optional[list[dict]] = None, mo
         params["tools"] = tools
     if max_tokens is not None:
         params["max_tokens"] = max_tokens
-    resp = get_client().chat.completions.create(**params)
+    resp = await get_client().chat.completions.create(**params)
     return resp.choices[0].message, resp.usage
 
 
-def chat(messages: list[dict], tools: Optional[list[dict]] = None, model: Optional[str] = None, temperature: float = 0.0):
+async def chat(messages: list[dict], tools: Optional[list[dict]] = None, model: Optional[str] = None, temperature: float = 0.0):
     """单轮对话，返回完整 message 对象（含 content 和 tool_calls）。兼容旧调用，不需要 usage 时用这个"""
-    message, _ = chat_with_usage(messages, tools, model, temperature)
+    message, _ = await chat_with_usage(messages, tools, model, temperature)
     return message
