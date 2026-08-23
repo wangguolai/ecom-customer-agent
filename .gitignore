@@ -12,5 +12,9 @@ data/ecommerce.db
 # 环境变量
 .env
 
+# 评测临时结果（baseline 定稿保留，其余临时产物不入库）
+tests/eval_results/answer_quality_after.json
+tests/eval_results/answer_quality_retest.json
+
 # IDE
 .vscode/
