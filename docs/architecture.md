@@ -21,16 +21,17 @@
 └───────────────────────────┬─────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
-│                   工具层（6 个工具，Function Calling）           │
+│                   工具层（7 个工具，Function Calling）           │
 │  search_products │ search_orders │ search_logistics           │
-│  check_stock     │ get_return_policy │ transfer_to_human      │
+│  check_stock     │ get_return_policy │ refund_order（写）      │
+│  transfer_to_human（写）                                        │
 └───────┬──────────────────────────────┬───────────────────────┘
         │（商品咨询）                    │（订单/物流/库存/转人工）
         ↓                              ↓
 ┌───────────────────┐          ┌───────────────────┐
-│   RAG 检索（混合）  │          │    mock 数据       │
+│   RAG 检索（混合）  │          │  FastAPI+SQLite    │
 │ 预过滤(类别) → BM25+向量 │    │  订单/物流/库存     │
-│  → 双低拒答 → RRF 融合  │    │  （内存硬编码）      │
+│  → 双低拒答 → RRF 融合  │    │  （真实后端+种子数据）│
 │  → Rerank 精排     │          │                   │
 └─────────┬─────────┘          └───────────────────┘
           ↓
@@ -51,7 +52,7 @@
 
 | 决策点 | 选择 | 为什么 |
 |--------|------|--------|
-| LLM | DeepSeek（deepseek-chat） | 便宜 + 中文好 + OpenAI 兼容（原生支持 Function Calling） |
+| LLM | DeepSeek（deepseek-v4-pro） | 便宜 + 中文好 + OpenAI 兼容（原生支持 Function Calling） |
 | Agent 编排 | **手写 ReAct 循环**，不套 LangGraph/LangChain | 理解底层「LLM 只输出指令、代码才执行」，要说明循环；框架封装了循环反而盖住要点 |
 | 工具交互 | Function Calling（不手写正则 ReAct） | API 契约保证格式可靠，避免「正则解析 Thought:/Action:」的格式地狱 |
 | RAG 角色 | 包装成 `search_products` 工具，和其他工具平级 | RAG 在 agent 里就是一个查询工具，路由交给 ReAct 自动选，不用写 if-else |
@@ -92,5 +93,5 @@
 
 - 订单/物流/库存已接 FastAPI + SQLite 后端（真实 HTTP 接口 + 超时降级），但后端数据是**种子数据**（非生产数据），转人工仍是 mock
 - Prompt Injection 已做 prompt 级（数据/指令分离）+ 代码级（写操作权限开关：refund 待审批 + 参数校验 + 读/写分离），但「待审批」是 mock（无真实审批流程）
-- 评测做了检索层（Recall@3 + MRR）+ 脏输入四档测试，Agent 级评测（LLM-as-judge）只做了最小版验证、未正式落地
+- 评测做了检索层（Recall@3 + MRR）+ 脏输入四档测试 + 回答质量评测（LLM-as-judge，N=3 多数票 + 结构化层抓硬编造 + 喂 KB 判软编造，faithfulness 100% 已定稿）
 - 可观测已做（Trace + MetricsStore：技术成功率 / P99 / 平均延迟 / 平均 token），可视化层生产接 LangSmith
