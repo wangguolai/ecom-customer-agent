@@ -161,8 +161,11 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
         elapsed = time.perf_counter() - t0
         tokens = usage.total_tokens if usage else 0
         prompt_tokens = usage.prompt_tokens if usage else 0
+        # DeepSeek 前缀缓存命中量：usage 的额外字段，SDK 未定义时 getattr 兜底 0（缓存自动生效，这里只做观测）
+        cache_hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+        cache_miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
         if trace:
-            trace.add_llm(step + 1, elapsed, tokens, prompt_tokens)
+            trace.add_llm(step + 1, elapsed, tokens, prompt_tokens, cache_hit, cache_miss)
         # 显式回填最小字段，避免多余字段引发 DeepSeek 兼容层 400
         messages.append(resp.model_dump(exclude_none=True))
 

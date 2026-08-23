@@ -21,10 +21,14 @@ class Trace:
         self.steps = []       # [(step, elapsed, tokens, prompt_tokens)] 每次 LLM 决策
         self.tool_calls = []  # [(name, elapsed, step, is_empty)] 每次工具调用
         self.summaries = []   # [(elapsed, prompt_tokens, completion_tokens)] 摘要压缩调用
+        self.cache_hit_tokens = 0   # DeepSeek 前缀缓存命中 token（按命中价计费，~1/30 输入价）
+        self.cache_miss_tokens = 0  # 缓存未命中 token（按未命中价计费）
         self.end_reason = "未知"  # 正常 / 死循环 / 超步数 / 异常
 
-    def add_llm(self, step: int, elapsed: float, tokens, prompt_tokens=None):
-        self.steps.append((step, elapsed, tokens or 0, prompt_tokens or 0))  # tokens 可能为 None，防御
+    def add_llm(self, step: int, elapsed: float, tokens, prompt_tokens=None, cache_hit=0, cache_miss=0):
+        self.steps.append((step, elapsed, tokens or 0, prompt_tokens or 0))
+        self.cache_hit_tokens += cache_hit or 0
+        self.cache_miss_tokens += cache_miss or 0  # tokens 可能为 None，防御
 
     def add_tool(self, name: str, elapsed: float, step: int, is_empty: bool):
         self.tool_calls.append((name, elapsed, step, is_empty))
@@ -45,11 +49,16 @@ class Trace:
             tool_freq[name] = tool_freq.get(name, 0) + 1
             if is_empty:
                 empty_count += 1
+        cache_total = self.cache_hit_tokens + self.cache_miss_tokens
+        cache_hit_rate = round(self.cache_hit_tokens / cache_total, 4) if cache_total else 0.0
         return {
             "总耗时(秒)": round(total_time, 3),
             "LLM 调用次数": len(self.steps) + len(self.summaries),  # 含摘要调用，和「总 token 消耗」规范一致
             "总 token 消耗": total_tokens + summary_in + summary_out,  # 计费规范：主循环各步 + 摘要（含重复历史）
             "输入 token 规模": prompt_tokens,  # 主循环各步 prompt_tokens 求和（含重复历史），压缩率分析用
+            "缓存命中 token": self.cache_hit_tokens,  # DeepSeek 前缀缓存命中（省钱核心指标）
+            "缓存未命中 token": self.cache_miss_tokens,
+            "缓存命中率": cache_hit_rate,  # hit / (hit+miss)，0 表示无缓存数据或未命中
             "摘要调用次数": len(self.summaries),
             "摘要输入 token": summary_in,  # 把旧历史发给摘要 LLM 花的 prompt token
             "摘要输出 token": summary_out,  # 摘要正文 completion token
@@ -63,8 +72,8 @@ class Trace:
         s = self.summary()
         return (
             f"<Trace 耗时={s['总耗时(秒)']}s LLM={s['LLM 调用次数']}次 "
-            f"token={s['总 token 消耗']} 工具={s['工具调用次数']}次 "
-            f"空返回={s['召回端空返回次数']} 结束={s['结束原因']}>"
+            f"token={s['总 token 消耗']} 缓存命中率={s['缓存命中率']:.1%} "
+            f"工具={s['工具调用次数']}次 空返回={s['召回端空返回次数']} 结束={s['结束原因']}>"
         )
 
 

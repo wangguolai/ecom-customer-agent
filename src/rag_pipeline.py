@@ -7,6 +7,7 @@
 
 import sys
 import os
+import threading
 
 # 确保项目根目录在 Python 路径中
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,13 +23,20 @@ from src.tools import detect_category
 TOP_K = 3
 
 _retriever = None
+_retriever_lock = threading.Lock()
 
 
 def _get_retriever():
-    """懒加载单例——BM25 索引 + embedding 模型只建一次"""
+    """懒加载单例——BM25 索引 + embedding 模型只建一次。
+
+    线程安全：和 tools._get_hybrid_retriever 同一个并发初始化竞态（asyncio 改造后工具并发执行）。
+    加锁 + 双重检查，保证单例只初始化一次。
+    """
     global _retriever
     if _retriever is None:
-        _retriever = HybridRetriever()
+        with _retriever_lock:
+            if _retriever is None:
+                _retriever = HybridRetriever()
     return _retriever
 
 

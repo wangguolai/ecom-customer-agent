@@ -42,34 +42,59 @@ BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 RESULT_DIR = os.path.join(_project_root, "tests", "eval_results")
 
 # ═══════════════════════════════════════════════════════════════
-# 事实库（结构化层 ground truth，从 data/products.md + src/backend/main.py 提取）
+# 事实库（结构化层 ground truth）
+# 品牌/商品名/价格从 products.md 自动提取（单一数据源，避免手写白名单和知识库不同步）；
+# 订单号来自 backend 种子（不在 products.md，手写）。数据迁移时只需改 products.md，白名单自动更新。
 # ═══════════════════════════════════════════════════════════════
-FACTS = {
-    # 合法订单号（backend _SEED_ORDERS）
-    "order_ids": {"20240818001", "20240817002", "20240816003"},
-    # 合法价格数值（products.md 全部价格 + backend 库存价格，去重）
-    "prices": {
-        15, 18, 19, 22, 25, 28, 29, 32, 35, 39, 45, 49, 55, 59, 69, 79, 89,
-        99, 109, 119, 129, 139, 149, 159, 219, 259, 289, 299, 319, 359, 379,
-        389, 399, 459,
-    },
-}
+def _load_facts() -> dict:
+    products_path = os.path.join(_project_root, "data", "products.md")
+    with open(products_path, encoding="utf-8") as f:
+        content = f.read()
+
+    brands = set()
+    product_names = set()
+    for title in re.findall(r"^## (.+)$", content, flags=re.MULTILINE):
+        product_names.add(title.strip())
+        for b in re.findall(r"（([^（）]+牌)）", title):
+            brands.add(b)
+    prices = {int(p) for p in re.findall(r"¥\s*(\d+)", content)}
+
+    return {
+        "order_ids": {"20240818001", "20240817002", "20240816003"},  # backend _SEED_ORDERS
+        "brands": brands,
+        "product_names": product_names,
+        "prices": prices,
+    }
+
+
+FACTS = _load_facts()
+
+# 品牌提取的功能词停用前缀（口语「什么牌/这个牌/哪个牌」不是品牌名，避免误判编造品牌）
+_BRAND_STOP_PREFIXES = {"什么", "这个", "那个", "哪个", "一个", "这种", "那种", "哪种"}
 
 # ═══════════════════════════════════════════════════════════════
 # 裁判（语义层）：判 accuracy + faithfulness
 # 硬事实（订单号/价格）的编造不归 LLM 判，由结构化层精确比对——让两个维度正交：
 #   accuracy 只判「答对没」，faithfulness 只判「语义编造没」，不混「该拒答却编造」进 accuracy。
 # ═══════════════════════════════════════════════════════════════
-JUDGE_SYSTEM = """你是电商客服 Agent 回答质量的评测裁判。根据「用户问题」「客服回答」「参考答案」判两个维度：
+JUDGE_SYSTEM = """你是电商客服 Agent 回答质量的评测裁判。根据「知识库事实」「用户问题」「客服回答」「参考答案」判两个维度：
 
 1. accuracy（准确率，0/1）：客服回答是否正确回应了用户问题、是否与参考答案一致（答对了该答的）。
-2. faithfulness（忠实度，0/1）：客服回答在语义层面是否忠实、没有凭空编造。重点看：有没有编造不存在的商品名、编造库存状态（有货/缺货说反）、编造物流轨迹、编造政策条款。
+2. faithfulness（忠实度，0/1）：客服回答是否忠于「知识库事实」，有没有编造知识库里不存在的商品名/品牌/物流轨迹/政策条款。
 
-注意：回答里的「订单号」「价格数值」这类硬事实的编造不归你判，由外部规则层精确比对。你只判语义层面的编造。
+重要：faithfulness 判的是「编造」，不是「答错」。以下情况都是 accuracy 问题（faithfulness 应判 1），不要误判成编造：
+- 答非所问、漏答关键信息
+- 没有纠正用户的错误说法
+- 推荐了「不相关但知识库里确实存在」的商品
+- 该反问时没反问、直接推荐了知识库里的商品
+
+只有「说了知识库里不存在的商品名 / 品牌 / 物流轨迹 / 政策条款」这类凭空捏造，才判 faithfulness=0。
+
+注意：回答里的「订单号」「价格数值」这类硬事实的编造由外部规则层精确比对，你主要判「商品名/品牌/物流/政策」这类语义编造。
 
 评分规则：
 - accuracy=1：回答正确回应了用户问题、与参考答案一致；accuracy=0：答非所问、答错、漏答关键信息。
-- faithfulness=1：语义层面没有凭空编造；faithfulness=0：编造了不存在的商品 / 状态 / 轨迹 / 政策条款。
+- faithfulness=1：没有编造知识库不存在的商品/品牌/物流/政策；faithfulness=0：编造了知识库不存在的商品名/品牌/物流轨迹/政策条款。
 
 只输出一个 JSON 对象，不要 markdown 代码块、不要任何多余文字，格式：
 {"accuracy": 0或1, "faithfulness": 0或1, "reason": "一句话理由"}
@@ -123,13 +148,40 @@ def _structural_faithfulness(turns, answer: str) -> dict:
     answer_prices = {int(p) for p in re.findall(r"¥\s*(\d+)", answer)}
     fake_prices = sorted(answer_prices - FACTS["prices"])
 
-    return {"faithful": not (fake_orders or fake_prices), "fake_orders": fake_orders, "fake_prices": fake_prices}
+    # 品牌校验：抓 answer 里的「XX牌」（2 字），不在白名单的判编造。
+    # 排除三类误抓：① 功能词前缀（什么/这个/哪个…）②「X品牌/X牌子」普通词（提取词以「品/子」结尾）③ 已知品牌前缀。
+    known_brand_prefixes = {b[:-1] for b in FACTS["brands"]}  # 贝乐/优宠/喵趣
+    answer_brand_tokens = set(re.findall(r"([一-龥]{2})牌", answer))
+    fake_brands = sorted(
+        f"{p}牌" for p in answer_brand_tokens
+        if p not in known_brand_prefixes and p not in _BRAND_STOP_PREFIXES and not p.endswith(("品", "子"))
+    )
+
+    return {
+        "faithful": not (fake_orders or fake_prices or fake_brands),
+        "fake_orders": fake_orders, "fake_prices": fake_prices, "fake_brands": fake_brands,
+    }
+
+
+def _kb_context() -> str:
+    """裁判的事实源上下文（判断「编造」的唯一依据）。喂给裁判，避免它拿「现实世界品牌存在性」误判 demo 虚构品牌。"""
+    return (
+        "【知识库事实（判断「编造」的唯一依据，不是现实世界）】\n"
+        f"品牌：{('、'.join(sorted(FACTS['brands']))) or '（无）'}\n"
+        f"商品：{'、'.join(sorted(FACTS['product_names']))}\n"
+        f"订单号：{'、'.join(sorted(FACTS['order_ids']))}\n"
+        "订单状态：已发货、待付款、已完成\n"
+        "库存状态：有货、缺货\n"
+        "物流状态：已揽收、运输中、派送中\n"
+        "物流地点：杭州分拨中心、杭州转运中心、上海转运中心\n"
+        "退换政策：7天无理由退货（未拆封）、质量问题15天内退换、食品类拆封不退、退款需人工审批（生成待审批工单）、退款1-3个工作日到账"
+    )
 
 
 async def _judge(query: str, answer: str, expected: str) -> dict:
-    """语义层裁判：判 accuracy + faithfulness（LLM）。
+    """语义层裁判：判 accuracy + faithfulness（LLM，喂 KB 事实源做 ground truth）。
     异常保护：裁判 LLM 调用失败返回 parse_fail=True（走显式报错路径），不让脚本整体崩溃、丢已跑结果。"""
-    user = f"用户问题：{query}\n客服回答：{answer}\n参考答案：{expected}"
+    user = f"{_kb_context()}\n\n用户问题：{query}\n客服回答：{answer}\n参考答案：{expected}"
     try:
         msg, _ = await chat_with_usage(
             [{"role": "system", "content": JUDGE_SYSTEM}, {"role": "user", "content": user}],
@@ -174,10 +226,44 @@ def _parse_judge(text: str) -> dict:
     return {"parse_fail": False, "accuracy": acc, "faithfulness": faith, "reason": str(d.get("reason", ""))}
 
 
-async def run_eval(out_suffix: str = "baseline", only_names=None):
+async def _run_case_once(name: str, turns: list, display_query: str, expected: str) -> dict:
+    """单次跑一个 case：跑 agent（多步 ReAct）+ 结构化层 + 语义裁判，返回单次结果。
+
+    异常不中断（和裁判异常同一处理路径），记 parse_fail 继续。
+    """
+    try:
+        session = AgentSession()
+        for t in turns:
+            answer = await session.chat(t)
+        end_reason = session.get_last_trace().end_reason if session.get_last_trace() else "未知"
+        struct = _structural_faithfulness(turns, answer)
+        verdict = await _judge(display_query, answer, expected)
+    except Exception as e:
+        answer = f"（评测异常：{type(e).__name__}）"
+        end_reason = "异常"
+        struct = {"faithful": True, "fake_orders": [], "fake_prices": [], "fake_brands": []}
+        verdict = {"parse_fail": True, "reason": f"评测异常: {type(e).__name__}"}
+
+    # 解析失败/字段非法 → 显式报错 + 按 0 计入（不静默从分母剔除，避免「裁判崩了」伪装成「没这个 case」）
+    parse_fail = verdict.get("parse_fail", False)
+    llm_acc = 0 if parse_fail else verdict["accuracy"]
+    llm_faith = 0 if parse_fail else verdict["faithfulness"]
+    final_faith = 1 if (llm_faith and struct["faithful"]) else 0
+
+    return {
+        "answer": answer, "accuracy": llm_acc, "faithfulness": final_faith,
+        "faithfulness_llm": llm_faith, "faithfulness_struct": 1 if struct["faithful"] else 0,
+        "fake_orders": struct["fake_orders"], "fake_prices": struct["fake_prices"], "fake_brands": struct["fake_brands"],
+        "end_reason": end_reason, "parse_fail": parse_fail,
+        "reason": verdict.get("reason", ""),
+    }
+
+
+async def run_eval(out_suffix: str = "baseline", only_names=None, runs: int = 3):
     backend_up = _backend_up()
     print("=" * 80)
     print(f"后端状态：{'在线' if backend_up else '离线（订单/库存/物流类 case 将 SKIP）'}")
+    print(f"采样方式：每个 case 跑 {runs} 次取多数票（消除单次采样噪声）")
     print("=" * 80)
 
     eval_cases = EVAL_SET if not only_names else [c for c in EVAL_SET if c["name"] in only_names]
@@ -193,51 +279,48 @@ async def run_eval(out_suffix: str = "baseline", only_names=None):
             skipped.append(name)
             print(f"📍 [{i}/{len(eval_cases)}] {name} — SKIP（后端未启动）")
             continue
-        print(f"📍 [{i}/{len(eval_cases)}] {name} — 跑 agent + 分层判分中...")
 
-        try:
-            session = AgentSession()
-            for t in turns:
-                answer = await session.chat(t)
-            end_reason = session.get_last_trace().end_reason if session.get_last_trace() else "未知"
-            struct = _structural_faithfulness(turns, answer)
-            verdict = await _judge(display_query, answer, expected)
-        except Exception as e:
-            # 单个 case 异常不中断整轮，记 parse_fail 继续（和裁判异常同一处理路径）
-            answer = f"（评测异常：{type(e).__name__}）"
-            end_reason = "异常"
-            struct = {"faithful": True, "fake_orders": [], "fake_prices": []}
-            verdict = {"parse_fail": True, "reason": f"评测异常: {type(e).__name__}"}
+        runs_detail = []
+        for r in range(1, runs + 1):
+            print(f"📍 [{i}/{len(eval_cases)}] {name} — 第 {r}/{runs} 次...")
+            once = await _run_case_once(name, turns, display_query, expected)
+            once["run"] = r
+            runs_detail.append(once)
+            print(f"    acc={once['accuracy']} faith={once['faithfulness']} | {once['reason'][:60]}")
+            if once["parse_fail"]:
+                print(f"   ⚠️ 解析失败：{once['reason']}")
+            if once["fake_orders"] or once["fake_prices"] or once["fake_brands"]:
+                print(f"   ⚠️ 结构化层抓到编造：订单号{once['fake_orders']} 价格{once['fake_prices']} 品牌{once['fake_brands']}")
 
-        # 解析失败/字段非法 → 显式报错 + 按 0 计入分母（不静默从分母剔除，避免「裁判崩了」伪装成「没这个 case」）
-        parse_fail = verdict.get("parse_fail", False)
-        llm_acc = 0 if parse_fail else verdict["accuracy"]
-        llm_faith = 0 if parse_fail else verdict["faithfulness"]
-        final_faith = 1 if (llm_faith and struct["faithful"]) else 0
+        # 多数票：> N/2 才算通过（N=3 时 2 票通过，1 票不通过）
+        acc_votes = sum(1 for d in runs_detail if d["accuracy"])
+        faith_votes = sum(1 for d in runs_detail if d["faithfulness"])
+        parse_fail_count = sum(1 for d in runs_detail if d["parse_fail"])
+        final_acc = 1 if acc_votes * 2 > runs else 0
+        final_faith = 1 if faith_votes * 2 > runs else 0
+        # 取「代表多数票」的一轮 answer 展示（优先取 acc/faith 都和多数票一致的，否则取第一轮）
+        rep = next((d for d in runs_detail if d["accuracy"] == final_acc and d["faithfulness"] == final_faith), runs_detail[0])
 
         record = {
-            "name": name, "query": display_query, "turns": turns, "answer": answer, "expected": expected,
-            "accuracy": llm_acc, "faithfulness": final_faith,
-            "faithfulness_llm": llm_faith, "faithfulness_struct": 1 if struct["faithful"] else 0,
-            "fake_orders": struct["fake_orders"], "fake_prices": struct["fake_prices"],
-            "end_reason": end_reason, "parse_fail": parse_fail,
+            "name": name, "query": display_query, "turns": turns,
+            "answer": rep["answer"], "expected": expected,
+            "accuracy": final_acc, "faithfulness": final_faith,
+            "accuracy_votes": f"{acc_votes}/{runs}", "faithfulness_votes": f"{faith_votes}/{runs}",
+            "runs": runs_detail,
+            "end_reason": " | ".join(d["end_reason"] for d in runs_detail),
+            "parse_fail": parse_fail_count,
         }
         cases.append(record)
-
-        print(f"   回答：{answer}")
-        print(f"   裁判：accuracy={llm_acc} faithfulness(语义)={llm_faith} 结构化={struct['faithful']} 最终={final_faith} | {verdict.get('reason', '')}")
-        if parse_fail:
-            print(f"   ⚠️ 解析失败：{verdict.get('reason', '')}")
-        if struct["fake_orders"] or struct["fake_prices"]:
-            print(f"   ⚠️ 结构化层抓到编造：订单号{struct['fake_orders']} 价格{struct['fake_prices']}")
+        print(f"    👉 多数票: accuracy={acc_votes}/{runs} faithfulness={faith_votes}/{runs}")
 
     total = len(cases)
     acc_sum = sum(c["accuracy"] for c in cases)
     faith_sum = sum(c["faithfulness"] for c in cases)
-    parse_fail_count = sum(1 for c in cases if c["parse_fail"])
+    parse_fail_count = sum(c["parse_fail"] for c in cases)
 
     summary = {
         "total": total, "skipped": len(skipped), "parse_fail": parse_fail_count,
+        "runs": runs,
         "accuracy": round(acc_sum / total, 4) if total else 0,
         "faithfulness": round(faith_sum / total, 4) if total else 0,
     }
@@ -248,9 +331,9 @@ async def run_eval(out_suffix: str = "baseline", only_names=None):
     if skipped:
         print(f"SKIP（后端离线）：{len(skipped)} 条 {skipped}")
     if parse_fail_count:
-        print(f"⚠️ 解析失败（已按 0 计入分母）：{parse_fail_count} 条 {[c['name'] for c in cases if c['parse_fail']]}")
+        print(f"⚠️ 解析失败（{runs} 次采样累计）：{parse_fail_count} 次")
     print("=" * 80)
-    print("⚠️ 这是 baseline。asyncio 改造后 `--out after` 重跑 + `--diff` 对比，确认准确率/忠实度不退化。")
+    print(f"✅ baseline 已定稿：每个 case 跑 {runs} 次取多数票，结果可信。")
 
     _save_results(summary, cases, out_suffix)
 
@@ -308,10 +391,22 @@ if __name__ == "__main__":
             os.path.join(RESULT_DIR, "answer_quality_after.json"),
         )
     else:
-        out_suffix = "after" if "--out" in sys.argv else "baseline"
+        # --out 接受值：--out baseline 落盘 baseline，--out after 落盘 after，裸 --out 默认 after（保持旧开关行为）
+        out_suffix = "baseline"
+        if "--out" in sys.argv:
+            idx = sys.argv.index("--out")
+            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("--"):
+                out_suffix = sys.argv[idx + 1]
+            else:
+                out_suffix = "after"
         only_names = None
+        runs = 3
         if "--only" in sys.argv:
             idx = sys.argv.index("--only")
             if idx + 1 < len(sys.argv):
                 only_names = sys.argv[idx + 1].split(",")
-        asyncio.run(run_eval(out_suffix, only_names))
+        if "--runs" in sys.argv:
+            idx = sys.argv.index("--runs")
+            if idx + 1 < len(sys.argv):
+                runs = int(sys.argv[idx + 1])
+        asyncio.run(run_eval(out_suffix, only_names, runs))

@@ -15,6 +15,7 @@ import sys
 import os
 import uuid
 import asyncio
+import threading
 from urllib.parse import quote
 
 import httpx
@@ -241,14 +242,22 @@ async def refund_order(order_id: str, amount: float) -> str:
 
 
 _hybrid_retriever = None
+_hybrid_retriever_lock = threading.Lock()
 
 
 def _get_hybrid_retriever():
-    """懒加载单例——BM25 索引 + embedding 模型只建一次"""
+    """懒加载单例——BM25 索引 + embedding 模型只建一次。
+
+    线程安全（asyncio 改造后踩的坑）：工具经 asyncio.gather 并发执行、落到 to_thread 线程池，
+    多个线程可能同时首次调用、并发初始化单例，Qdrant 本地模式文件锁会 AlreadyLocked → RuntimeError。
+    加锁 + 双重检查：锁外快速路径（已初始化后零开销），锁内再判，保证只初始化一次。
+    """
     global _hybrid_retriever
     if _hybrid_retriever is None:
-        from src.infra.hybrid_retriever import HybridRetriever
-        _hybrid_retriever = HybridRetriever()
+        with _hybrid_retriever_lock:
+            if _hybrid_retriever is None:
+                from src.infra.hybrid_retriever import HybridRetriever
+                _hybrid_retriever = HybridRetriever()
     return _hybrid_retriever
 
 
