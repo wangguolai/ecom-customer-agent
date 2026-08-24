@@ -21,26 +21,16 @@ from rank_bm25 import BM25Okapi
 from src.infra.embedding import get_embedding_model
 from src.infra.vector_store import QdrantStore
 from src.infra import reranker
+from src.derived.categories import build_jieba_words
 
 RRF_K = 60
 DEFAULT_TOP_K = 3
 RERANK_CANDIDATE_N = 20  # RRF 融合后先取这么多候选，交给 Rerank 精排
 VEC_SCORE_LOW = 0.4  # 召回层双低拒答：向量 top1 分数 < 此值且 BM25 无召回 → 判超知识库，拒答
 
-# 品牌名 + 品类词加进 jieba 词典，避免在 query 语境里被切成单字/错误切分，导致 BM25 跨类误匹配。
-# 依据：放进「我想买{词}」语境实测（不是单独测词——单独测会漏掉「化毛膏」这类单独完整、语境里碎成「买化/毛膏」的）。
-# 切成合理多词的（如「训练饼干」→训练/饼干）不补，两边 token 一致照样匹配。
-_CUSTOM_WORDS = [
-    # 品牌名
-    "贝乐牌", "优宠牌", "喵趣牌",
-    # 品类词（语境实测会碎）
-    "猫粮", "狗粮", "猫砂", "钙磷",
-    "磨牙棒", "猫薄荷", "逗猫棒", "猫抓板",
-    "猫窝", "猫爬架",
-    "老年猫", "老年犬", "小型犬",
-    "化毛膏", "洁齿", "猫条", "漏食球", "梳毛",
-]
-for _w in _CUSTOM_WORDS:
+# jieba 词典从派生层生成：品牌名（自动，从 products.md）+ 特征词（人维护，映射表 category_synonyms.md）。
+# 特征词依据「我想买{词}」语境实测会碎才加（切成合理多词的如「训练饼干」不补）。
+for _w in build_jieba_words():
     jieba.add_word(_w)
 
 
@@ -54,10 +44,11 @@ class HybridRetriever:
 
     def _build_bm25(self):
         """从 Qdrant scroll 出所有 chunk 建 BM25 索引，保证和向量库数据对齐"""
-        chunks = self._store.scroll_all()  # [(chunk_id, text, category)]
-        self._chunk_ids = [cid for cid, _, _ in chunks]
-        self._chunk_texts = [text for _, text, _ in chunks]
-        self._chunk_categories = [cat for _, _, cat in chunks]
+        chunks = self._store.scroll_all()  # [(chunk_id, text, title, category)]
+        self._chunk_ids = [cid for cid, _, _, _ in chunks]
+        self._chunk_texts = [text for _, text, _, _ in chunks]
+        self._chunk_titles = [title for _, _, title, _ in chunks]
+        self._chunk_categories = [cat for _, _, _, cat in chunks]
         if not self._chunk_texts:
             self._bm25 = None  # 知识库为空，跳过 BM25（search 里退化为纯向量）
             return
@@ -119,17 +110,18 @@ class HybridRetriever:
 
         # 4. Rerank 精排（先取 top_n 候选，用 CrossEncoder 精排到 top_k）
         text_map = dict(zip(self._chunk_ids, self._chunk_texts))
+        title_map = dict(zip(self._chunk_ids, self._chunk_titles))
         top_n = min(RERANK_CANDIDATE_N, len(fused))
         candidates = fused[:top_n]
-        reranked = self._rerank(query, candidates, top_k, text_map)
+        reranked = self._rerank(query, candidates, top_k, text_map, title_map)
         if reranked is not None:
             # Rerank 只负责排序，不做绝对分数阈值拒答（拒答已移到召回层四维判断）。
             return label, reranked
 
-        # 6. 降级：Rerank 不可用则退回 RRF 排序（附 text）
+        # 6. 降级：Rerank 不可用则退回 RRF 排序（附 text + title）
         result = []
         for cid, score in candidates[:top_k]:
-            result.append((cid, score, text_map.get(cid, "")))
+            result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, "")))
         return label, result
 
     def _classify(self, vec_top1: str, vec_top1_score: float, bm25_top1: str) -> str:
@@ -151,8 +143,8 @@ class HybridRetriever:
             return "双高" if vec_high else "单高一致"
         return "单高冲突"  # 两路 top1 不同
 
-    def _rerank(self, query: str, candidates: list, top_k: int, text_map: dict):
-        """CrossEncoder 精排候选，返回 [(chunk_id, rerank_score, text)]；不可用返回 None"""
+    def _rerank(self, query: str, candidates: list, top_k: int, text_map: dict, title_map: dict):
+        """CrossEncoder 精排候选，返回 [(chunk_id, rerank_score, text, title)]；不可用返回 None"""
         texts = [text_map.get(cid, "") for cid, _ in candidates]
         ranked = reranker.rerank(query, texts, top_k=top_k)
         if ranked is None:
@@ -160,7 +152,7 @@ class HybridRetriever:
         result = []
         for score, idx in ranked:
             cid = candidates[idx][0]
-            result.append((cid, score, text_map.get(cid, "")))
+            result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, "")))
         return result
 
 
@@ -175,6 +167,5 @@ if __name__ == "__main__":
         print(f"Q: {q}")
         label, results = retriever.search(q)
         print(f"  置信度: {label}")
-        for cid, score, text in results:
-            title = text.split("\n")[0].strip("# ").strip() if text else ""
+        for cid, score, text, title in results:
             print(f"  ({score:.4f}) {title}")

@@ -5,7 +5,7 @@
   search_products   商品知识库检索（只读，RAG）
   search_orders     订单查询（只读）
   search_logistics  物流追踪（只读）
-  check_stock       库存查询（只读，含价格）
+  check_stock       库存查询（只读）
   get_return_policy 退货政策（只读）
   refund_order      退款申请（写，待人工审批）
   transfer_to_human 转人工（写，demo 阶段无权限开关）
@@ -79,7 +79,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "check_stock",
-            "description": "查询某个商品的库存和价格",
+            "description": "查询某个商品的库存（是否有货、库存量）",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -183,7 +183,7 @@ async def search_logistics(order_id: str) -> str:
 
 
 async def check_stock(product_name: str) -> str:
-    """库存查询（真实后端接口，含价格）"""
+    """库存查询（真实后端接口）。只查库存量，价格走 search_products（价格是静态属性，唯一真相在知识库）。"""
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             resp = await client.get(f"{BACKEND_URL}/stock/{quote(product_name)}")
@@ -195,8 +195,8 @@ async def check_stock(product_name: str) -> str:
         return f"库存查询失败（状态码 {resp.status_code}），请稍后重试。"
     d = resp.json()
     if d["qty"] <= 0:
-        return f"「{product_name}」暂时缺货，价格 {d['price']}。"
-    return f"「{product_name}」有货，库存 {d['qty']} 件，价格 {d['price']}。"
+        return f"「{product_name}」暂时缺货。"
+    return f"「{product_name}」有货，库存 {d['qty']} 件。"
 
 
 async def get_return_policy() -> str:
@@ -261,15 +261,9 @@ def _get_hybrid_retriever():
     return _hybrid_retriever
 
 
-# 类别关键词表（意图识别 → category 映射；识别不出返回 None，不过滤保召回）
-CATEGORY_KEYWORDS = {
-    "猫粮": ["猫粮", "幼猫", "成猫", "奶糕", "美毛", "泌尿", "牛磺酸", "老年猫", "布偶", "英短"],
-    "狗粮": ["狗粮", "幼犬", "成犬", "骨骼", "钙磷", "老年犬", "大型犬", "小型犬"],
-    "猫砂": ["猫砂", "结团", "除臭", "膨润土", "松木", "水晶"],
-    "零食": ["零食", "冻干", "磨牙棒", "洁齿", "化毛膏", "猫条", "训练饼干"],
-    "玩具": ["玩具", "猫薄荷", "橡胶球", "飞盘", "逗猫棒", "猫抓板", "漏食球"],
-    "用品": ["饮水机", "航空箱", "梳毛", "牵引绳", "猫窝", "狗窝", "猫爬架", "食盆"],
-}
+# 类别触发词表（意图识别 → category 映射）从派生层生成（读映射表 category_synonyms.md）
+from src.derived.categories import build_category_keywords
+CATEGORY_KEYWORDS = build_category_keywords()
 
 
 def detect_category(query: str):
@@ -308,8 +302,7 @@ def _search_products_sync(query: str, top_k: int) -> str:
         return "知识库检索无高置信度匹配。请如实告知用户暂未找到相关信息、可建议联系人工客服，不要编造商品信息。"
 
     parts = []
-    for i, (cid, score, text) in enumerate(results, 1):
-        title = text.split("\n")[0].strip("# ").strip() if text else ""
+    for i, (cid, score, text, title) in enumerate(results, 1):
         parts.append(f"[{i}] {title}\n{text}")
 
     # 策略提示（系统生成的受信任指令）+ 检索结果（外部数据），分开标注，不混进「数据/指令分离」的防御里

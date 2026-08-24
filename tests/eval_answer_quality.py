@@ -47,24 +47,9 @@ RESULT_DIR = os.path.join(_project_root, "tests", "eval_results")
 # 订单号来自 backend 种子（不在 products.md，手写）。数据迁移时只需改 products.md，白名单自动更新。
 # ═══════════════════════════════════════════════════════════════
 def _load_facts() -> dict:
-    products_path = os.path.join(_project_root, "data", "products.md")
-    with open(products_path, encoding="utf-8") as f:
-        content = f.read()
-
-    brands = set()
-    product_names = set()
-    for title in re.findall(r"^## (.+)$", content, flags=re.MULTILINE):
-        product_names.add(title.strip())
-        for b in re.findall(r"（([^（）]+牌)）", title):
-            brands.add(b)
-    prices = {int(p) for p in re.findall(r"¥\s*(\d+)", content)}
-
-    return {
-        "order_ids": {"20240818001", "20240817002", "20240816003"},  # backend _SEED_ORDERS
-        "brands": brands,
-        "product_names": product_names,
-        "prices": prices,
-    }
+    """评测白名单（从派生层生成：品牌/价格/商品名从 products.md，订单号/状态/物流从 backend 种子）"""
+    from src.derived.facts import build_facts
+    return build_facts()
 
 
 FACTS = _load_facts()
@@ -170,10 +155,10 @@ def _kb_context() -> str:
         f"品牌：{('、'.join(sorted(FACTS['brands']))) or '（无）'}\n"
         f"商品：{'、'.join(sorted(FACTS['product_names']))}\n"
         f"订单号：{'、'.join(sorted(FACTS['order_ids']))}\n"
-        "订单状态：已发货、待付款、已完成\n"
+        f"订单状态：{'、'.join(sorted(FACTS['order_statuses']))}\n"
         "库存状态：有货、缺货\n"
-        "物流状态：已揽收、运输中、派送中\n"
-        "物流地点：杭州分拨中心、杭州转运中心、上海转运中心\n"
+        f"物流状态：{'、'.join(sorted(FACTS['logistics_statuses']))}\n"
+        f"物流地点：{'、'.join(sorted(FACTS['logistics_locations']))}\n"
         "退换政策：7天无理由退货（未拆封）、质量问题15天内退换、食品类拆封不退、退款需人工审批（生成待审批工单）、退款1-3个工作日到账"
     )
 

@@ -67,12 +67,23 @@ EVAL_SET = [
 
 
 def _build_title_map(store):
-    """chunk_id -> title 映射"""
+    """chunk_id -> title 映射（title 从 Qdrant payload 拿，不切片）"""
     title_map = {}
-    for cid, text, _ in store.scroll_all():
-        title = text.split("\n")[0].strip("# ").strip()
+    for cid, text, title, _ in store.scroll_all():
         title_map[cid] = title
     return title_map
+
+
+def _validate_expected(title_set: set) -> None:
+    """一致性校验：标注集 expected 标题必须在入库 title 集合里，否则报警（防「改名后 Recall 恒 0」静默失效）"""
+    missing = []
+    for _, expected in EVAL_SET:
+        for e in expected:
+            if e not in title_set:
+                missing.append(e)
+    if missing:
+        print(f"⚠️ 标注集 expected 标题不在知识库 title 集合（商品改名/删除？）：{sorted(set(missing))}")
+        print("   → Recall 会被低估，请同步更新 EVAL_SET。")
 
 
 def run_eval():
@@ -80,6 +91,7 @@ def run_eval():
     retriever = HybridRetriever()  # 内部已创建 QdrantStore（本地模式单实例，文件锁）
     store = retriever._store       # 复用，避免同一目录起两个 client 触发锁冲突
     title_map = _build_title_map(store)
+    _validate_expected(set(title_map.values()))
 
     methods = ["纯向量", "纯BM25", "混合+预过滤+Rerank"]
     agg = {m: {"recall": [], "mrr": []} for m in methods}
@@ -103,7 +115,7 @@ def run_eval():
         # 3. 混合 + 预过滤 + Rerank（完整链路）
         category = detect_category(query)
         _, hybrid_results = retriever.search(query, top_k=3, category=category)
-        hybrid_titles = [t.split("\n")[0].strip("# ").strip() for _, _, t in hybrid_results]
+        hybrid_titles = [title for _, _, _, title in hybrid_results]
 
         for method, titles in zip(methods, [vec_titles, bm25_titles, hybrid_titles]):
             recall = len(set(expected) & set(titles)) / len(expected)
