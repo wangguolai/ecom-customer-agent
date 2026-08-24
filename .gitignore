@@ -18,3 +18,7 @@ tests/eval_results/answer_quality_retest.json
 
 # IDE
 .vscode/
+
+# 本地临时产物（清理 C 盘脚本 + Redis 快照，非项目内容）
+.tmp/
+dump.rdb
