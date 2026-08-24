@@ -87,7 +87,7 @@
 
 ### 决策 1：内存派生 vs 持久化派生（分两类，不同步机制）
 - **内存派生**（jieba 词典 / 类别表 / 评测白名单）：运行时从实体生成，模块 import 建一次。源改了 → 重启即同步，零 refresh。
-- **持久化派生**（向量库 / MySQL DB）：`python -m src.refresh` 重建。源改了 → 跑 refresh。
+- **持久化派生**（向量库 / MySQL DB / Redis 缓存）：`python -m src.refresh` 重建（含 Redis FLUSHDB）。源改了 → 跑 refresh。
 
 ### 决策 2：products.md 保留 md 格式（不升级 JSON）
 - 换人可读、运营可改；代价是 parser 靠正则脆弱。demo 规模值得。迁结构化源时 parser 是唯一入口，改一处。

@@ -55,7 +55,7 @@
     ↓ parse（唯一 parser）
 实体层 Domain（有 schema）: Product / Order / Logistics / Stock
     ↓ materialize（派生）
-派生层 Derived（可重建）: 向量库 + BM25 + jieba词典 + 意图触发词 + 评测白名单 + MySQL
+派生层 Derived（可重建）: 向量库 + BM25 + jieba词典 + 意图触发词 + 评测白名单 + MySQL + Redis缓存
 ```
 
 - **单向数据流**：源 → 实体 → 派生，派生永不反向写源；消费方（tools / hybrid_retriever / eval）不自己解析源，import 派生层。
@@ -96,6 +96,7 @@
 | Embedding | BGE-small-zh-v1.5（512 维） | 中文优化 + 本地免费（零 API 成本）+ 数据量小 512 维够用 |
 | 向量库 | Qdrant 本地文件模式 | 无需 Docker（中国大陆网络限制）+ API 简洁 + 数据量小本地够用 |
 | 数据库 | MySQL（连接池 + 唯一约束幂等） | 主流（索引/事务/锁要点）；SQLite 只是零配置起步，迁 MySQL 是「真实工具」演进 |
+| 缓存 | Redis（Cache Aside + 空值哨兵 + 降级） | 缓存是旁路、可重建副本；减轻 MySQL 读压力，缓存挂降级查库不拖垮真源 |
 | 元数据管理 | SSOT 三层（源 → 实体 → 派生） | 单一数据源 + 派生可重建；消除「源改了派生忘同步」的散落 |
 | 检索策略 | category 预过滤 → BM25+向量混合召回 → 双低拒答 → RRF 融合 → Rerank 精排 | 预过滤在召回时就锁类别，Rerank 只对已锁类别的候选精排；「召回优先 or 拒答」动机见 6.2 |
 | 动态数据 | 价格/库存走工具实时查，不写进向量库 | 数据分治：向量库是「快照」，动态数据走工具才有时效性 |
@@ -130,7 +131,7 @@
 
 ## 7. 当前状态与不足（「诚实讲不足」用）
 
-- 订单/物流/库存已接 FastAPI + MySQL 后端（连接池 + 唯一约束幂等 + 二级索引 + 超时降级），但后端数据是**种子数据**（非生产数据），转人工仍是 mock
+- 订单/物流/库存已接 FastAPI + MySQL 后端（连接池 + 唯一约束幂等 + 二级索引 + 超时降级）+ Redis 缓存层（Cache Aside 读路径 + 空值哨兵 + 降级），但后端数据是**种子数据**（非生产数据），转人工仍是 mock
 - 元数据同步已落地 SSOT 三层架构（源→实体→派生，8 处散落清零），但「数据飞轮」（bad case 回流成回归集）还没接
 - Prompt Injection 已做 prompt 级（数据/指令分离）+ 代码级（写操作权限开关：refund 待审批 + 参数校验 + 读/写分离），但「待审批」是 mock（无真实审批流程）
 - 评测做了检索层（Recall@3 + MRR）+ 回答质量（LLM-as-judge + 结构化层抓硬编造，白名单从源自动生成），但 faithfulness「判定只用 struct」还没下沉彻底（LLM 仍判 faithfulness）

@@ -81,6 +81,7 @@ agent 生产级（原 4 项「升级」，当前是 demo 级）：
 - 编排：手写 ReAct 循环（不用 LangGraph/LangChain，理由见 docs/framework-selection.md）
 - RAG：Qdrant + 混合检索（BM25+向量+RRF）+ Rerank
 - 后端：FastAPI + MySQL（订单/物流/库存真实数据源，连接池 + 唯一约束幂等）
+- 缓存：Redis（Cache Aside 读缓存 + 空值哨兵 + 降级，减轻 MySQL 读压力）
 - 接口：FastAPI（SSE 流式是规划、未落地）
 - 模型：DeepSeek（Kimi 等多模型分工是规划、未落地）
 - 语言：Python
