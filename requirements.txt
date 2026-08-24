@@ -7,3 +7,5 @@ rank-bm25
 fastapi
 uvicorn
 requests
+pymysql
+DBUtils
