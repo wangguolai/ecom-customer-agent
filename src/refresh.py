@@ -20,16 +20,21 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 def refresh():
     """重建所有持久化派生数据"""
-    print("📍 [1/2] MySQL — 重建 seed 表（DROP + 灌种子）...")
+    print("📍 [1/3] MySQL — 重建 seed 表（DROP + 灌种子）...")
     from src.backend.main import _init_db
     _init_db()
     print("    MySQL 已重建。")
 
-    print("📍 [2/2] 向量库 — 重建 product_knowledge（embedding + 写 Qdrant）...")
+    print("📍 [2/3] Redis — 清空缓存副本（FLUSHDB）...")
+    from src.backend import cache
+    cache.flush()
+    print("    Redis 缓存已清空。")
+
+    print("📍 [3/3] 向量库 — 重建 product_knowledge（embedding + 写 Qdrant）...")
     from src.index_products import build_knowledge_base
     build_knowledge_base()
 
-    print("✅ refresh 完成：MySQL + 向量库 已从源数据重建。")
+    print("✅ refresh 完成：MySQL + Redis + 向量库 已从源数据重建。")
 
 
 if __name__ == "__main__":

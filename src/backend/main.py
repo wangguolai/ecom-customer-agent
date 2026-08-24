@@ -21,6 +21,7 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from src.backend.db import get_conn, close_conn
+from src.backend import cache
 from src.backend.seed import _SEED_ORDERS, _SEED_LOGISTICS, _SEED_STOCK
 
 
@@ -58,6 +59,13 @@ app = FastAPI(title="电商客服后端", lifespan=lifespan)
 
 @app.get("/orders/{order_id}")
 def get_order(order_id: str):
+    cache_key = f"ecom:order:{order_id}"
+    hit, data = cache.get_json(cache_key)
+    if hit:
+        if data is None:  # 命中空标记（不存在）
+            raise HTTPException(status_code=404, detail=f"未查到订单号 {order_id}")
+        return data
+
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -66,12 +74,22 @@ def get_order(order_id: str):
     finally:
         close_conn(conn)
     if row is None:
+        cache.set_empty(cache_key, 30)  # 缓存空标记防穿透
         raise HTTPException(status_code=404, detail=f"未查到订单号 {order_id}")
-    return {"order_id": order_id, "status": row[0], "created_at": row[1], "product": row[2], "amount": row[3]}
+    data = {"order_id": order_id, "status": row[0], "created_at": row[1], "product": row[2], "amount": row[3]}
+    cache.set_json(cache_key, data, 60)
+    return data
 
 
 @app.get("/logistics/{order_id}")
 def get_logistics(order_id: str):
+    cache_key = f"ecom:logistics:{order_id}"
+    hit, data = cache.get_json(cache_key)
+    if hit:
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"未查到订单号 {order_id} 的物流信息")
+        return data
+
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -80,12 +98,22 @@ def get_logistics(order_id: str):
     finally:
         close_conn(conn)
     if not rows:
+        cache.set_empty(cache_key, 30)
         raise HTTPException(status_code=404, detail=f"未查到订单号 {order_id} 的物流信息")
-    return {"order_id": order_id, "traces": [{"time": r[0], "location": r[1], "status": r[2]} for r in rows]}
+    data = {"order_id": order_id, "traces": [{"time": r[0], "location": r[1], "status": r[2]} for r in rows]}
+    cache.set_json(cache_key, data, 60)
+    return data
 
 
 @app.get("/stock/{product_name}")
 def get_stock(product_name: str):
+    cache_key = f"ecom:stock:{product_name}"
+    hit, data = cache.get_json(cache_key)
+    if hit:
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"未查到商品「{product_name}」")
+        return data
+
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -94,8 +122,11 @@ def get_stock(product_name: str):
     finally:
         close_conn(conn)
     if row is None:
+        cache.set_empty(cache_key, 30)
         raise HTTPException(status_code=404, detail=f"未查到商品「{product_name}」")
-    return {"product_name": product_name, "qty": row[0]}
+    data = {"product_name": product_name, "qty": row[0]}  # qty=0 是真实数据（缺货），正常缓存
+    cache.set_json(cache_key, data, 30)
+    return data
 
 
 @app.post("/refund")
