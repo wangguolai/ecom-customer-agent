@@ -22,6 +22,8 @@ backend 加 Redis 缓存层：订单/物流/库存**三个只读接口**走 Cach
 
 **连接池**：进程级单例 `Redis(host=..., port=..., decode_responses=True)`，模块级 `_redis` 单例（类似 `db.py` 的 `_pool`），不每请求重建。`decode_responses=True`（否则返回 bytes，json.loads 踩编码坑）。
 
+**RESP3 兼容坑（实现时踩）**：redis-py 8.x 默认 RESP3（连接时发 `HELLO 3`），但 tporadowski/redis 是 5.x 不支持 RESP3 → `unknown command HELLO`。解法：构造加 `protocol=2` 强制 RESP2。requirements 锁 `redis>=8,<9`（保 8.x 行为一致）。这是「新版客户端 vs 旧版服务端」的兼容坑，未来模块 4/5/6 复用同一 Redis 的读者别重踩。
+
 **Qdrant 类比**：Redis 是独立网络进程、连接池线程安全，**无 Qdrant 本地模式的 `AlreadyLocked` 文件锁坑**，不需要 `_get_hybrid_retriever` 那种双重检查锁——这是可以说明的「Redis vs Qdrant 本地模式」区别。
 
 ## 四、改动清单
@@ -51,8 +53,10 @@ backend 加 Redis 缓存层：订单/物流/库存**三个只读接口**走 Cach
 - TTL：订单/物流 `EX 60`、库存 `EX 30`、空标记 `EX 30`。
 
 ### 决策 4：Redis 降级（缓存是旁路，不成为单点）
-- **`get` 对连接异常（ConnectionError）吞掉返回 None（视为 miss）**→ 请求回落到 MySQL，正确性不受影响。
-- **`set` 失败只记日志、不抛**。
+- **`get` 对 Redis 异常（`RedisError`，含 ConnectionError + TimeoutError）吞掉返回 None（视为 miss）**→ 请求回落到 MySQL，正确性不受影响。
+- **超时必须设**：构造加 `socket_connect_timeout=0.5, socket_timeout=1`——redis-py 默认 `socket_timeout=None`（无限阻塞），Redis 半开连接/网络分区会抛 TimeoutError 而不是 ConnectionError，只捕后者会让超时冒出去挂死线程池。缓存是旁路，超时降级查库，不能拖垮真源。
+- **⚠️ 必须关默认重试（2026-08-24 实测坑）**：redis-py 8.1 的 `Redis()` 默认 `retry=Retry(ExponentialWithJitterBackoff(), 10)`——连接失败会退避重试 10 次。实测 Redis 停止时每次操作 ~9s（0.5s connect 超时 × 10 + 指数退避），比无限阻塞还隐蔽。构造加 `retry=None` 关闭，连接失败 0.5s 即抛 RedisError 降级查库；Redis 恢复后连接池自会建新连接，不需要重试。
+- **`set` 失败只记日志、不抛**（含空标记写入）。
 - 启动时 Redis 连接失败不阻塞服务（lifespan 里 Redis ping 非致命探活）。
 - **验收**：停掉 Redis 后，三端点仍返回正确数据（降级查库）。
 

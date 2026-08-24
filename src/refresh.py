@@ -25,7 +25,7 @@ def refresh():
     _init_db()
     print("    MySQL 已重建。")
 
-    print("📍 [2/3] Redis — 清空缓存副本（FLUSHDB）...")
+    print("📍 [2/3] Redis — 清空缓存副本（ecom:* 前缀删）...")
     from src.backend import cache
     cache.flush()
     print("    Redis 缓存已清空。")

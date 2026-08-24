@@ -9,4 +9,4 @@ uvicorn
 requests
 pymysql
 DBUtils
-redis
+redis>=8,<9  # RESP3 兼容坑：8.x 默认 RESP3，tporadowski Redis 5.x 不支持 → 代码已强制 protocol=2

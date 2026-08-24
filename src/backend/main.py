@@ -7,6 +7,7 @@
 
 import sys
 import os
+import re
 from uuid import uuid4
 from contextlib import asynccontextmanager
 
@@ -49,8 +50,15 @@ def _init_db():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """启动时初始化 DB。不在 import 时执行——MySQL 连不上不该让 import 崩，移到这里报错更明确。"""
+    """启动时初始化 DB。不在 import 时执行——MySQL 连不上不该让 import 崩，移到这里报错更明确。
+
+    _init_db() 会 DROP 重建 seed 表（重写真源），和 refresh.py 同属「重写真源」路径，
+    缓存副本必须同步失效（cache.flush()），否则重启后最长 60s 返回旧数据——SSOT 单向链路闭环。
+    """
     _init_db()
+    cache.flush()
+    # Redis 探活（非致命）：没起来就降级查库，但启动日志要能区分「Redis OK / 不可用」方便排障
+    print("✅ Redis OK（缓存可用）" if cache.ping() else "⚠️ Redis 不可用，降级查库（缓存旁路）")
     yield
 
 
@@ -59,6 +67,12 @@ app = FastAPI(title="电商客服后端", lifespan=lifespan)
 
 @app.get("/orders/{order_id}")
 def get_order(order_id: str):
+    # 参数校验（穿透三层第一层）：非法格式直接 400，不查库不写空标记——
+    # 否则任意不存在订单号都会写 30s 空标记，被 LLM 幻觉/攻击者刷爆 Redis。
+    # 上界 32 与 orders.logistics 的 order_id VARCHAR(32) 对齐：超长纯数字在库中必然不存在，
+    # 校验住它才真正堵住「刷空标记」口子。
+    if not re.fullmatch(r"\d{8,32}", order_id):
+        raise HTTPException(status_code=400, detail=f"订单号格式非法：{order_id}")
     cache_key = f"ecom:order:{order_id}"
     hit, data = cache.get_json(cache_key)
     if hit:
@@ -83,6 +97,8 @@ def get_order(order_id: str):
 
 @app.get("/logistics/{order_id}")
 def get_logistics(order_id: str):
+    if not re.fullmatch(r"\d{8,32}", order_id):
+        raise HTTPException(status_code=400, detail=f"订单号格式非法：{order_id}")
     cache_key = f"ecom:logistics:{order_id}"
     hit, data = cache.get_json(cache_key)
     if hit:
@@ -107,6 +123,8 @@ def get_logistics(order_id: str):
 
 @app.get("/stock/{product_name}")
 def get_stock(product_name: str):
+    if not product_name or len(product_name) > 64:
+        raise HTTPException(status_code=400, detail=f"商品名非法：{product_name}")
     cache_key = f"ecom:stock:{product_name}"
     hit, data = cache.get_json(cache_key)
     if hit:
@@ -140,6 +158,9 @@ def refund_order(payload: dict):
     amount = payload.get("amount")
     if not order_id or amount is None:
         raise HTTPException(status_code=400, detail="缺少 order_id 或 amount")
+    # 与 get_order/get_logistics 同标准：非法订单号直接 400，不进 SELECT
+    if not re.fullmatch(r"\d{8,32}", order_id):
+        raise HTTPException(status_code=400, detail=f"订单号格式非法：{order_id}")
 
     conn = get_conn()
     try:
