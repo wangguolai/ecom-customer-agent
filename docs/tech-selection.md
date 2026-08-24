@@ -103,16 +103,17 @@
 
 ---
 
-## 8. 数据库：SQLite
+## 8. 数据库：MySQL（原 SQLite，2026-08-24 迁移）
 
-**那个**：PostgreSQL、MySQL、Redis
+**那个**：PostgreSQL、SQLite、Redis
 
 | 替代 | 为什么不选 |
 |------|-----------|
-| PostgreSQL / MySQL | 要装服务、要运维，10 条种子数据杀鸡用牛刀 |
+| SQLite | 单写者 + 无连接池，写密集会 `database is locked`；且宽松语法（TEXT 主键）掩盖 MySQL 严格性 |
+| PostgreSQL | 更强大（JSON/全文检索），但 MySQL 最普及（/教程/公司都用），贴合目标 |
 | Redis | 内存库，不适合做持久化订单库（除非做缓存） |
 
-**为什么 SQLite**：零配置、文件型、Python 标准库自带。**诚实点**：生产高并发要换 Postgres——SQLite 单写者 + 无连接池，写密集会 `database is locked`。
+**为什么 MySQL**：后端基础盘要学「索引 / 事务 / 锁 / 连接池」这些要点，MySQL 是主流；SQLite 只是零配置起步，迁到 MySQL 是「真实工具」的演进（连接池 + 唯一约束幂等 + 二级索引）。
 
 ---
 
@@ -153,6 +154,6 @@
 | 编排 | 手写 ReAct | 学习选择，踩坑讲底层 |
 | 工具交互 | Function Calling | 契约可靠，避正则地狱 |
 | 后端 | FastAPI | 自动文档 + 类型校验 |
-| 数据库 | SQLite | 零配置，小数据够用 |
+| 数据库 | MySQL | 主流，索引/事务/连接池要点落地 |
 | 分词 | jieba | 主流 + 自定义词典 |
 | 融合 | RRF | 免疫分数量纲不一致 |
