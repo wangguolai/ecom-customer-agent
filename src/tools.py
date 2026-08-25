@@ -13,6 +13,7 @@
 
 import sys
 import os
+import json
 import uuid
 import asyncio
 import threading
@@ -26,6 +27,8 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+from src.circuit_breaker import CircuitBreaker
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -138,6 +141,59 @@ TOOL_SCHEMAS = [
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 REQUEST_TIMEOUT = 2.0  # 秒
 
+# 熔断器（进程级单例）：demo 单后端一个全局实例；生产按下游服务粒度分（订单/物流/库存各一个）。
+# 熔断打开时快速失败（不真调后端），保护自己不被挂掉的后端拖垮，同时给用户降级话术。
+_breaker = CircuitBreaker(fail_threshold=5, cooldown=30.0)
+
+# HTTP 客户端（模块级单例，复用连接池）：不每次请求新建 AsyncClient，TCP 连接复用（keep-alive）。
+# httpx 懒创建连接池，import 时不在事件循环内也安全（连接在首次 await 时建立）。
+_client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
+
+
+async def _http_request(method, url, json=None):
+    """统一 HTTP 调用（带熔断）。返回 (resp, error)：
+    resp: httpx.Response（error=None 时，2xx/4xx 的响应）或 None
+    error: None 或 "breaker_open" / "rate_limited" / "timeout" / "5xx" / "bad_response"
+
+    熔断记账（失败判定边界）：
+      breaker_open：熔断打开，不调下游，直接快速失败
+      rate_limited：429 限流（后端健康，不算熔断失败，单独话术防 LLM 重试浪费轮次）
+      timeout：TransportError（Connect/Timeout/Read/RemoteProtocol 等）→ record_failure
+      5xx：后端内部错（如 MySQL 挂）→ record_failure
+      bad_response：200 但 JSON 解析失败（坑 7：200 垃圾响应）→ record_failure
+      4xx（除 429）：业务正常响应（订单不存在/参数非法/409）→ record_success（重置连续失败计数）
+    """
+    if not _breaker.allow():
+        return None, "breaker_open"
+    try:
+        if method == "GET":
+            resp = await _client.get(url)
+        else:
+            resp = await _client.post(url, json=json)
+    except httpx.TransportError:
+        # TransportError 覆盖 ConnectError/TimeoutException/ReadError/WriteError/
+        # RemoteProtocolError/CloseError——后端中途挂（连接断开）也走熔断失败。
+        # 只捕 ConnectError+TimeoutException 会漏 RemoteProtocolError，穿透炸 agent 循环。
+        _breaker.record_failure()
+        return None, "timeout"
+    if resp.status_code >= 500:
+        _breaker.record_failure()
+        return None, "5xx"
+    if resp.status_code == 429:
+        _breaker.record_success()  # 429 后端健康（被限流是自己的错），不算熔断失败
+        return None, "rate_limited"
+    if resp.status_code >= 400:
+        _breaker.record_success()  # 4xx 后端健康，重置连续失败计数
+        return resp, None
+    # 2xx：校验响应格式（坑 7），垃圾响应算熔断失败
+    try:
+        resp.json()
+    except (json.JSONDecodeError, ValueError):
+        _breaker.record_failure()
+        return None, "bad_response"
+    _breaker.record_success()
+    return resp, None
+
 RETURN_POLICY = (
     "退换货政策：\n"
     "1. 7 天无理由退货（商品未拆封、不影响二次销售）；\n"
@@ -153,10 +209,12 @@ RETURN_POLICY = (
 
 async def search_orders(order_id: str) -> str:
     """订单查询（真实后端接口）"""
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            resp = await client.get(f"{BACKEND_URL}/orders/{order_id}")
-    except (httpx.ConnectError, httpx.TimeoutException):
+    resp, err = await _http_request("GET", f"{BACKEND_URL}/orders/{order_id}")
+    if err:
+        if err == "breaker_open":
+            return "服务暂不可用（当前熔断中，请稍后重试或转人工）。"
+        if err == "rate_limited":
+            return "请求过于频繁，请稍后再试。"
         return "订单查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
     if resp.status_code == 404:
         return f"未查到订单号 {order_id}，请核对订单号。"
@@ -168,10 +226,12 @@ async def search_orders(order_id: str) -> str:
 
 async def search_logistics(order_id: str) -> str:
     """物流追踪（真实后端接口）"""
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            resp = await client.get(f"{BACKEND_URL}/logistics/{order_id}")
-    except (httpx.ConnectError, httpx.TimeoutException):
+    resp, err = await _http_request("GET", f"{BACKEND_URL}/logistics/{order_id}")
+    if err:
+        if err == "breaker_open":
+            return "服务暂不可用（当前熔断中，请稍后重试或转人工）。"
+        if err == "rate_limited":
+            return "请求过于频繁，请稍后再试。"
         return "物流查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
     if resp.status_code == 404:
         return f"未查到订单号 {order_id} 的物流信息。"
@@ -184,10 +244,12 @@ async def search_logistics(order_id: str) -> str:
 
 async def check_stock(product_id: str) -> str:
     """实时价格 + 库存查询（真实后端接口）。动态数据（价格/库存）走工具实时查，不进向量库（数据分治）。"""
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            resp = await client.get(f"{BACKEND_URL}/products/{quote(product_id)}")
-    except (httpx.ConnectError, httpx.TimeoutException):
+    resp, err = await _http_request("GET", f"{BACKEND_URL}/products/{quote(product_id)}")
+    if err:
+        if err == "breaker_open":
+            return "服务暂不可用（当前熔断中，请稍后重试或转人工）。"
+        if err == "rate_limited":
+            return "请求过于频繁，请稍后再试。"
         return "价格/库存查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
     if resp.status_code == 404:
         return f"未查到商品 {product_id}。"
@@ -224,13 +286,10 @@ async def refund_order(order_id: str, amount: float) -> str:
     MQ 异步化后：后端 /refund 返回「已受理」，工单由消费者异步生成。按响应里 ticket_id
     是否为空分两套话术——降级回退路径带工单号，异步路径带受理号。
     """
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            resp = await client.post(
-                f"{BACKEND_URL}/refund",
-                json={"order_id": order_id, "amount": amount},
-            )
-    except (httpx.ConnectError, httpx.TimeoutException):
+    resp, err = await _http_request("POST", f"{BACKEND_URL}/refund", json={"order_id": order_id, "amount": amount})
+    if err:
+        if err == "breaker_open":
+            return "退款服务暂不可用（当前熔断中，请稍后重试或转人工）。"
         return "退款服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
     if resp.status_code == 404:
         return f"未查到订单 {order_id}，无法退款。"

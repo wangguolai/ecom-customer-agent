@@ -40,6 +40,22 @@ QUEUE_KEY = "mq:refund_queue"
 DONE_PREFIX = "mq:refund:done:"
 DONE_TTL = 604800  # 幂等标记 7 天：控制 key 增长（脱离 ecom: 后无 flush 兜底清理），过期由业务级唯一约束兜底
 
+# 退款工单状态机（模块 5）：pending → approved → refunded（终态）；pending → rejected（终态）。
+# 状态流转由代码层/人工驱动（审批接口），不由 LLM 驱动。状态常量放 mq.py（退款域），
+# 不放 db.py（连接池基础设施，不是业务域）。
+STATUS_PENDING = "待人工审批"
+STATUS_APPROVED = "已批准"
+STATUS_REFUNDED = "已退款"
+STATUS_REJECTED = "已拒绝"
+
+# 合法流转表：action → {当前状态: 新状态}。只有匹配的当前状态才允许该 action。
+# 终态（refunded/rejected）不在任何 {当前状态} 里 → 任何 action 都非法（终态不可再流转）。
+TRANSITIONS = {
+    "approve": {STATUS_PENDING: STATUS_APPROVED},
+    "execute": {STATUS_APPROVED: STATUS_REFUNDED},
+    "reject": {STATUS_PENDING: STATUS_REJECTED},
+}
+
 
 def _validate_refund(order_id, amount):
     """退款参数校验（纯函数，返回结果不抛异常）。同步 /refund 和异步消费者共用，语义一致。
@@ -80,24 +96,70 @@ def _validate_refund(order_id, amount):
 def _create_refund_ticket(order_id, amount):
     """落库退款工单（幂等落库）。同步回退路径和异步消费者共用，等价旧 /refund 的落库逻辑。
 
-    幂等靠 DB 唯一约束 UNIQUE(order_id, amount)：并发/重复 INSERT 撞键 → IntegrityError →
-    查已有工单返回 duplicate=True，不产生重复工单。这是「业务级幂等」，比消息级去重更兜底。
+    幂等靠 DB 唯一约束 UNIQUE(order_id)：并发/重复 INSERT 撞键 → IntegrityError →
+    查已有工单返回 duplicate=True，不产生重复工单。「一个订单一个工单」由数据库硬兜底，
+    同订单退 50 又退 80（不同金额）也会撞键——这是「状态机幂等」的 DB 兜底，不是先查后插。
     """
     conn = db.get_conn()
     try:
         cur = conn.cursor()
         ticket_id = f"RF{uuid.uuid4().hex[:8].upper()}"
         try:
-            cur.execute("INSERT INTO refunds VALUES (%s,%s,%s,%s)", (ticket_id, order_id, amount, "待人工审批"))
+            cur.execute("INSERT INTO refunds VALUES (%s,%s,%s,%s)", (ticket_id, order_id, amount, STATUS_PENDING))
         except pymysql.IntegrityError:
-            cur.execute("SELECT ticket_id, status FROM refunds WHERE order_id=%s AND amount=%s", (order_id, amount))
+            # 撞 UNIQUE(order_id)：同订单已有工单（不管金额），查已有返回 duplicate
+            cur.execute("SELECT ticket_id, status FROM refunds WHERE order_id=%s", (order_id,))
             existing = cur.fetchone()
             if existing:
                 return {"ticket_id": existing[0], "status": existing[1], "duplicate": True}
             raise
     finally:
         db.close_conn(conn)
-    return {"ticket_id": ticket_id, "status": "待人工审批", "duplicate": False}
+    return {"ticket_id": ticket_id, "status": STATUS_PENDING, "duplicate": False}
+
+
+def _transition(current, action):
+    """状态机流转校验（纯函数）。返回 (ok, new_status)。
+
+    ok=False 时 new_status 是错误信息（非法流转 / 未知操作）。
+    终态（refunded/rejected）不在 TRANSITIONS 的 {当前状态} 里，任何 action 都非法。
+    """
+    if action not in TRANSITIONS:
+        return False, f"未知操作：{action}"
+    new_status = TRANSITIONS[action].get(current)
+    if new_status is None:
+        return False, f"非法状态流转：{current} 不能执行 {action}"
+    return True, new_status
+
+
+def _apply_transition(ticket_id, action):
+    """审批/执行落库（条件 UPDATE 乐观锁）。返回 {ok, ...}。
+
+    并发安全靠「UPDATE ... WHERE status=当前状态」：两个并发审批（approve+reject）都读到
+    pending，条件 UPDATE 只有一个 affected rows=1，另一个 0 行 → 409。
+    这就是「乐观锁版本号」幂等要点——不是「读 → 判断 → 普通 UPDATE」（那样 last-writer-wins）。
+
+    先读 status 只为区分 404（工单不存在）和 409（非法流转/状态已变），真正的并发保证是条件 UPDATE。
+    """
+    conn = db.get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT status FROM refunds WHERE ticket_id=%s", (ticket_id,))
+        row = cur.fetchone()
+        if row is None:
+            return {"ok": False, "err": f"未找到工单 {ticket_id}", "status_code": 404}
+        current = row[0]
+        ok, result = _transition(current, action)
+        if not ok:
+            return {"ok": False, "err": result, "status_code": 409}
+        new_status = result
+        # 条件 UPDATE：只在 status 仍是 current 时更新（乐观锁），并发审批只有一个成功
+        cur.execute("UPDATE refunds SET status=%s WHERE ticket_id=%s AND status=%s", (new_status, ticket_id, current))
+        if cur.rowcount == 0:
+            return {"ok": False, "err": "工单状态已变化，请刷新后重试", "status_code": 409}
+        return {"ok": True, "ticket_id": ticket_id, "status": new_status}
+    finally:
+        db.close_conn(conn)
 
 
 def _notify_human(ticket_id):

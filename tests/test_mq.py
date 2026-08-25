@@ -80,7 +80,7 @@ def main():
     assert status2 == 200, f"期望 200，实际 {status2}：{body2}"
     time.sleep(2)
     n2 = _count_refunds(order_id)
-    assert n2 == 1, f"业务级幂等应拦截重复（UNIQUE(order_id, amount)），期望 1 张，实际 {n2}"
+    assert n2 == 1, f"业务级幂等应拦截重复（UNIQUE(order_id)），期望 1 张，实际 {n2}"
     print(f"  ✅ 重复退款被唯一约束拦截（仍 {n2} 张工单）")
 
     print("🎉 MQ 异步化 + 幂等消费：全部通过")

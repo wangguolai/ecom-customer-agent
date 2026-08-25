@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 
 # 确保项目根目录在 Python 路径中
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,13 +23,15 @@ if _project_root not in sys.path:
 from src.backend.db import get_conn, close_conn
 from src.backend import cache
 from src.backend import mq
+from src.backend import ratelimit
 from src.backend.seed import _SEED_ORDERS, _SEED_LOGISTICS, _SEED_PRODUCTS
 
 
 def _init_db():
-    """建表 + 灌种子数据。seed 表 DROP 重建：seed 是唯一源，保证 schema/数据每次启动最新。
+    """建表 + 灌种子数据。全部表 DROP 重建：seed 是唯一源，保证 schema/数据每次启动最新。
 
-    refunds 是运行时数据（退款工单），不 DROP（保留工单），CREATE IF NOT EXISTS 带唯一约束（幂等兜底）。
+    refunds 也 DROP 重建：模块 5 改 UNIQUE(order_id,amount) → UNIQUE(order_id)（状态机幂等，
+    一个订单一个工单），schema 变更需重建；demo 历史工单是本地测试产物，无需保留。
     """
     conn = get_conn()
     try:
@@ -37,10 +39,11 @@ def _init_db():
         cur.execute("DROP TABLE IF EXISTS orders")
         cur.execute("DROP TABLE IF EXISTS logistics")
         cur.execute("DROP TABLE IF EXISTS products")
+        cur.execute("DROP TABLE IF EXISTS refunds")
         cur.execute("CREATE TABLE orders (order_id VARCHAR(32) PRIMARY KEY, status VARCHAR(20), created_at VARCHAR(32), product VARCHAR(128), amount VARCHAR(32))")
         cur.execute("CREATE TABLE logistics (order_id VARCHAR(32), time VARCHAR(32), location VARCHAR(64), status VARCHAR(20), KEY idx_order_id (order_id))")
         cur.execute("CREATE TABLE products (product_id VARCHAR(16) PRIMARY KEY, name VARCHAR(128), price DOUBLE, qty INTEGER)")
-        cur.execute("CREATE TABLE IF NOT EXISTS refunds (ticket_id VARCHAR(32) PRIMARY KEY, order_id VARCHAR(32), amount DOUBLE, status VARCHAR(20), UNIQUE KEY uk_order_amount (order_id, amount))")
+        cur.execute("CREATE TABLE refunds (ticket_id VARCHAR(32) PRIMARY KEY, order_id VARCHAR(32), amount DOUBLE, status VARCHAR(20), UNIQUE KEY uk_order (order_id))")
         cur.executemany("INSERT INTO orders VALUES (%s,%s,%s,%s,%s)", _SEED_ORDERS)
         cur.executemany("INSERT INTO logistics VALUES (%s,%s,%s,%s)", _SEED_LOGISTICS)
         cur.executemany("INSERT INTO products VALUES (%s,%s,%s,%s)", _SEED_PRODUCTS)
@@ -71,8 +74,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="电商客服后端", lifespan=lifespan)
 
 
+# ── 限流依赖（模块 5）──
+# 读接口挂 read 桶（松），写接口挂 write 桶（严：退款/审批/执行资金敏感）。
+# Depends 依赖函数：超限 raise 429。client 固定 "demo"（单客户端），生产 per-IP + 全局双层。
+def _limit_read():
+    if not ratelimit.rate_limit("read", "demo", window=10, max_req=100):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后重试")
+
+
+def _limit_write():
+    if not ratelimit.rate_limit("write", "demo", window=10, max_req=10):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后重试")
+
+
 @app.get("/orders/{order_id}")
-def get_order(order_id: str):
+def get_order(order_id: str, _: None = Depends(_limit_read)):
     # 参数校验（穿透三层第一层）：非法格式直接 400，不查库不写空标记——
     # 否则任意不存在订单号都会写 30s 空标记，被 LLM 幻觉/攻击者刷爆 Redis。
     # 上界 32 与 orders.logistics 的 order_id VARCHAR(32) 对齐：超长纯数字在库中必然不存在，
@@ -102,7 +118,7 @@ def get_order(order_id: str):
 
 
 @app.get("/logistics/{order_id}")
-def get_logistics(order_id: str):
+def get_logistics(order_id: str, _: None = Depends(_limit_read)):
     if not re.fullmatch(r"\d{8,32}", order_id):
         raise HTTPException(status_code=400, detail=f"订单号格式非法：{order_id}")
     cache_key = f"ecom:logistics:{order_id}"
@@ -128,7 +144,7 @@ def get_logistics(order_id: str):
 
 
 @app.get("/products/{product_id}")
-def get_product(product_id: str):
+def get_product(product_id: str, _: None = Depends(_limit_read)):
     """商品实时价格 + 库存（动态数据走工具实时查，数据分治：价格/库存不进向量库）"""
     # 格式校验（对齐 orders 的防御水平）：任意短字符串都会 404 写空标记，被 LLM 幻觉/攻击者刷爆 Redis。
     # 用格式 P\d{1,15} 拦掉，和 seed 的 P001 形态对齐。
@@ -157,13 +173,15 @@ def get_product(product_id: str):
 
 
 @app.post("/refund")
-def refund_order(payload: dict):
+def refund_order(payload: dict, _: None = Depends(_limit_write)):
     """退款（写操作）—— MQ 异步化：同步校验 + 发消息，消费者异步落库 + 通知人工。
 
     代码级防御不变：只生成「待人工审批」工单，不直接退款；参数校验拦截非法金额。
     同步只做「参数校验」（即时反馈，非法订单/金额不让用户白等），「落库 + 通知人工」走 MQ 异步。
     降级：MQ（Redis）不可用 → 回退同步落库（复用 _create_refund_ticket，等价旧行为），退款不因 MQ 挂而失败。
     """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
     order_id = payload.get("order_id")
     amount = payload.get("amount")
     if not order_id or amount is None:
@@ -182,3 +200,34 @@ def refund_order(payload: dict):
     # 降级回退：MQ 不可用 → 同步落库（复用 _create_refund_ticket，等价旧行为）
     ticket = mq._create_refund_ticket(order_id, amount)
     return {"status": "已受理", "message_id": None, "ticket_id": ticket["ticket_id"]}
+
+
+@app.post("/refund/{ticket_id}/review")
+def review_refund(ticket_id: str, payload: dict, _: None = Depends(_limit_write)):
+    """人工审批（代码层驱动状态机流转，不由 LLM 驱动）。action=approve/reject。
+
+    并发安全：mq._apply_transition 用条件 UPDATE（WHERE status=当前状态）乐观锁，
+    两个并发审批只有一个成功，另一个 409。
+    审批/执行接口无鉴权是 demo 取舍（资金敏感操作），生产必须鉴权 + IP 白名单。
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+    action = payload.get("action")
+    if action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail=f"非法 action：{action}，只支持 approve/reject")
+    result = mq._apply_transition(ticket_id, action)
+    if not result["ok"]:
+        raise HTTPException(status_code=result["status_code"], detail=result["err"])
+    return {"ticket_id": ticket_id, "status": result["status"]}
+
+
+@app.post("/refund/{ticket_id}/execute")
+def execute_refund(ticket_id: str, _: None = Depends(_limit_write)):
+    """退款执行（approved → refunded，mock）。真实场景接支付/财务，这里只改状态。
+
+    execute 后 orders.status 不联动（demo mock），生产退款到账要联动订单状态。
+    """
+    result = mq._apply_transition(ticket_id, "execute")
+    if not result["ok"]:
+        raise HTTPException(status_code=result["status_code"], detail=result["err"])
+    return {"ticket_id": ticket_id, "status": result["status"]}
