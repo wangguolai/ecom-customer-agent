@@ -37,7 +37,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search_products",
-            "description": "检索商品知识库，查询商品信息（适用对象、成分、规格、价格、特点等）。当用户咨询商品本身（如「XX 适合我家狗吗」「XX 的成分是什么」「有没有适合肠胃敏感的粮」）时调用。",
+            "description": "检索商品知识库，查询商品静态信息（适用对象、成分、规格、特点等），并返回商品的 product_id。当用户咨询商品本身（如「XX 适合我家狗吗」「XX 的成分是什么」「有没有适合肠胃敏感的粮」）时调用。查价格/库存用 check_stock（传这里返回的 product_id）。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -79,13 +79,13 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "check_stock",
-            "description": "查询某个商品的库存（是否有货、库存量）",
+            "description": "查询某个商品的实时价格和库存（是否有货、库存量、当前价格）。product_id 从 search_products 的检索结果里获取。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "product_name": {"type": "string", "description": "商品名，如「幼犬成长粮」"}
+                    "product_id": {"type": "string", "description": "商品 ID，如 P001（从 search_products 检索结果的 product_id 字段获取）"}
                 },
-                "required": ["product_name"],
+                "required": ["product_id"],
             },
         },
     },
@@ -182,21 +182,21 @@ async def search_logistics(order_id: str) -> str:
     return "物流轨迹：\n" + "\n".join(lines)
 
 
-async def check_stock(product_name: str) -> str:
-    """库存查询（真实后端接口）。只查库存量，价格走 search_products（价格是静态属性，唯一真相在知识库）。"""
+async def check_stock(product_id: str) -> str:
+    """实时价格 + 库存查询（真实后端接口）。动态数据（价格/库存）走工具实时查，不进向量库（数据分治）。"""
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            resp = await client.get(f"{BACKEND_URL}/stock/{quote(product_name)}")
+            resp = await client.get(f"{BACKEND_URL}/products/{quote(product_id)}")
     except (httpx.ConnectError, httpx.TimeoutException):
-        return "库存查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
+        return "价格/库存查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
     if resp.status_code == 404:
-        return f"未查到商品「{product_name}」，请确认商品名。"
+        return f"未查到商品 {product_id}。"
     if resp.status_code != 200:
-        return f"库存查询失败（状态码 {resp.status_code}），请稍后重试。"
+        return f"价格/库存查询失败（状态码 {resp.status_code}），请稍后重试。"
     d = resp.json()
     if d["qty"] <= 0:
-        return f"「{product_name}」暂时缺货。"
-    return f"「{product_name}」有货，库存 {d['qty']} 件。"
+        return f"「{d['name']}」暂时缺货（价格 ¥{d['price']:g}）。"
+    return f"「{d['name']}」有货，库存 {d['qty']} 件，价格 ¥{d['price']:g}。"
 
 
 async def get_return_policy() -> str:
@@ -220,6 +220,9 @@ async def refund_order(order_id: str, amount: float) -> str:
 
     关键：LLM 只有「建议权」（提交退款申请），没有「执行权」（真正退款在人工审批）。
     Prompt Injection 诱导 LLM 调 refund，最多生成一个待审批工单，金额非法会被后端参数校验拦下。
+
+    MQ 异步化后：后端 /refund 返回「已受理」，工单由消费者异步生成。按响应里 ticket_id
+    是否为空分两套话术——降级回退路径带工单号，异步路径带受理号。
     """
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -236,9 +239,11 @@ async def refund_order(order_id: str, amount: float) -> str:
     if resp.status_code != 200:
         return f"退款失败（状态码 {resp.status_code}），请稍后重试。"
     d = resp.json()
-    if d.get("duplicate"):
-        return f"退款工单已存在（{d['ticket_id']}），金额 ¥{d['amount']}，状态：{d['status']}。已去重，未重复创建。"
-    return f"已生成退款工单 {d['ticket_id']}，订单 {d['order_id']}，金额 ¥{d['amount']}，状态：{d['status']}。真正的退款需人工审批后执行。"
+    if d.get("ticket_id"):
+        # 降级回退路径（MQ 不可用，同步落库）：带工单号
+        return f"退款申请已受理，工单已生成：{d['ticket_id']}，金额 ¥{amount}，状态：待人工审批。真正的退款需人工审批后执行。"
+    # 异步路径：已受理，工单处理中
+    return f"退款申请已受理（受理号 {d['message_id']}），工单处理中。真正的退款需人工审批后执行。"
 
 
 _hybrid_retriever = None
@@ -302,8 +307,8 @@ def _search_products_sync(query: str, top_k: int) -> str:
         return "知识库检索无高置信度匹配。请如实告知用户暂未找到相关信息、可建议联系人工客服，不要编造商品信息。"
 
     parts = []
-    for i, (cid, score, text, title) in enumerate(results, 1):
-        parts.append(f"[{i}] {title}\n{text}")
+    for i, (cid, score, text, title, product_id) in enumerate(results, 1):
+        parts.append(f"[{i}] {title}（product_id: {product_id}）\n{text}")
 
     # 策略提示（系统生成的受信任指令）+ 检索结果（外部数据），分开标注，不混进「数据/指令分离」的防御里
     return f"[检索策略：{label}]\n{STRATEGY_HINTS[label]}\n\n" + "\n\n".join(parts)

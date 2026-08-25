@@ -104,7 +104,7 @@ EVAL_SET = [
 def _backend_up() -> bool:
     """探测后端三端点（orders/logistics/stock），全部返回 200 才算在线。
     except requests.RequestException 覆盖 timeout/conn；检查 resp.ok 避免「端口被占但后端坏/种子缺失」误判在线。"""
-    probes = ["/orders/20240818001", "/logistics/20240818001", f"/stock/{quote('幼犬成长粮')}"]
+    probes = ["/orders/20240818001", "/logistics/20240818001", "/products/P001"]
     for ep in probes:
         try:
             resp = requests.get(f"{BACKEND_URL}{ep}", timeout=1.0)

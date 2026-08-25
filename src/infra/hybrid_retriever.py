@@ -25,7 +25,10 @@ from src.derived.categories import build_jieba_words
 
 RRF_K = 60
 DEFAULT_TOP_K = 3
-RERANK_CANDIDATE_N = 20  # RRF 融合后先取这么多候选，交给 Rerank 精排
+RERANK_CANDIDATE_N = 10  # RRF 融合后先取这么多候选交给 Rerank 精排。
+# 实测 Recall@3：N=5→0.7667、N=10→0.9333、N=15→0.9667、N=20→0.9667。
+# 选 N=10 是成本收益权衡（不是 Recall 最大化）：0.9333 对电商客服够用，省一半 rerank 推理；
+# 为 0.033 升到 N=15 多花 50% 成本不值（正确性投入匹配错误成本）。N 跟数据规模+业务容忍度走，不拍脑袋。
 VEC_SCORE_LOW = 0.4  # 召回层双低拒答：向量 top1 分数 < 此值且 BM25 无召回 → 判超知识库，拒答
 
 # jieba 词典从派生层生成：品牌名（自动，从 products.md）+ 特征词（人维护，映射表 category_synonyms.md）。
@@ -44,11 +47,12 @@ class HybridRetriever:
 
     def _build_bm25(self):
         """从 Qdrant scroll 出所有 chunk 建 BM25 索引，保证和向量库数据对齐"""
-        chunks = self._store.scroll_all()  # [(chunk_id, text, title, category)]
-        self._chunk_ids = [cid for cid, _, _, _ in chunks]
-        self._chunk_texts = [text for _, text, _, _ in chunks]
-        self._chunk_titles = [title for _, _, title, _ in chunks]
-        self._chunk_categories = [cat for _, _, _, cat in chunks]
+        chunks = self._store.scroll_all()  # [(chunk_id, text, title, category, product_id)]
+        self._chunk_ids = [cid for cid, _, _, _, _ in chunks]
+        self._chunk_texts = [text for _, text, _, _, _ in chunks]
+        self._chunk_titles = [title for _, _, title, _, _ in chunks]
+        self._chunk_categories = [cat for _, _, _, cat, _ in chunks]
+        self._chunk_product_ids = [pid for _, _, _, _, pid in chunks]
         if not self._chunk_texts:
             self._bm25 = None  # 知识库为空，跳过 BM25（search 里退化为纯向量）
             return
@@ -60,7 +64,7 @@ class HybridRetriever:
         """混合检索，返回 (label, results)。
 
         label ∈ {'双高','单高一致','单高冲突','双低'} —— 四维置信度（判断层），上层据此做策略映射。
-        results = [(chunk_id, score, text)]，双低时为空列表。
+        results = [(chunk_id, score, text, title, product_id)]，双低时为空列表。
         category 不为 None 时，向量 + BM25 都只在指定类别内检索（锁类别优先，避免跨类误命中）。
         注意：score 语义随路径变化——rerank 可用时是 sigmoid 概率(0-1)，降级时是 RRF 分数(~1/(60+rank))。
         下游只依赖相对排序，不要依赖 score 的绝对阈值。top_k 超出 RERANK_CANDIDATE_N 会被截断。
@@ -111,17 +115,18 @@ class HybridRetriever:
         # 4. Rerank 精排（先取 top_n 候选，用 CrossEncoder 精排到 top_k）
         text_map = dict(zip(self._chunk_ids, self._chunk_texts))
         title_map = dict(zip(self._chunk_ids, self._chunk_titles))
+        pid_map = dict(zip(self._chunk_ids, self._chunk_product_ids))
         top_n = min(RERANK_CANDIDATE_N, len(fused))
         candidates = fused[:top_n]
-        reranked = self._rerank(query, candidates, top_k, text_map, title_map)
+        reranked = self._rerank(query, candidates, top_k, text_map, title_map, pid_map)
         if reranked is not None:
             # Rerank 只负责排序，不做绝对分数阈值拒答（拒答已移到召回层四维判断）。
             return label, reranked
 
-        # 6. 降级：Rerank 不可用则退回 RRF 排序（附 text + title）
+        # 6. 降级：Rerank 不可用则退回 RRF 排序（附 text + title + product_id）
         result = []
         for cid, score in candidates[:top_k]:
-            result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, "")))
+            result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, "")))
         return label, result
 
     def _classify(self, vec_top1: str, vec_top1_score: float, bm25_top1: str) -> str:
@@ -143,8 +148,8 @@ class HybridRetriever:
             return "双高" if vec_high else "单高一致"
         return "单高冲突"  # 两路 top1 不同
 
-    def _rerank(self, query: str, candidates: list, top_k: int, text_map: dict, title_map: dict):
-        """CrossEncoder 精排候选，返回 [(chunk_id, rerank_score, text, title)]；不可用返回 None"""
+    def _rerank(self, query: str, candidates: list, top_k: int, text_map: dict, title_map: dict, pid_map: dict):
+        """CrossEncoder 精排候选，返回 [(chunk_id, rerank_score, text, title, product_id)]；不可用返回 None"""
         texts = [text_map.get(cid, "") for cid, _ in candidates]
         ranked = reranker.rerank(query, texts, top_k=top_k)
         if ranked is None:
@@ -152,7 +157,7 @@ class HybridRetriever:
         result = []
         for score, idx in ranked:
             cid = candidates[idx][0]
-            result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, "")))
+            result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, "")))
         return result
 
 
@@ -167,5 +172,5 @@ if __name__ == "__main__":
         print(f"Q: {q}")
         label, results = retriever.search(q)
         print(f"  置信度: {label}")
-        for cid, score, text, title in results:
-            print(f"  ({score:.4f}) {title}")
+        for cid, score, text, title, pid in results:
+            print(f"  ({score:.4f}) {title} [{pid}]")

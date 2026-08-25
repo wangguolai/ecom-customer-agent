@@ -29,7 +29,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 COLLECTIONS = {
     "product_knowledge": {
         "description": "宠物商品知识库 RAG",
-        "payload_schema": ["chunk_id", "text", "title", "category", "source_file", "chunk_index"],
+        "payload_schema": ["chunk_id", "text", "title", "category", "source_file", "chunk_index", "product_id"],
     },
 }
 
@@ -151,20 +151,20 @@ class QdrantStore:
         return [SearchHit(score=r.score, payload=r.payload) for r in results.points]
 
     def scroll_all(self, collection: str = "product_knowledge") -> list:
-        """scroll 出所有 chunk 的 (chunk_id, text, title, category)，用于 BM25 建索引"""
+        """scroll 出所有 chunk 的 (chunk_id, text, title, category, product_id)，用于 BM25 建索引"""
         results = []
         offset = None
         while True:
             points, next_offset = self._client.scroll(
                 collection_name=collection, limit=100, offset=offset,
-                with_payload=["chunk_id", "text", "title", "category"],
+                with_payload=["chunk_id", "text", "title", "category", "product_id"],
             )
             for p in points:
                 if p.payload:
                     cid = p.payload.get("chunk_id")
                     text = p.payload.get("text")
                     if cid and text:  # 过滤缺失字段，避免 None 混入下游分词
-                        results.append((cid, text, p.payload.get("title", ""), p.payload.get("category", "")))
+                        results.append((cid, text, p.payload.get("title", ""), p.payload.get("category", ""), p.payload.get("product_id", "")))
             if next_offset is None:
                 break
             offset = next_offset

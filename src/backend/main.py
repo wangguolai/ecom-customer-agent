@@ -8,13 +8,12 @@
 import sys
 import os
 import re
-from uuid import uuid4
+import threading
 from contextlib import asynccontextmanager
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from fastapi import FastAPI, HTTPException
-import pymysql
 
 # 确保项目根目录在 Python 路径中
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,7 +22,8 @@ if _project_root not in sys.path:
 
 from src.backend.db import get_conn, close_conn
 from src.backend import cache
-from src.backend.seed import _SEED_ORDERS, _SEED_LOGISTICS, _SEED_STOCK
+from src.backend import mq
+from src.backend.seed import _SEED_ORDERS, _SEED_LOGISTICS, _SEED_PRODUCTS
 
 
 def _init_db():
@@ -36,14 +36,14 @@ def _init_db():
         cur = conn.cursor()
         cur.execute("DROP TABLE IF EXISTS orders")
         cur.execute("DROP TABLE IF EXISTS logistics")
-        cur.execute("DROP TABLE IF EXISTS stock")
+        cur.execute("DROP TABLE IF EXISTS products")
         cur.execute("CREATE TABLE orders (order_id VARCHAR(32) PRIMARY KEY, status VARCHAR(20), created_at VARCHAR(32), product VARCHAR(128), amount VARCHAR(32))")
         cur.execute("CREATE TABLE logistics (order_id VARCHAR(32), time VARCHAR(32), location VARCHAR(64), status VARCHAR(20), KEY idx_order_id (order_id))")
-        cur.execute("CREATE TABLE stock (product_name VARCHAR(64) PRIMARY KEY, qty INTEGER)")
+        cur.execute("CREATE TABLE products (product_id VARCHAR(16) PRIMARY KEY, name VARCHAR(128), price DOUBLE, qty INTEGER)")
         cur.execute("CREATE TABLE IF NOT EXISTS refunds (ticket_id VARCHAR(32) PRIMARY KEY, order_id VARCHAR(32), amount DOUBLE, status VARCHAR(20), UNIQUE KEY uk_order_amount (order_id, amount))")
         cur.executemany("INSERT INTO orders VALUES (%s,%s,%s,%s,%s)", _SEED_ORDERS)
         cur.executemany("INSERT INTO logistics VALUES (%s,%s,%s,%s)", _SEED_LOGISTICS)
-        cur.executemany("INSERT INTO stock VALUES (%s,%s)", _SEED_STOCK)
+        cur.executemany("INSERT INTO products VALUES (%s,%s,%s,%s)", _SEED_PRODUCTS)
     finally:
         close_conn(conn)
 
@@ -59,7 +59,13 @@ async def lifespan(app: FastAPI):
     cache.flush()
     # Redis 探活（非致命）：没起来就降级查库，但启动日志要能区分「Redis OK / 不可用」方便排障
     print("✅ Redis OK（缓存可用）" if cache.ping() else "⚠️ Redis 不可用，降级查库（缓存旁路）")
+    # 启动 MQ 消费者（daemon 线程）：BRPOP 阻塞拉取退款工单消息，异步落库。
+    # stop_event 让 shutdown 干净退出（BRPOP 最多 5s 后返回）；daemon=True 保证进程退出不阻塞。
+    _consumer_stop = threading.Event()
+    _consumer_thread = threading.Thread(target=mq.consume_loop, args=(_consumer_stop,), daemon=True, name="refund-consumer")
+    _consumer_thread.start()
     yield
+    _consumer_stop.set()
 
 
 app = FastAPI(title="电商客服后端", lifespan=lifespan)
@@ -121,71 +127,58 @@ def get_logistics(order_id: str):
     return data
 
 
-@app.get("/stock/{product_name}")
-def get_stock(product_name: str):
-    if not product_name or len(product_name) > 64:
-        raise HTTPException(status_code=400, detail=f"商品名非法：{product_name}")
-    cache_key = f"ecom:stock:{product_name}"
+@app.get("/products/{product_id}")
+def get_product(product_id: str):
+    """商品实时价格 + 库存（动态数据走工具实时查，数据分治：价格/库存不进向量库）"""
+    # 格式校验（对齐 orders 的防御水平）：任意短字符串都会 404 写空标记，被 LLM 幻觉/攻击者刷爆 Redis。
+    # 用格式 P\d{1,15} 拦掉，和 seed 的 P001 形态对齐。
+    if not re.fullmatch(r"P\d{1,15}", product_id):
+        raise HTTPException(status_code=400, detail=f"商品 ID 非法：{product_id}")
+    cache_key = f"ecom:product:{product_id}"
     hit, data = cache.get_json(cache_key)
     if hit:
         if data is None:
-            raise HTTPException(status_code=404, detail=f"未查到商品「{product_name}」")
+            raise HTTPException(status_code=404, detail=f"未查到商品 {product_id}")
         return data
 
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT qty FROM stock WHERE product_name=%s", (product_name,))
+        cur.execute("SELECT name, price, qty FROM products WHERE product_id=%s", (product_id,))
         row = cur.fetchone()
     finally:
         close_conn(conn)
     if row is None:
         cache.set_empty(cache_key, 30)
-        raise HTTPException(status_code=404, detail=f"未查到商品「{product_name}」")
-    data = {"product_name": product_name, "qty": row[0]}  # qty=0 是真实数据（缺货），正常缓存
+        raise HTTPException(status_code=404, detail=f"未查到商品 {product_id}")
+    data = {"product_id": product_id, "name": row[0], "price": row[1], "qty": row[2]}  # qty=0 是真实数据（缺货），正常缓存
     cache.set_json(cache_key, data, 30)
     return data
 
 
 @app.post("/refund")
 def refund_order(payload: dict):
-    """退款（写操作）——代码级防御：不直接退款，只生成「待人工审批」工单；参数校验拦截非法金额。
+    """退款（写操作）—— MQ 异步化：同步校验 + 发消息，消费者异步落库 + 通知人工。
 
-    幂等：UNIQUE(order_id, amount) 兜底。refund 是单步写（只插一条工单），原子性由单条 INSERT 保证，
-    不需要显式事务；撞唯一键后 autocommit 下直接 SELECT 就能看到已提交的行，也不需要 rollback。
+    代码级防御不变：只生成「待人工审批」工单，不直接退款；参数校验拦截非法金额。
+    同步只做「参数校验」（即时反馈，非法订单/金额不让用户白等），「落库 + 通知人工」走 MQ 异步。
+    降级：MQ（Redis）不可用 → 回退同步落库（复用 _create_refund_ticket，等价旧行为），退款不因 MQ 挂而失败。
     """
     order_id = payload.get("order_id")
     amount = payload.get("amount")
     if not order_id or amount is None:
         raise HTTPException(status_code=400, detail="缺少 order_id 或 amount")
-    # 与 get_order/get_logistics 同标准：非法订单号直接 400，不进 SELECT
-    if not re.fullmatch(r"\d{8,32}", order_id):
-        raise HTTPException(status_code=400, detail=f"订单号格式非法：{order_id}")
 
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT amount FROM orders WHERE order_id=%s", (order_id,))
-        row = cur.fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail=f"未查到订单 {order_id}")
+    # 同步校验（即时反馈）：订单号格式 / 订单存在 / 金额区间
+    ok, err_msg, status_code = mq._validate_refund(order_id, amount)
+    if not ok:
+        raise HTTPException(status_code=status_code, detail=err_msg)
 
-        # 参数校验（代码级，拦截 LLM 诱导的非法金额：0 元 / 负数 / 超订单金额）
-        order_amount = float(row[0].replace("¥", "").split("/")[0].strip())
-        if amount <= 0 or amount > order_amount:
-            raise HTTPException(status_code=400, detail=f"退款金额非法：必须 >0 且 ≤ 订单金额 ¥{order_amount}")
+    # 发消息到 MQ
+    pub = mq.publish_refund(order_id, amount)
+    if pub["ok"]:
+        return {"status": "已受理", "message_id": pub["message_id"], "ticket_id": None}
 
-        # 插入工单（单条原子）；撞唯一键 → 已存在工单，查出来返回 duplicate
-        ticket_id = f"RF{uuid4().hex[:8].upper()}"
-        try:
-            cur.execute("INSERT INTO refunds VALUES (%s,%s,%s,%s)", (ticket_id, order_id, amount, "待人工审批"))
-        except pymysql.IntegrityError:
-            cur.execute("SELECT ticket_id, status FROM refunds WHERE order_id=%s AND amount=%s", (order_id, amount))
-            existing = cur.fetchone()
-            if existing:
-                return {"ticket_id": existing[0], "order_id": order_id, "amount": amount, "status": existing[1], "duplicate": True}
-            raise
-    finally:
-        close_conn(conn)
-
-    return {"ticket_id": ticket_id, "order_id": order_id, "amount": amount, "status": "待人工审批", "duplicate": False}
+    # 降级回退：MQ 不可用 → 同步落库（复用 _create_refund_ticket，等价旧行为）
+    ticket = mq._create_refund_ticket(order_id, amount)
+    return {"status": "已受理", "message_id": None, "ticket_id": ticket["ticket_id"]}

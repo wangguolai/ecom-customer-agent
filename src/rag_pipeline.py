@@ -43,7 +43,7 @@ def _get_retriever():
 def _build_prompt(question: str, results: list) -> str:
     """拼 prompt：检索到的商品资料放【数据区】，用户问题放底部（数据/指令分离）"""
     parts = []
-    for i, (cid, score, text, title) in enumerate(results, 1):
+    for i, (cid, score, text, title, _pid) in enumerate(results, 1):
         parts.append(f"[{i}] {title}\n{text}")
     context = "\n\n".join(parts)
 

@@ -36,6 +36,7 @@ def build_knowledge_base():
             "category": p.category,
             "source_file": "products.md",
             "chunk_index": i,
+            "product_id": p.id,  # 稳定实体 ID，打通「向量检索 → MySQL 查价」链路
         })
 
     # 4. 写入 Qdrant（先删旧数据再写入，保证幂等、清残留）

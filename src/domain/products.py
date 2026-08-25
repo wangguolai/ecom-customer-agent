@@ -23,10 +23,10 @@ PRODUCTS_PATH = os.path.join(_project_root, "data", "products.md")
 @dataclass
 class Product:
     """商品实体（products.md 的 schema 化投影）"""
+    id: str             # 稳定实体 ID（业务短码，如 P001）——知识库/MySQL/向量库三处对齐的桥
     title: str          # 完整标题，含品牌括号，如「幼犬成长粮（贝乐牌）」
     brand: str          # 品牌名，如「贝乐牌」；无品牌为空字符串
     category: str       # 类别，如「狗粮」
-    prices: list        # 价格列表（元），如 [89, 219]
     raw_chunk: str      # 原始块文本（含「## 标题」开头，供向量化）
 
 
@@ -49,9 +49,10 @@ def parse_products() -> list[Product]:
         brand = bm.group(1) if bm else ""
         cm = re.search(r"类别：(\S+)", chunk)
         category = cm.group(1).strip() if cm else ""
-        prices = [int(p) for p in re.findall(r"¥\s*(\d+)", chunk)]
+        im = re.search(r"ID：(\S+)", chunk)
+        pid = im.group(1) if im else ""  # 缺 ID 会被 refresh 的唯一性校验抓出
         products.append(Product(
-            title=title, brand=brand, category=category,
-            prices=prices, raw_chunk=chunk,
+            id=pid, title=title, brand=brand, category=category,
+            raw_chunk=chunk,
         ))
     return products

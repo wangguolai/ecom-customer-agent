@@ -17,7 +17,7 @@ if _project_root not in sys.path:
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from src.domain.products import parse_products
-from src.backend.seed import _SEED_ORDERS, _SEED_LOGISTICS
+from src.backend.seed import _SEED_ORDERS, _SEED_LOGISTICS, _SEED_PRODUCTS
 
 
 def build_facts() -> dict:
@@ -25,9 +25,8 @@ def build_facts() -> dict:
     products = parse_products()
     brands = {p.brand for p in products if p.brand}
     product_names = {p.title for p in products}
-    prices = set()
-    for p in products:
-        prices.update(p.prices)
+    # 价格从 MySQL seed（动态属性 SSOT）拿，不再从 products.md（价格已拆走，Product 无 prices 字段）
+    prices = {sp[2] for sp in _SEED_PRODUCTS}
 
     order_ids = {o[0] for o in _SEED_ORDERS}
     order_statuses = {o[1] for o in _SEED_ORDERS}

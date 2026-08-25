@@ -32,7 +32,7 @@ def main():
         for path, name in [
             ("/orders/20240818001", "订单"),
             ("/logistics/20240818001", "物流"),
-            ("/stock/" + quote("豆腐猫砂"), "库存"),
+            ("/products/P029", "商品"),
         ]:
             r = get(path)
             ok = r.status_code == 200
@@ -61,9 +61,9 @@ def main():
 
     # 场景 2：qty=0 是真实缺货，缓存真值不是空标记
     print("📍 场景 2：qty=0 真值（豆腐猫砂缺货）")
-    r = get("/stock/" + quote("豆腐猫砂"))
+    r = get("/products/P029")
     assert r.status_code == 200 and r.json().get("qty") == 0, f"豆腐猫砂返回异常: {r.status_code} {r.text}"
-    hit, data = cache.get_json("ecom:stock:" + "豆腐猫砂")
+    hit, data = cache.get_json("ecom:product:P029")
     assert hit and data and data.get("qty") == 0, f"qty=0 被当空标记或未缓存: hit={hit} data={data}"
     print(f"  ✅ 缓存 {data}（qty=0 是真实数据，不是 __EMPTY__）")
 
@@ -86,9 +86,9 @@ def main():
     hit, _ = cache.get_json("ecom:order:abc")
     assert not hit, f"非法参数写入了缓存: hit={hit}"
     print("  ✅ 非法 order_id → 400，未写缓存")
-    r = get("/stock/" + quote("长" * 65))
-    assert r.status_code == 400, f"超长 product_name 未拦截: {r.status_code}"
-    print("  ✅ 超长 product_name（65 字）→ 400")
+    r = get("/products/" + quote("P" + "0" * 30))
+    assert r.status_code == 400, f"超长 product_id 未拦截: {r.status_code}"
+    print("  ✅ 超长 product_id（31 字）→ 400")
 
     # 场景 6（附带）：lifespan 的 flush 只清 ecom:* —— 验证非 ecom 前缀不被误删
     print("📍 场景 6：flush 只清 ecom:* 前缀")

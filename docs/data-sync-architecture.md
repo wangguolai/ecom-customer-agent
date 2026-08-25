@@ -3,6 +3,7 @@
 > 触发：faithfulness 下沉方案引出的「元数据改动 → 派生数据同步」散落问题。
 > 定位：系统设计主线「数据分治」的事前架构化——不是靠踩坑演进，是一开始就把「源 → 派生」链路设计对。
 > v2：吸收 plan-reviewer 审核（4 阻塞 + 5 重要已闭环）。
+> ⚠️ 2026-08-25 演进：本文件「决策 6（价格唯一真相在 products.md，静态）」「stock 去价格」「check_stock 只返回库存」已被**商品统一 ID 重构**推翻——价格/库存现在都是动态属性，走 MySQL products 表 + `check_stock(product_id)` 工具实时查（见 `docs/product-id-architecture.md`）。本文件相关描述是当时的历史决策，现已演进为「价格动态化」。
 
 ## 一、目标
 

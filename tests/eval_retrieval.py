@@ -69,7 +69,7 @@ EVAL_SET = [
 def _build_title_map(store):
     """chunk_id -> title 映射（title 从 Qdrant payload 拿，不切片）"""
     title_map = {}
-    for cid, text, title, _ in store.scroll_all():
+    for cid, text, title, _, _ in store.scroll_all():
         title_map[cid] = title
     return title_map
 
@@ -115,7 +115,7 @@ def run_eval():
         # 3. 混合 + 预过滤 + Rerank（完整链路）
         category = detect_category(query)
         _, hybrid_results = retriever.search(query, top_k=3, category=category)
-        hybrid_titles = [title for _, _, _, title in hybrid_results]
+        hybrid_titles = [title for _, _, _, title, _ in hybrid_results]
 
         for method, titles in zip(methods, [vec_titles, bm25_titles, hybrid_titles]):
             recall = len(set(expected) & set(titles)) / len(expected)

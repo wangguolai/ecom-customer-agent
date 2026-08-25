@@ -55,7 +55,7 @@ def test_幻觉工具_错误回灌():
 
 def test_死循环_连续三次相同():
     """LLM 连续 3 次调同一工具 → 判死循环"""
-    same = _resp(tool_calls=[_tool_call("check_stock", '{"product_name": "幼犬成长粮"}')])
+    same = _resp(tool_calls=[_tool_call("check_stock", '{"product_id": "P001"}')])
 
     async def fake_chat(messages, **kwargs):
         return same, mock.Mock(total_tokens=0, prompt_tokens=0)

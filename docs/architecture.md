@@ -44,7 +44,9 @@
 
 ## 2. 数据流（一句话）
 
-用户问题 → AgentSession 追加历史 → ReAct 循环让 LLM 输出 `tool_calls`（JSON 指令）→ 代码执行对应工具（商品咨询走 RAG，订单物流走 MySQL 后端）→ 结果回灌 → LLM 再决策 → 最终答案。
+> 退款写路径（refund_order）走 MQ：/refund 同步校验 → 发消息到 Redis list → 消费者异步落库 + 通知人工（模块 4，解耦/削峰/幂等消费，Redis 挂回退同步）。
+
+用户问题 → AgentSession 追加历史 → ReAct 循环让 LLM 输出 `tool_calls`（JSON 指令）→ 代码执行对应工具（商品咨询走 RAG，订单/物流/库存走 MySQL 后端，退款走 MQ 异步落库）→ 结果回灌 → LLM 再决策 → 最终答案。
 
 ## 3. 数据层架构：元数据单一数据源（SSOT → Domain → Derived）
 
@@ -131,7 +133,7 @@
 
 ## 7. 当前状态与不足（「诚实讲不足」用）
 
-- 订单/物流/库存已接 FastAPI + MySQL 后端（连接池 + 唯一约束幂等 + 二级索引 + 超时降级）+ Redis 缓存层（Cache Aside 读路径 + 空值哨兵 + 降级），但后端数据是**种子数据**（非生产数据），转人工仍是 mock
+- 订单/物流/库存已接 FastAPI + MySQL 后端（连接池 + 唯一约束幂等 + 二级索引 + 超时降级）+ Redis 缓存层（Cache Aside 读路径 + 空值哨兵 + 降级），退款走 MQ 异步落库（Redis list 模拟，解耦/削峰/幂等消费，Redis 挂回退同步），但后端数据是**种子数据**（非生产数据），转人工仍是 mock
 - 元数据同步已落地 SSOT 三层架构（源→实体→派生，8 处散落清零），但「数据飞轮」（bad case 回流成回归集）还没接
 - Prompt Injection 已做 prompt 级（数据/指令分离）+ 代码级（写操作权限开关：refund 待审批 + 参数校验 + 读/写分离），但「待审批」是 mock（无真实审批流程）
 - 评测做了检索层（Recall@3 + MRR）+ 回答质量（LLM-as-judge + 结构化层抓硬编造，白名单从源自动生成），但 faithfulness「判定只用 struct」还没下沉彻底（LLM 仍判 faithfulness）

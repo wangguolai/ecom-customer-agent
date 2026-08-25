@@ -7,7 +7,7 @@
   mincached=1        预热一个连接
   maxcached=5        闲置连接上限
   ping=1             每次取连接前 ping，检测被 MySQL wait_timeout 杀掉的死连接
-  autocommit=True    读接口无事务需求；写接口（refund）显式 conn.begin() 开事务
+  autocommit=True    读接口无事务需求；写接口（refund）单条 INSERT 原子 + 撞键 SELECT，无需显式事务
 """
 
 import os

@@ -18,8 +18,43 @@ if _project_root not in sys.path:
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
+def _validate_product_ids():
+    """校验商品 ID 一致性（防人工加漏/加重 ID 导致 products 表主键冲突、md↔seed 漂移）。
+
+    - ID 非空 + 集合内唯一（防加漏/加重）
+    - md 的 id+title ↔ seed 的 product_id+name 双向一致（防两处漂移）
+    """
+    from collections import Counter
+    from src.domain.products import parse_products
+    from src.backend.seed import _SEED_PRODUCTS
+
+    products = parse_products()
+    md_ids = [p.id for p in products]
+    # 先判缺 ID（空串），再判重复——否则 ≥2 个缺 ID 会被误报成「重复 ID {''}」
+    empty = [p.title for p in products if not p.id]
+    if empty:
+        raise ValueError(f"products.md 有商品缺 ID：{empty}")
+    dupes = {pid for pid, n in Counter(md_ids).items() if n > 1}
+    if dupes:
+        raise ValueError(f"products.md 有重复 ID：{dupes}")
+
+    md = {p.id: p.title for p in products}
+    seed = {sp[0]: sp[1] for sp in _SEED_PRODUCTS}
+    md_only = set(md) - set(seed)
+    seed_only = set(seed) - set(md)
+    if md_only or seed_only:
+        raise ValueError(f"md ↔ seed 不一致：md 有 seed 无 {md_only}，seed 有 md 无 {seed_only}")
+    drift = {pid: (md[pid], seed[pid]) for pid in md if md[pid] != seed[pid]}
+    if drift:
+        raise ValueError(f"md title ↔ seed name 漂移：{drift}")
+
+
 def refresh():
     """重建所有持久化派生数据"""
+    print("📍 [0/3] 校验商品 ID 一致性（md ↔ seed 双向）...")
+    _validate_product_ids()
+    print("    ID 校验通过。")
+
     print("📍 [1/3] MySQL — 重建 seed 表（DROP + 灌种子）...")
     from src.backend.main import _init_db
     _init_db()
