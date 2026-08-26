@@ -1,7 +1,7 @@
 # Rerank 精排设计
 
 > 状态：v1（2026-08-19）
-> 定位：RAG Pipeline 主线，混合检索（召回）之后的「精排」层，README  硬项「混合检索 + Rerank」的后半段。
+> 定位：RAG Pipeline 主线，混合检索（召回）之后的「精排」层，README 硬项「混合检索 + Rerank」的后半段。
 
 ## 一、为什么需要 Rerank
 

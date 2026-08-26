@@ -1,6 +1,6 @@
 # 框架选型：为什么手写 ReAct，不用 LangChain / LangGraph / CrewAI / AutoGen
 
-> 对应 README  第 6 项「说明『为什么用这个框架不用那个』」。
+> 对应 README 第 6 项「说明『为什么用这个框架不用那个』」。
 > 这是 architecture.md 选型表「手写 ReAct，不套 LangGraph/LangChain」那一格的展开——补全「那个」到底是什么。
 > 来源：2026-08-20 WebSearch 调研。
 
