@@ -13,6 +13,7 @@ Collection:
 
 import sys
 import os
+import atexit
 import uuid
 from pathlib import Path
 from dataclasses import dataclass
@@ -64,10 +65,33 @@ class QdrantStore:
             self._path = p
         self._path.mkdir(parents=True, exist_ok=True)
         self._client = QdrantClient(path=str(self._path))
+        atexit.register(self._safe_close)
 
     @property
     def client(self):
         return self._client
+
+    def close(self):
+        """显式关闭（释放文件锁）；正常退出由 atexit 兜底，无需手动调"""
+        self._safe_close()
+
+    def _safe_close(self):
+        """退出前主动 close，避免 QdrantClient.__del__ 在解释器关闭时 import msvcrt 失败刷 ModuleNotFoundError。
+
+        根因：QdrantClient.__del__（库代码）无异常保护调 close()，close 链里
+        portalocker.unlock → import msvcrt（Windows 文件锁），而解释器关闭时
+        msvcrt 已被清成 None，抛 ModuleNotFoundError；库的 close 只 except TypeError，
+        没接住 ImportError。atexit 回调在模块清空前执行（import 还安全），
+        主动 close 后 _flock_file.closed=True，退出 GC 时 __del__ 的 close 短路，不再 import。
+        """
+        client = getattr(self, "_client", None)
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception:
+            pass
+        self._client = None  # 断开引用，让退出 GC 时不再触发 __del__ 的清理
 
     # ── Collection 管理 ──────────────────────────────────────
 

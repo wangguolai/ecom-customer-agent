@@ -23,7 +23,7 @@
 
 ### 4. 库存查询（工具调用）
 - 「XX 商品有货吗」
-- **链路**：`check_stock(商品名)` → 库存
+- **链路**：`check_stock(product_id)` → 库存（product_id 从 search_products 检索结果获取）
 
 ### 5. 售后 / 退货政策（RAG + 工具）
 - 「能退吗」「退货流程是什么」
@@ -49,13 +49,13 @@
 | `search_products` | query | 商品知识库检索 | 只读 |
 | `search_orders` | 订单号 | 订单状态 | 只读 |
 | `search_logistics` | 订单号 | 物流轨迹 | 只读 |
-| `check_stock` | 商品名 | 库存/价格 | 只读 |
+| `check_stock` | product_id | 库存/价格 | 只读 |
 | `get_return_policy` | — | 退换货政策 | 只读 |
-| `refund_order` | 订单号+金额 | 退款工单（待人工审批） | 写 |
+| `refund_order` | 订单号 | 退款工单（全额退款，待人工审批） | 写 |
 | `transfer_to_human` | 问题描述 | 工单 | 写 |
 
 ## 安全边界
 
 - 工具默认只读，写操作（退款/改单）需显式权限开关
-- 工具参数校验（订单号格式、商品名存在性）
+- 工具参数校验（订单号格式、product_id 存在性）
 - Prompt Injection 防御：外部数据放数据区，指令与数据分离

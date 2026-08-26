@@ -54,8 +54,8 @@ def _clear_refunds():
         conn.close()
 
 
-def _post_refund(order_id, amount):
-    resp = httpx.post(f"{BACKEND_URL}/refund", json={"order_id": order_id, "amount": amount}, timeout=5)
+def _post_refund(order_id):
+    resp = httpx.post(f"{BACKEND_URL}/refund", json={"order_id": order_id}, timeout=5)
     return resp.status_code, resp.json()
 
 
@@ -65,9 +65,10 @@ def main():
 
     print("📍 [1/2] 正常路径：异步受理 → 消费者落库生成工单")
     order_id = "20240818001"
-    status, body = _post_refund(order_id, 89)
+    status, body = _post_refund(order_id)
     assert status == 200, f"期望 200，实际 {status}：{body}"
     assert body["status"] == "已受理", body
+    assert body["refund_amount"] == 89, f"金额下沉后 refund_amount 应为订单金额 89，实际 {body.get('refund_amount')}"
     assert body["ticket_id"] is None, f"异步路径 ticket_id 应为 None（工单异步生成），实际 {body['ticket_id']}"
     print(f"  POST /refund → 已受理，message_id={body['message_id']}")
     time.sleep(2)  # 等消费者线程消费（BRPOP 阻塞拉取 + 落库，毫秒级，2s 足够）
@@ -76,7 +77,7 @@ def main():
     print(f"  ✅ 消费者已异步落库（refunds 表 {n} 张工单）")
 
     print("📍 [2/2] 幂等：重复 POST（不同 message_id，本质同一笔退款）→ 业务级唯一约束拦截")
-    status2, body2 = _post_refund(order_id, 89)
+    status2, body2 = _post_refund(order_id)
     assert status2 == 200, f"期望 200，实际 {status2}：{body2}"
     time.sleep(2)
     n2 = _count_refunds(order_id)

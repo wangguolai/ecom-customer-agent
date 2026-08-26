@@ -57,23 +57,19 @@ TRANSITIONS = {
 }
 
 
-def _validate_refund(order_id, amount):
-    """退款参数校验（纯函数，返回结果不抛异常）。同步 /refund 和异步消费者共用，语义一致。
+def _validate_refund(order_id):
+    """退款校验（金额下沉后）：LLM 只传 order_id，退款金额=订单金额（全额退款），由后端权威值决定。
 
-    返回 (ok, err_msg, status_code)：
-      ok=True  → 校验通过（err_msg/status_code 为 None）
-      ok=False → status_code 区分 404（订单不存在）和 400（格式/金额非法），供 /refund 翻译成 HTTPException。
-    消费者只关心 ok + err_msg（不关心 404 vs 400），校验失败记日志丢弃。
+    返回 (ok, err_msg, status_code, refund_amount)：
+      ok=True  → refund_amount 是订单金额（后端权威值，落库唯一来源）
+      ok=False → status_code 区分 404（订单不存在）和 400（格式/金额数据异常），供 /refund 翻译成 HTTPException。
+    消费者拿 refund_amount 落库，不取消息字段（消息只带 order_id，无 amount 可篡改）。
 
     为什么不抛 HTTPException：HTTP 层概念不该泄漏进消费者线程；纯函数让「同步翻译成 HTTP、
     异步直接判断」两种用法都干净。
     """
-    if not re.fullmatch(r"\d{8,32}", order_id):
-        return False, f"订单号格式非法：{order_id}", 400
-    # 金额类型校验：只接受 int/float，拦 None/str/bool。str 和 <= 比较会 TypeError（同步路径 500），
-    # bool 是 int 子类（True<=0 为 False 会穿过）——都在入口拦掉，Prompt Injection 可诱导传 "89"/true。
-    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
-        return False, f"退款金额非法：必须是数字，收到 {type(amount).__name__}", 400
+    if not isinstance(order_id, str) or not re.fullmatch(r"\d{8,32}", order_id):
+        return False, f"订单号格式非法：{order_id}", 400, None
 
     conn = db.get_conn()
     try:
@@ -84,13 +80,17 @@ def _validate_refund(order_id, amount):
         db.close_conn(conn)
 
     if row is None:
-        return False, f"未查到订单 {order_id}", 404
+        return False, f"未查到订单 {order_id}", 404, None
 
-    # 金额是「下单锁定的价格快照」，格式如 "¥89"，防御性处理货币符号/分隔
-    order_amount = float(row[0].replace("¥", "").split("/")[0].strip())
-    if amount <= 0 or amount > order_amount:
-        return False, f"退款金额非法：必须 >0 且 ≤ 订单金额 ¥{order_amount}", 400
-    return True, None, None
+    # 金额解析（防御）：订单金额是「下单锁定的价格快照」，格式如 "¥89"。脏数据→拒绝退款，不抛异常
+    # （原 float() 遇脏数据 ValueError 违反「纯函数不抛异常」设计，plan-reviewer 11-H 指出，顺手修）。
+    try:
+        order_amount = float(row[0].replace("¥", "").split("/")[0].strip())
+    except (ValueError, AttributeError):
+        return False, f"订单金额数据异常，无法退款，请联系人工", 400, None
+    if order_amount <= 0:
+        return False, f"订单金额异常（≤0），无法退款，请联系人工", 400, None
+    return True, None, None, order_amount
 
 
 def _create_refund_ticket(order_id, amount):
@@ -167,14 +167,16 @@ def _notify_human(ticket_id):
     print(f"🔔 [MQ] 已通知人工客服处理退款工单 {ticket_id}")
 
 
-def publish_refund(order_id, amount):
+def publish_refund(order_id):
     """生产者：发退款工单生成请求到 MQ。返回 {ok, message_id}。
 
+    消息只带 order_id，不带 amount——金额唯一来源是消费者重查 DB 的订单金额（refund_amount），
+    消息里的金额字段是可篡改的攻击面（超额退款洞），从源头消除。
     RPUSH 抛 RedisError 表示 MQ 不可用 → ok=False，调用方（/refund）回退同步落库。
     不做前置 ping：多一次往返 + 竞态窗口，实际操作失败才降级。
     """
     message_id = uuid.uuid4().hex
-    payload = {"message_id": message_id, "order_id": order_id, "amount": amount}
+    payload = {"message_id": message_id, "order_id": order_id}
     try:
         _redis_client.rpush(QUEUE_KEY, json.dumps(payload, ensure_ascii=False))
     except redis.exceptions.RedisError:
@@ -190,7 +192,6 @@ def _process_message(payload):
     """
     message_id = payload["message_id"]
     order_id = payload["order_id"]
-    amount = payload["amount"]
 
     # 幂等检查（消息级）：已处理过 → 跳过（重复消息）
     try:
@@ -201,19 +202,19 @@ def _process_message(payload):
         print(f"[MQ] 重复消息，跳过：{message_id}")
         return
 
-    # 校验（消费者不信任消息：可能来自多生产者/被篡改/订单状态已变，重新校验）
-    ok, err_msg, _ = _validate_refund(order_id, amount)
+    # 校验 + 查订单金额（消费者不信任消息：金额唯一来源是重查 DB 的 refund_amount，不取消息字段）
+    ok, err_msg, _, refund_amount = _validate_refund(order_id)
     if not ok:
         # 消息已被 BRPOP 弹出，校验失败只能「记日志 + 丢弃」——异步化后无同步拒绝回执，
         # 用户已收到「已受理」但工单不会生成，这是「受理 ≠ 完成」的代价。
         print(f"[MQ] 消费者校验失败，丢弃消息（{message_id}）：{err_msg}")
         return
 
-    ticket = _create_refund_ticket(order_id, amount)
+    ticket = _create_refund_ticket(order_id, refund_amount)
     if not ticket["duplicate"]:
         # 业务级幂等命中（撞唯一约束）时工单早已存在、早已通知过，不重复通知——避免重复下游副作用
         _notify_human(ticket["ticket_id"])
-    print(f"[MQ] 工单生成：{ticket['ticket_id']}（订单 {order_id}，¥{amount}）{'[重复已去重]' if ticket['duplicate'] else ''}")
+    print(f"[MQ] 工单生成：{ticket['ticket_id']}（订单 {order_id}，¥{refund_amount:g}）{'[重复已去重]' if ticket['duplicate'] else ''}")
 
 
 def consume_loop(stop_event):

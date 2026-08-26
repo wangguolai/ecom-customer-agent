@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "query": "我家猫毛色越来越差，摸起来糙糙的",
+      "expected": [
+        "成猫美毛粮（喵趣牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "猫咪化毛膏",
+      "added_at": "2026-08-26",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "手机壳",
+      "expected": [
+        "宠物航空箱"
+      ],
+      "fail_type": "软推",
+      "first_actual": "宠物航空箱",
+      "added_at": "2026-08-26",
+      "expect_type": "lock",
+      "note": "超知识库 query，软推相关商品是「召回优先」的正确行为（语义相似≠业务相关），锁住防误修成拒答",
+      "status": "open"
+    },
+    {
+      "query": "狗凉",
+      "expected": [
+        "幼犬成长粮（贝乐牌）",
+        "成犬均衡粮（贝乐牌）",
+        "肠胃敏感狗粮（贝乐牌）",
+        "老年犬配方粮（贝乐牌）",
+        "幼犬奶糕粮（优宠牌）",
+        "大型犬高钙粮（优宠牌）",
+        "小型犬专用粮（喵趣牌）"
+      ],
+      "fail_type": "排序偏",
+      "first_actual": "狗窝（大号）",
+      "added_at": "2026-08-26",
+      "expect_type": "fix",
+      "note": "「凉」→「粮」同音错别字，期望召回狗粮（标题含犬/狗的粮），却召回狗窝",
+      "status": "open"
+    }
+  ]
+}

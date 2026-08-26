@@ -6,7 +6,7 @@
 
 ## 背景
 
-当前 refund 是**同步链路**：`POST /refund` → 校验（订单号格式 / 订单存在 / 金额区间）→ `INSERT` 工单（待人工审批）→ 返回 ticket_id。
+当前 refund 是**同步链路**：`POST /refund` → 校验（订单号格式 / 订单存在）+ 查订单金额（金额下沉：退款金额=订单金额，全额退款，LLM 只传 order_id）→ `INSERT` 工单（待人工审批）→ 返回 ticket_id。
 
 「工单落库」和「通知人工」都在请求线程里同步完成，没有解耦——请求要等「落库 + 通知人工」全部做完才返回。
 
@@ -19,13 +19,13 @@
 ```
 agent refund_order 工具
   → POST /refund（同步校验 + 发消息）
-  → RPUSH mq:refund_queue（消息 = {message_id, order_id, amount}）
-  → 立即返回 {status: "已受理", message_id, ticket_id: null}   ← 响应不含工单号
+  → RPUSH mq:refund_queue（消息 = {message_id, order_id}，不带 amount——金额消费者重查 DB 权威值，防篡改）
+  → 立即返回 {status: "已受理", message_id, ticket_id: null, refund_amount}   ← 响应含订单金额（金额下沉）
                           ↓
 消费者（daemon 线程，lifespan 启动，BRPOP 阻塞拉取）
   → 幂等检查（message_id 已处理？）→ 跳过
-  → 校验（复用 _validate_refund，消费者不信任消息）
-  → INSERT refunds 工单（UNIQUE(order_id, amount) 兜底）
+  → 校验 + 查订单金额（复用 _validate_refund，消费者不信任消息，金额不取消息字段）
+  → INSERT refunds 工单（金额=refund_amount，UNIQUE(order_id) 兜底）
   → 通知人工（mock：打印日志）
 ```
 
@@ -33,10 +33,10 @@ agent refund_order 工具
 
 | 层 | 内容 | 为什么 |
 |----|------|--------|
-| 同步（/refund 内） | 订单号格式、金额>0、订单存在、金额≤订单金额 | 参数非法要**即时反馈**，不能让用户「受理中」后才发现金额错；校验是轻操作（查一条订单） |
+| 同步（/refund 内） | 订单号格式、订单存在、查订单金额（金额下沉：退款金额=订单金额，全额退款） | 参数非法要**即时反馈**，不能让用户「受理中」后才发现问题；校验是轻操作（查一条订单） |
 | 异步（消费者内） | 落库工单 + 通知人工 | 下游操作（通知人工系统、发短信）可能慢，异步化不阻塞退款响应 |
 
-**校验函数抽纯函数**：`_validate_refund(order_id, amount) -> (ok, err_msg, status_code)` 返回结果不抛异常。`/refund` 把它翻译成 `HTTPException`，消费者直接判断 `ok`——避免 `HTTPException`（HTTP 层概念）泄漏进消费者线程。
+**校验函数抽纯函数**：`_validate_refund(order_id) -> (ok, err_msg, status_code, refund_amount)` 返回结果不抛异常（金额下沉：LLM 只传 order_id，refund_amount 是订单金额权威值）。`/refund` 把它翻译成 `HTTPException`，消费者直接判断 `ok`——避免 `HTTPException`（HTTP 层概念）泄漏进消费者线程。
 
 **消费者不信任消息**：MQ 消息可能来自多生产者 / 被篡改 / 订单状态已变，消费者处理前重新校验（复用 `_validate_refund`，不重复代码）。
 
@@ -44,14 +44,14 @@ agent refund_order 工具
 
 1. **消息级**：`message_id` 去重。`SET mq:refund:done:{message_id} 1 NX EX 604800`（7 天）原子抢占标记——防**生产者侧重复入队**（/refund 在 RPUSH 超时后重发，同 message_id 入队两次）。
    - ⚠️ 表述修正：Redis list 用 BRPOP 是「至多一次」语义（消息原子弹出、崩溃即丢、无 ack 无重投），不存在「至少一次投递」。message_id 幂等防的是**生产者重复发布**，不是「消费重投」。
-2. **业务级**：DB 唯一约束 `UNIQUE(order_id, amount)` 兜底。防「同一订单金额」不同 message_id 的重复（用户重复提交两次退款）——消费者 `INSERT` 撞唯一约束 → 查已有工单 → 跳过。
+2. **业务级**：DB 唯一约束 `UNIQUE(order_id)` 兜底（模块5 升级 + 金额下沉后更明确）。防「同一订单」不同 message_id 的重复（用户重复提交两次退款）——消费者 `INSERT` 撞唯一约束 → 查已有工单 → 跳过。
 
 两层各拦一类重复：消息级拦「同一条消息入队两次」，业务级拦「两个不同消息本质是同一笔退款」。TTL 过期导致消息级去重失效时，业务级兜住，不产生重复工单。
 
 ## 降级：MQ 挂了不拖垮退款
 
 - **检测方式**：`RPUSH` 抛 `RedisError` 才回退（实际操作失败才降级），**不做前置 ping**（多一次往返 + 竞态窗口）。
-- **回退路径**：复用旧「`INSERT` 工单 + 撞键查已有」整段逻辑，等价旧行为。撞 `UNIQUE(order_id, amount)` → `IntegrityError` → SELECT 已有 → 返回 duplicate，不产生重复工单。
+- **回退路径**：复用旧「`INSERT` 工单 + 撞键查已有」整段逻辑，等价旧行为。撞 `UNIQUE(order_id)` → `IntegrityError` → SELECT 已有 → 返回 duplicate，不产生重复工单。
 - **统一响应形状（关键）**：两条路径都返回 `{status: "已受理", message_id, ticket_id}`——异步路径 `ticket_id=None`，回退路径带 `ticket_id`。`tools.py` 按 `ticket_id` 是否为空分两套文案，避免解析崩。
 - MQ 是「解耦 + 削峰」的手段，不是退款正确性的依赖；挂了降级同步，退款仍然可用。
 
@@ -90,5 +90,5 @@ agent refund_order 工具
 ## 验证
 
 - 起后端 → POST /refund → 返回「已受理」→ 消费者消费 → refunds 表生成工单（直查 MySQL 确认）
-- 幂等：同 order_id+amount 重复 POST（不同 message_id）→ 只 1 张工单
+- 幂等：同 order_id 重复 POST（不同 message_id）→ 只 1 张工单
 - 降级：停 Redis → POST /refund → 回退同步 → 工单直接生成

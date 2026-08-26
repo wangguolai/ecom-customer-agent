@@ -23,6 +23,7 @@ if _project_root not in sys.path:
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import src.agent as agent
+from cases import COMPRESSION_CASES as EVAL_SET
 
 # 订单号模式（评测的关键实体：跨轮指代依赖的对象）
 ORDER_ID_PATTERN = re.compile(r"20240818\d{3}")
@@ -31,37 +32,7 @@ ORDER_ID_PATTERN = re.compile(r"20240818\d{3}")
 # 用 500 是为了让 3 条评测场景都真正触发压缩，清晰对比「丢轮次 vs 摘要压缩」的实体保留差异。
 EVAL_MAX_TOKENS = 500
 
-# 评测集：多轮对话场景，早期轮含订单号，最后一轮是「指代追问」（依赖早期轮的订单号）
-# turns = [(user_msg, assistant_msg), ...]，最后一个 turn 的 assistant 是 None（当前轮未答）
-EVAL_SET = [
-    {
-        "name": "单订单指代",
-        "turns": [
-            ("查一下订单 20240818001 的物流到哪了", "物流轨迹：杭州转运中心已发出，下一站上海分拨" * 30),
-            ("这款幼犬粮适合我家金毛吗", "幼犬粮富含优质蛋白，适合中大型犬" * 30),
-            ("这个订单能退款吗", None),
-        ],
-        "entities": ["20240818001"],
-    },
-    {
-        "name": "多订单指代",
-        "turns": [
-            ("订单 20240818001 发货了吗", "订单已发货，物流单号 SF123456" * 30),
-            ("订单 20240818002 呢", "订单还在备货中" * 30),
-            ("第一个订单能退吗", None),
-        ],
-        "entities": ["20240818001", "20240818002"],
-    },
-    {
-        "name": "订单+售后混合",
-        "turns": [
-            ("订单 20240818001 到哪了", "已签收" * 30),
-            ("你们的退货政策是什么", "7 天无理由退货，质量问题 15 天" * 30),
-            ("那这个订单退款要多久", None),
-        ],
-        "entities": ["20240818001"],
-    },
-]
+# 上下文压缩评测集已集中到 cases.py（COMPRESSION_CASES），此处不再内联定义。
 
 
 def _mock_summarize(history_messages):

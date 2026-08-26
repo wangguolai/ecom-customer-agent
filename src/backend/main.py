@@ -8,12 +8,13 @@
 import sys
 import os
 import re
+import time
 import threading
 from contextlib import asynccontextmanager
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Response
 
 # 确保项目根目录在 Python 路径中
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,6 +23,7 @@ if _project_root not in sys.path:
 
 from src.backend.db import get_conn, close_conn
 from src.backend import cache
+from src.backend import fault
 from src.backend import mq
 from src.backend import ratelimit
 from src.backend.seed import _SEED_ORDERS, _SEED_LOGISTICS, _SEED_PRODUCTS
@@ -95,6 +97,16 @@ def get_order(order_id: str, _: None = Depends(_limit_read)):
     # 校验住它才真正堵住「刷空标记」口子。
     if not re.fullmatch(r"\d{8,32}", order_id):
         raise HTTPException(status_code=400, detail=f"订单号格式非法：{order_id}")
+    # 故障注入（评测用）：命中直接 return，不写缓存（避免脏响应污染缓存）。
+    # 注入的是 tools.py 已有的降级路径（超时→友好提示、脏数据→数据异常），不定义新降级行为。
+    mode = fault.apply_fault("orders")
+    if mode == "timeout":
+        time.sleep(3)  # 超过 tools.py 的 2s 客户端超时，触发 timeout 降级路径
+        return {}
+    if mode == "dirty":
+        return Response(content="这不是合法JSON", media_type="application/json")  # 200 但 JSON 解析失败 → bad_response
+    if mode == "empty":
+        return {}  # 合法 JSON 缺字段，触发工具层「数据异常」降级
     cache_key = f"ecom:order:{order_id}"
     hit, data = cache.get_json(cache_key)
     if hit:
@@ -121,6 +133,15 @@ def get_order(order_id: str, _: None = Depends(_limit_read)):
 def get_logistics(order_id: str, _: None = Depends(_limit_read)):
     if not re.fullmatch(r"\d{8,32}", order_id):
         raise HTTPException(status_code=400, detail=f"订单号格式非法：{order_id}")
+    # 故障注入（评测用）：命中直接 return，不写缓存（避免脏响应污染缓存）。
+    mode = fault.apply_fault("logistics")
+    if mode == "timeout":
+        time.sleep(3)  # 超过 tools.py 的 2s 客户端超时，触发 timeout 降级路径
+        return {}
+    if mode == "dirty":
+        return Response(content="这不是合法JSON", media_type="application/json")  # 200 但 JSON 解析失败 → bad_response
+    if mode == "empty":
+        return {}  # 合法 JSON 缺字段，触发工具层「数据异常」降级
     cache_key = f"ecom:logistics:{order_id}"
     hit, data = cache.get_json(cache_key)
     if hit:
@@ -150,6 +171,15 @@ def get_product(product_id: str, _: None = Depends(_limit_read)):
     # 用格式 P\d{1,15} 拦掉，和 seed 的 P001 形态对齐。
     if not re.fullmatch(r"P\d{1,15}", product_id):
         raise HTTPException(status_code=400, detail=f"商品 ID 非法：{product_id}")
+    # 故障注入（评测用）：命中直接 return，不写缓存（避免脏响应污染缓存）。
+    mode = fault.apply_fault("products")
+    if mode == "timeout":
+        time.sleep(3)  # 超过 tools.py 的 2s 客户端超时，触发 timeout 降级路径
+        return {}
+    if mode == "dirty":
+        return Response(content="这不是合法JSON", media_type="application/json")  # 200 但 JSON 解析失败 → bad_response
+    if mode == "empty":
+        return {}  # 合法 JSON 缺字段，触发工具层「数据异常」降级
     cache_key = f"ecom:product:{product_id}"
     hit, data = cache.get_json(cache_key)
     if hit:
@@ -172,34 +202,57 @@ def get_product(product_id: str, _: None = Depends(_limit_read)):
     return data
 
 
+@app.get("/online")
+def check_online(_: None = Depends(_limit_read)):
+    """客服在线状态（动态数据走接口查，数据分治）。demo 用环境变量 CS_ONLINE mock（可测试切换），
+    生产来自坐席系统（IM/客服工作台）实时状态。
+
+    CS_ONLINE 布尔解析：字符串 "false" 是 truthy，必须 strip().lower() == "true" 判断。
+    """
+    online = os.environ.get("CS_ONLINE", "true").strip().lower() == "true"
+    return {"online": online}
+
+
 @app.post("/refund")
 def refund_order(payload: dict, _: None = Depends(_limit_write)):
-    """退款（写操作）—— MQ 异步化：同步校验 + 发消息，消费者异步落库 + 通知人工。
+    """退款（写操作）—— 金额下沉 + MQ 异步化。
 
-    代码级防御不变：只生成「待人工审批」工单，不直接退款；参数校验拦截非法金额。
-    同步只做「参数校验」（即时反馈，非法订单/金额不让用户白等），「落库 + 通知人工」走 MQ 异步。
-    降级：MQ（Redis）不可用 → 回退同步落库（复用 _create_refund_ticket，等价旧行为），退款不因 MQ 挂而失败。
+    金额下沉：LLM 只传 order_id，退款金额=订单金额（后端查，全额退款），
+    LLM 无权指定金额（防被诱导填 0/负数/超额，数据分治：能结构化查到的参数不让 LLM 填）。
+    代码级防御不变：只生成「待人工审批」工单，不直接退款。
+    同步只做「校验 + 查订单金额」（即时反馈），「落库 + 通知人工」走 MQ 异步。
+    降级：MQ（Redis）不可用 → 回退同步落库，退款不因 MQ 挂而失败。
     """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
     order_id = payload.get("order_id")
-    amount = payload.get("amount")
-    if not order_id or amount is None:
-        raise HTTPException(status_code=400, detail="缺少 order_id 或 amount")
+    if not order_id:
+        raise HTTPException(status_code=400, detail="缺少 order_id")
 
-    # 同步校验（即时反馈）：订单号格式 / 订单存在 / 金额区间
-    ok, err_msg, status_code = mq._validate_refund(order_id, amount)
+    # 故障注入（评测用）：命中直接 return，不写缓存（避免脏响应污染缓存）。
+    # 注入的是 tools.py 已有的降级路径（超时→友好提示、脏数据→数据异常），不定义新降级行为。
+    mode = fault.apply_fault("refund")
+    if mode == "timeout":
+        time.sleep(3)  # 超过 tools.py 的 2s 客户端超时，触发 timeout 降级路径
+        return {}
+    if mode == "dirty":
+        return Response(content="这不是合法JSON", media_type="application/json")
+    if mode == "empty":
+        return {}
+
+    # 校验 + 查订单金额（金额下沉：退款金额=订单金额，后端权威值）
+    ok, err_msg, status_code, refund_amount = mq._validate_refund(order_id)
     if not ok:
         raise HTTPException(status_code=status_code, detail=err_msg)
 
-    # 发消息到 MQ
-    pub = mq.publish_refund(order_id, amount)
+    # 发消息到 MQ（消息只带 order_id，不带 amount，防篡改）
+    pub = mq.publish_refund(order_id)
     if pub["ok"]:
-        return {"status": "已受理", "message_id": pub["message_id"], "ticket_id": None}
+        return {"status": "已受理", "message_id": pub["message_id"], "ticket_id": None, "refund_amount": refund_amount}
 
-    # 降级回退：MQ 不可用 → 同步落库（复用 _create_refund_ticket，等价旧行为）
-    ticket = mq._create_refund_ticket(order_id, amount)
-    return {"status": "已受理", "message_id": None, "ticket_id": ticket["ticket_id"]}
+    # 降级回退：MQ 不可用 → 同步落库（refund_amount 是订单金额）
+    ticket = mq._create_refund_ticket(order_id, refund_amount)
+    return {"status": "已受理", "message_id": None, "ticket_id": ticket["ticket_id"], "refund_amount": refund_amount}
 
 
 @app.post("/refund/{ticket_id}/review")
@@ -231,3 +284,26 @@ def execute_refund(ticket_id: str, _: None = Depends(_limit_write)):
     if not result["ok"]:
         raise HTTPException(status_code=result["status_code"], detail=result["err"])
     return {"ticket_id": ticket_id, "status": result["status"]}
+
+
+# ── 故障注入调试端点（模块：评测用，生产默认关闭）──
+# ENABLE_DEBUG_FAULT 环境变量为真才挂路由——「能让系统出故障」的无鉴权端点不能裸奔
+# （和 prompt injection 的写权限开关同类：调试后门代码级默认关闭）。
+if os.environ.get("ENABLE_DEBUG_FAULT", "").strip().lower() in ("1", "true", "yes"):
+    @app.post("/debug/fault")
+    def debug_set_fault(payload: dict, _: None = Depends(_limit_write)):
+        target = payload.get("target")
+        mode = payload.get("mode")
+        count = payload.get("count", 1)
+        if target not in ("orders", "logistics", "products", "refund"):
+            raise HTTPException(status_code=400, detail=f"非法 target：{target}")
+        if mode not in ("timeout", "dirty", "empty"):
+            raise HTTPException(status_code=400, detail=f"非法 mode：{mode}")
+        fault.set_fault(target, mode, count)
+        return {"status": "已注入", "target": target, "mode": mode, "count": count}
+
+    @app.post("/debug/fault/clear")
+    def debug_clear_fault(payload: dict = None, _: None = Depends(_limit_write)):
+        target = (payload or {}).get("target")
+        fault.clear_fault(target)
+        return {"status": "已清除"}

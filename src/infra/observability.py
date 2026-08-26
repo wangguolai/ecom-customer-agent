@@ -23,6 +23,7 @@ class Trace:
         self.summaries = []   # [(elapsed, prompt_tokens, completion_tokens)] 摘要压缩调用
         self.cache_hit_tokens = 0   # DeepSeek 前缀缓存命中 token（按命中价计费，~1/30 输入价）
         self.cache_miss_tokens = 0  # 缓存未命中 token（按未命中价计费）
+        self.route_source = "LLM"  # 路由来源：LLM（默认决策） / 规则（意图路由层命中，省一次决策调用）
         self.end_reason = "未知"  # 正常 / 死循环 / 超步数 / 异常
 
     def add_llm(self, step: int, elapsed: float, tokens, prompt_tokens=None, cache_hit=0, cache_miss=0):
@@ -65,6 +66,7 @@ class Trace:
             "工具调用次数": len(self.tool_calls),
             "工具频次": tool_freq,
             "召回端空返回次数": empty_count,
+            "路由来源": self.route_source,
             "结束原因": self.end_reason,
         }
 
@@ -85,7 +87,7 @@ class MetricsStore:
 
     def record(self, trace: Trace):
         s = trace.summary()
-        self.records.append((s["总耗时(秒)"], s["总 token 消耗"], s["结束原因"]))
+        self.records.append((s["总耗时(秒)"], s["总 token 消耗"], s["结束原因"], s["路由来源"]))
 
     def _percentile(self, values: list, p: int) -> float:
         """最近秩近似 P 分位"""
@@ -102,9 +104,11 @@ class MetricsStore:
         tokens = [r[1] for r in self.records]
         # 技术成功率：结束原因 == 正常（没死循环/没超步数/没异常）。答案对不对归评测体系，不归这里。
         success = sum(1 for r in self.records if r[2] == "正常")
+        route_rule = sum(1 for r in self.records if r[3] == "规则")
         return {
             "样本数": len(self.records),
             "技术成功率": round(success / len(self.records), 4),
+            "规则路由占比": round(route_rule / len(self.records), 4),
             "平均延迟(秒)": round(sum(times) / len(times), 3),
             "P99延迟(秒)": round(self._percentile(times, 99), 3),
             "平均token": round(sum(tokens) / len(tokens), 1),

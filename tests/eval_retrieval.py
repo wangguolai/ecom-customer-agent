@@ -16,54 +16,18 @@ if _project_root not in sys.path:
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+import time
+
 import jieba
 from src.infra.embedding import get_embedding_model
 from src.infra.vector_store import QdrantStore
 from src.infra.hybrid_retriever import HybridRetriever
 from src.tools import detect_category
 
-# 标注集：query -> 正确答案标题列表（基于 data/products.md 人工标注）
-# ⚠️ expected 必须用「完整标题（含品牌括号）」，和 index_products.py 入库的 title 字段
-#    （re.match(r"## (.+)", chunk) 提取）严格一致，否则集合交集为空、Recall 恒 0。
-EVAL_SET = [
-    # ── G1 字面基线：query≈标题，三路都该对，只留 2 条做 sanity check ──
-    ("松木猫砂", ["松木猫砂"]),
-    ("逗猫棒", ["逗猫棒（羽毛）"]),
+import regression
+from cases import RETRIEVAL_CASES as EVAL_SET
 
-    # ── G2 精确词/品牌：embedding 对品牌名不敏感，测 BM25 应赢、向量可能漏 ──
-    ("贝乐牌的狗粮有哪些", ["幼犬成长粮（贝乐牌）", "成犬均衡粮（贝乐牌）", "肠胃敏感狗粮（贝乐牌）", "老年犬配方粮（贝乐牌）"]),
-    ("喵趣牌的猫粮有哪些", ["幼猫奶糕粮（喵趣牌）", "成猫美毛粮（喵趣牌）", "泌尿呵护猫粮（喵趣牌）", "布偶猫专用粮（喵趣牌）"]),
-    ("优宠牌的粮有哪些", ["全阶段鸡肉粮（优宠牌）", "幼犬奶糕粮（优宠牌）", "大型犬高钙粮（优宠牌）", "全阶段猫粮（优宠牌）", "肠胃敏感猫粮（优宠牌）", "英短专用粮（优宠牌）"]),
-
-    # ── G3 同义改写：字面不重叠、靠语义，测 BM25 应输、向量应赢 ──
-    ("有没有粉尘少一些的猫砂推荐", ["豆腐猫砂"]),
-    ("猫砂哪种结块快一点", ["膨润土猫砂"]),
-    ("有没有能直接冲马桶的猫砂", ["豆腐猫砂", "松木猫砂"]),
-    ("我家狗嘴巴里有味道，吃什么能清清", ["洁齿磨牙棒"]),
-    ("想给猫咪补点水，有没有流质一点的零食", ["猫条（金枪鱼味）"]),
-    ("狗狗爱咬东西，有没有耐啃的玩具", ["耐咬橡胶球"]),
-    ("猫爪子总抓沙发，怎么防", ["猫抓板"]),
-    ("遛狗的时候它老往前冲拉不住", ["宠物牵引绳"]),
-
-    # ── G4 场景描述：绕开答案关键词，测最难召回的边界 ──
-    ("我家狗狗老是乱咬东西，牙齿很脏，有没有什么零食可以清洁一下", ["洁齿磨牙棒"]),
-    ("最近天热了我家猫咪老是掉毛，给自己洗完澡容易吐，有什么办法", ["猫咪化毛膏"]),
-    ("我有时候懒得天天给家里的小猫小狗换水，有什么推荐吗", ["自动饮水机"]),
-    ("我家狗喜欢玩水，天天弄得自己毛发乱糟糟的", ["宠物梳毛刷"]),
-    ("我们家宠物出门的时候老是乱跑，有没有什么办法", ["宠物牵引绳"]),
-    ("我们家小猫喜欢蹦蹦跳跳的，有没有什么吃的或者玩的能消耗一下他的体力", ["益智漏食球"]),
-    ("我们家宝宝肠胃不好，有什么粮推荐吗", ["全阶段鸡肉粮（优宠牌）", "肠胃敏感狗粮（贝乐牌）", "肠胃敏感猫粮（优宠牌）"]),
-    ("我家小猫刚断奶，不知道喂什么好", ["幼猫奶糕粮（喵趣牌）"]),
-    ("我家狗狗年纪大了，腿脚不太利索了", ["老年犬配方粮（贝乐牌）"]),
-    ("我家猫总是尿频，还老舔下面", ["泌尿呵护猫粮（喵趣牌）"]),
-    ("带猫坐飞机要装什么箱子里", ["宠物航空箱"]),
-    ("我家狗睡觉老刨地，想给它整个窝", ["狗窝（大号）"]),
-    ("我家猫毛色越来越差，摸起来糙糙的", ["成猫美毛粮（喵趣牌）"]),
-    ("我家英短越吃越胖，怕它得病", ["英短专用粮（优宠牌）"]),
-    ("我家布偶毛长，老是打结成坨", ["布偶猫专用粮（喵趣牌）"]),
-    ("训狗的时候想拿点东西奖励它", ["狗狗训练饼干"]),
-    ("我家猫睡地上怕它冷", ["猫窝（保暖）"]),
-]
+# 检索评测集已集中到 cases.py（RETRIEVAL_CASES），此处 import 别名 EVAL_SET 保持脚本内逻辑不变。
 
 
 def _build_title_map(store):
@@ -95,6 +59,7 @@ def run_eval():
 
     methods = ["纯向量", "纯BM25", "混合+预过滤+Rerank"]
     agg = {m: {"recall": [], "mrr": []} for m in methods}
+    failures = []  # 混合检索 top1 错的 case（数据飞轮：自动回流进池）
 
     for query, expected in EVAL_SET:
         # 1. 纯向量
@@ -117,6 +82,26 @@ def run_eval():
         _, hybrid_results = retriever.search(query, top_k=3, category=category)
         hybrid_titles = [title for _, _, _, title, _ in hybrid_results]
 
+        # 失败判定：混合检索召回不足（top1 错 或 多答案召回不全）→ 记失败（自动回流进池）
+        # 规范 = top_k=3 的召回上限 min(len(expected), 3)，和毕业标准同规范，不自相矛盾
+        hybrid_top1 = hybrid_titles[0] if hybrid_titles else ""
+        recalled = len(set(expected) & set(hybrid_titles))
+        recall_cap = min(len(expected), 3)
+        if recalled < recall_cap:
+            if not hybrid_titles:
+                fail_type = "空返回"
+            elif hybrid_top1 not in expected:
+                fail_type = "top1错"
+            else:
+                fail_type = "多答案不全"
+            failures.append({
+                "query": query,
+                "expected": list(expected),
+                "fail_type": fail_type,
+                "first_actual": hybrid_top1,
+                "added_at": time.strftime("%Y-%m-%d"),
+            })
+
         for method, titles in zip(methods, [vec_titles, bm25_titles, hybrid_titles]):
             recall = len(set(expected) & set(titles)) / len(expected)
             mrr = 0.0
@@ -134,6 +119,60 @@ def run_eval():
         recall = sum(agg[m]["recall"]) / len(EVAL_SET)
         mrr = sum(agg[m]["mrr"]) / len(EVAL_SET)
         print(f"{m:<22} {recall:<12.4f} {mrr:<10.4f}")
+    print("=" * 70)
+
+    # 数据飞轮：失败回流 + 池回归 + fix 型毕业
+    _run_regression(retriever, failures)
+
+
+def _run_regression(retriever, failures):
+    """数据飞轮：① 失败 case 自动回流进池 ② 池 open case 复测（回归）③ fix 型毕业 / lock 型防误修"""
+    # 先取池 open case（本次回流前），再回流——避免本次刚失败的 case 又复测一遍
+    pool_cases = regression.open_cases("retrieval")
+    added = regression.add_failures("retrieval", failures)
+
+    print()
+    print("=" * 70)
+    print(f"数据飞轮：本次回流 +{added} 条 → 回归池 open {len(pool_cases)} 条（不含本次）")
+    print("-" * 70)
+    if not pool_cases:
+        print("📊 回归池：空（无待回归 case）")
+        print("=" * 70)
+        return
+
+    passed = set()
+    for c in pool_cases:
+        query = c["query"]
+        exp = c.get("expected") or []
+        expected = set(exp) if isinstance(exp, (list, tuple)) else {exp}
+        category = detect_category(query)
+        _, hybrid_results = retriever.search(query, top_k=3, category=category)
+        hybrid_titles = [title for _, _, _, title, _ in hybrid_results]
+        top1 = hybrid_titles[0] if hybrid_titles else ""
+        recalled = len(expected & set(hybrid_titles))
+        recall_cap = min(len(expected), 3)
+
+        if c.get("expect_type") == "lock":
+            # 行为锁定：锁「该软推的对象」——top1 还是 first_actual 才算保持
+            first_actual = c.get("first_actual", "")
+            if top1 == first_actual:
+                print(f"  ✅ [lock 锁定] {query}：软推保持（top1={top1}）")
+            elif not hybrid_titles:
+                print(f"  🔴 [lock 退化] {query}：应软推却拒答（召回空）！行为被误修，检查召回策略")
+            else:
+                print(f"  ⚠️ [lock 漂移] {query}：top1 {first_actual} → {top1}，软推对象变了，检查召回策略")
+        else:  # fix
+            if recalled >= recall_cap:
+                passed.add(query)
+                print(f"  ✅ [fix 修复] {query}：召回 {recalled}/{len(expected)} 达标")
+            else:
+                print(f"  ❌ [fix 仍坏] {query}：top1={top1 or '（空）'}，召回 {recalled}/{len(expected)}，期望 {sorted(expected)}")
+
+    graduated = regression.graduate("retrieval", passed)
+    if graduated:
+        print(f"🎓 毕业 {len(graduated)} 条：{graduated}")
+    open_left = len(regression.open_cases("retrieval"))
+    print(f"📊 回归汇总：open {len(pool_cases)} / 通过 {len(passed)} / 毕业 {len(graduated)} / 剩余 open {open_left}")
     print("=" * 70)
 
 

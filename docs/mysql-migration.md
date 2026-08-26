@@ -9,7 +9,7 @@ backend 数据层 `sqlite3` → MySQL，落地「订单号唯一索引 + 连接�
 
 ## 二、现状（元数据同步重构后）
 
-- `src/backend/seed.py`：种子数据（`_SEED_ORDERS`/`_SEED_LOGISTICS`/`_SEED_STOCK`，STOCK 已去价格）
+- `src/backend/seed.py`：种子数据（`_SEED_ORDERS`/`_SEED_LOGISTICS`/`_SEED_PRODUCTS`，商品统一 ID 后 STOCK→PRODUCTS、去价格）
 - `src/backend/main.py`：FastAPI + sqlite3 直连；`_init_db()` 在**模块 import 时顶层执行**（底部调用）；`/refund` 每个操作各 `sqlite3.connect` 一次、无事务、幂等靠「查重复 + 插入」
 - `src/refresh.py`：统一重建入口（`_init_db` + 向量库）
 
@@ -50,14 +50,14 @@ backend 数据层 `sqlite3` → MySQL，落地「订单号唯一索引 + 连接�
 
 ### 决策 3：幂等——唯一约束替代「先查后插」
 - 当前「先 SELECT 查无重复、再 INSERT」有竞态：两并发都查「无重复」→ 双 INSERT → 双工单。
-- **正解**：`refunds` 表加 `UNIQUE(order_id, amount)`，INSERT 撞唯一约束 → 按下面顺序处理。
+- **正解**：`refunds` 表加 `UNIQUE(order_id, amount)`，INSERT 撞唯一约束 → 按下面顺序处理。（**演进注记**：模块 5 高可用升级为 `UNIQUE(order_id)`——拦「同订单退 50 又退 80」，见 high-availability-plan.md）
 - **撞唯一键的处理（autocommit 下，比显式事务更简）**：`INSERT` 抛 `IntegrityError` → 直接 `SELECT` 已存在工单 → 返回 `duplicate=True` + 真实 `ticket_id`。autocommit 下每条 SQL 独立事务，撞键后 SELECT 能看到对方已提交的行，**不需要 rollback**（那是显式事务 REPEATABLE READ 下的要求，这里不适用）。
 - **refunds 迁移策略**：refunds 是运行时数据，迁移时 **DROP 重建**（清空），CREATE TABLE 直接带唯一约束。**不能依赖 `CREATE TABLE IF NOT EXISTS` 加约束**（表已存在会跳过，约束永远加不上）。
 
 ### 决策 4：索引设计
 - `orders.order_id`：`VARCHAR(32) PRIMARY KEY` = 聚簇索引 + 唯一（满足「订单号唯一索引」）。
 - `logistics.order_id`：建二级索引（`/logistics/{order_id}` 频繁 `WHERE`）。
-- `refunds` 的 `UNIQUE(order_id, amount)`：既保幂等，又是复合索引。
+- `refunds` 的 `UNIQUE(order_id, amount)`：既保幂等，又是复合索引。（模块 5 升级为 `UNIQUE(order_id)`）
 
 ### 决策 5：MySQL 环境 = 本地 MySQL（已定）
 - 本地装 MySQL 社区版（Windows 服务），国内镜像源，约 30 分钟~1 小时。
@@ -85,7 +85,7 @@ backend 数据层 `sqlite3` → MySQL，落地「订单号唯一索引 + 连接�
 - `.env` 新增 `MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD/MYSQL_DB`，db.py 用 `python-dotenv` 读（复用 `llm.py` 已有的 `load_dotenv` 模式），不硬编码。
 
 ### 决策 9：amount 类型局限（标注，不改）
-- 现状：`orders.amount` 是 TEXT「¥89」（含货币符号）、`refunds.amount` 是 REAL。`UNIQUE(order_id, amount)` 建在浮点上。
+- 现状：`orders.amount` 是 TEXT「¥89」（含货币符号）、`refunds.amount` 是 REAL。`UNIQUE(order_id, amount)` 建在浮点上（模块 5 改 `UNIQUE(order_id)` 后，浮点唯一键隐患消除）。
 - demo 整数金额（89.0/32.0）可精确表示，暂不影响；但这是「浮点唯一键」的隐患，生产应改 `DECIMAL(10,2)`。
 - **本次不改**（改 DECIMAL 牵动 seed + 评测金额断言，超出模块 2「SQLite→MySQL」范围），标注为已知局限 + 设计要点。
 

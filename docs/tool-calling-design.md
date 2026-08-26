@@ -46,7 +46,7 @@
 |------|------|------|------|
 | `search_orders` | `order_id` 订单号 | 订单状态 | 只读 |
 | `search_logistics` | `order_id` 订单号 | 物流轨迹 | 只读 |
-| `check_stock` | `product_name` 商品名 | 🔧 **库存 + 价格** | 只读 |
+| `check_stock` | `product_id` 商品ID | 🔧 **库存 + 价格** | 只读 |
 | `get_return_policy` | 无参数 | 退换货政策 | 只读 |
 | `transfer_to_human` | `problem` 问题描述 | 工单号 | 写（权限待决策） |
 
@@ -119,7 +119,7 @@ Token 爆炸做截断（500 字）；Prompt Injection / 上下文污染留到对
 
 - `MOCK_ORDERS`：2-3 个订单号 → 状态（下单时间、商品、金额）
 - `MOCK_LOGISTICS`：订单号 → 物流轨迹列表
-- `MOCK_STOCK`：商品名 → `{"库存": N, "价格": "¥xx"}`；🔧 未命中用 `dict.get()` 返回「未查到该商品」，不 KeyError
+- `MOCK_STOCK`：商品名 → `{"库存": N, "价格": "¥xx"}`（🔧 模块 1 过渡，已接真实后端：products 表 + `check_stock(product_id)`）；未命中用 `dict.get()` 返回「未查到该商品」，不 KeyError
 - `RETURN_POLICY`：一段退换货政策文本
 - `transfer_to_human`：返回生成的工单号
 

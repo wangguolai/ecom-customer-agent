@@ -103,15 +103,22 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "check_online",
+            "description": "查询人工客服当前是否在线（是否有人工客服值班）",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "refund_order",
-            "description": "为订单申请退款（写操作：只生成待人工审批的工单，不直接退款，需提供订单号和退款金额）",
+            "description": "为订单申请退款（写操作：只生成待人工审批的工单，不直接退款。只需订单号，退款金额由系统按订单金额全额退，不要指定金额）",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "order_id": {"type": "string", "description": "订单号，如 20240818001"},
-                    "amount": {"type": "number", "description": "退款金额（元）"}
+                    "order_id": {"type": "string", "description": "订单号，如 20240818001"}
                 },
-                "required": ["order_id", "amount"],
+                "required": ["order_id"],
             },
         },
     },
@@ -186,9 +193,12 @@ async def _http_request(method, url, json=None):
         _breaker.record_success()  # 4xx 后端健康，重置连续失败计数
         return resp, None
     # 2xx：校验响应格式（坑 7），垃圾响应算熔断失败
+    # 注意：这里只能用 ValueError，不能用 json.JSONDecodeError——本函数参数名 json 遮蔽了
+    # 模块级 import json（json 参数默认 None，except 里 json.JSONDecodeError 会 None 属性报错）。
+    # JSONDecodeError 是 ValueError 子类，except ValueError 就能捕获。此坑故障注入 dirty 才暴露。
     try:
         resp.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         _breaker.record_failure()
         return None, "bad_response"
     _breaker.record_success()
@@ -221,7 +231,12 @@ async def search_orders(order_id: str) -> str:
     if resp.status_code != 200:
         return f"订单查询失败（状态码 {resp.status_code}），请稍后重试。"
     d = resp.json()
-    return f"订单 {d['order_id']}：状态={d['status']}，商品={d['product']}，金额={d['amount']}，下单时间={d['created_at']}"
+    # 输出校验（格式级）：字段类型/非空。枚举级（status 值）透传——业务枚举会扩展（如「已退款」），
+    # 未知值如实告诉用户，不降级「数据异常」（降级会掩盖正常数据）。格式级异常（脏数据/缺字段）才拦。
+    status = d.get("status")
+    if not isinstance(status, str) or not status.strip():
+        return "订单数据异常，请联系人工客服。"
+    return f"订单 {d.get('order_id', '未知')}：状态={status}，商品={d.get('product', '未知')}，金额={d.get('amount', '未知')}，下单时间={d.get('created_at', '未知')}"
 
 
 async def search_logistics(order_id: str) -> str:
@@ -238,7 +253,12 @@ async def search_logistics(order_id: str) -> str:
     if resp.status_code != 200:
         return f"物流查询失败（状态码 {resp.status_code}），请稍后重试。"
     d = resp.json()
-    lines = [f"{t['time']} {t['location']} {t['status']}" for t in d["traces"]]
+    # 输出校验（格式级）：traces 必须是 list 且每项含 time/location/status 三字段。
+    # 否则（如故障注入 empty 返回 {}）d["traces"] 会 KeyError，被 agent 误捕成「参数不匹配」而非「数据异常」。
+    traces = d.get("traces")
+    if not isinstance(traces, list) or any(not isinstance(t, dict) or not all(k in t for k in ("time", "location", "status")) for t in traces):
+        return "物流数据异常，请联系人工客服。"
+    lines = [f"{t['time']} {t['location']} {t['status']}" for t in traces]
     return "物流轨迹：\n" + "\n".join(lines)
 
 
@@ -256,9 +276,18 @@ async def check_stock(product_id: str) -> str:
     if resp.status_code != 200:
         return f"价格/库存查询失败（状态码 {resp.status_code}），请稍后重试。"
     d = resp.json()
-    if d["qty"] <= 0:
-        return f"「{d['name']}」暂时缺货（价格 ¥{d['price']:g}）。"
-    return f"「{d['name']}」有货，库存 {d['qty']} 件，价格 ¥{d['price']:g}。"
+    # 输出校验（格式级）：qty 是非负 int（排除 bool，bool 是 int 子类）、price 是非负数字。
+    # qty=0 是合法缺货（豆腐猫砂），不误伤；格式级异常（负数/非数字/脏数据）降级，不把脏数据回灌 LLM。
+    qty = d.get("qty")
+    price = d.get("price")
+    if isinstance(qty, bool) or not isinstance(qty, int) or qty < 0:
+        return "商品数据异常，请联系人工客服。"
+    if isinstance(price, bool) or not isinstance(price, (int, float)) or price < 0:
+        return "商品数据异常，请联系人工客服。"
+    name = d.get("name", "未知商品")
+    if qty <= 0:
+        return f"「{name}」暂时缺货（价格 ¥{price:g}）。"
+    return f"「{name}」有货，库存 {qty} 件，价格 ¥{price:g}。"
 
 
 async def get_return_policy() -> str:
@@ -266,10 +295,38 @@ async def get_return_policy() -> str:
     return RETURN_POLICY
 
 
+async def check_online() -> str:
+    """查询人工客服是否在线（动态数据走接口查，数据分治）"""
+    resp, err = await _http_request("GET", f"{BACKEND_URL}/online")
+    if err:
+        if err == "breaker_open":
+            return "客服在线状态查询暂不可用（熔断中），请稍后重试。"
+        if err == "rate_limited":
+            return "请求过于频繁，请稍后再试。"
+        return "客服在线状态查询暂不可用（后端未启动或超时）。"
+    if resp.status_code != 200:
+        return "客服在线状态查询失败，请稍后重试。"
+    d = resp.json()
+    return "人工客服当前在线。" if d.get("online") else "人工客服当前不在线（工作时间 9:00-18:00）。"
+
+
 async def transfer_to_human(problem: str) -> str:
-    """转人工（生成工单）"""
+    """转人工（生成工单 + 查在线状态）。
+
+    转人工前必查在线（代码层保证，不靠 LLM 决策）：在线状态是动态数据走接口查（数据分治）。
+    在线 → 生成工单「已转接人工」；不在线 → 生成工单（记录问题）+ 安抚话术，不声称「已转接」。
+    /online 挂掉（后端不可用/熔断/超时）→ 降级生成工单 + 保守话术（不声称已转接），
+    转人工不因查询失败而拒绝——工单生成是本地逻辑，不依赖后端。
+    """
     ticket_id = f"TK{uuid.uuid4().hex[:8].upper()}"
-    return f"已为您创建工单 {ticket_id}，人工客服将尽快联系您。问题：{problem}"
+    resp, err = await _http_request("GET", f"{BACKEND_URL}/online")
+    online = False
+    if err is None and resp.status_code == 200:
+        online = bool(resp.json().get("online"))
+    if online:
+        return f"已为您转接人工客服，工单 {ticket_id}，人工将尽快联系您。问题：{problem}"
+    # 不在线（或在线状态查询失败）→ 生成工单（记录问题）+ 安抚，不声称已转接
+    return f"已记录您的问题（工单 {ticket_id}），当前人工客服不在线，工作时间（9:00-18:00）将尽快处理。问题：{problem}"
 
 
 # 写工具集合（代码级标记：写操作要过权限门槛，读工具随便调）
@@ -277,16 +334,17 @@ async def transfer_to_human(problem: str) -> str:
 WRITE_TOOLS = {"refund_order", "transfer_to_human"}
 
 
-async def refund_order(order_id: str, amount: float) -> str:
+async def refund_order(order_id: str) -> str:
     """退款（写工具，代码级防御：只提交「待人工审批」工单，不直接退款）。
 
-    关键：LLM 只有「建议权」（提交退款申请），没有「执行权」（真正退款在人工审批）。
-    Prompt Injection 诱导 LLM 调 refund，最多生成一个待审批工单，金额非法会被后端参数校验拦下。
+    金额下沉：LLM 只传 order_id，退款金额由后端查订单得出（全额退款），LLM 无权指定金额——
+    防 Prompt Injection 诱导 LLM 填 0/负数/超额（数据分治：能结构化查到的参数不让 LLM 填）。
 
-    MQ 异步化后：后端 /refund 返回「已受理」，工单由消费者异步生成。按响应里 ticket_id
-    是否为空分两套话术——降级回退路径带工单号，异步路径带受理号。
+    MQ 异步化后：后端 /refund 返回「已受理」+ refund_amount（订单金额），工单由消费者异步生成。
+    按响应里 ticket_id 是否为空分两套话术——降级回退路径带工单号，异步路径带受理号。
+    话术金额用响应 refund_amount（后端权威值），不引用任何局部 amount。
     """
-    resp, err = await _http_request("POST", f"{BACKEND_URL}/refund", json={"order_id": order_id, "amount": amount})
+    resp, err = await _http_request("POST", f"{BACKEND_URL}/refund", json={"order_id": order_id})
     if err:
         if err == "breaker_open":
             return "退款服务暂不可用（当前熔断中，请稍后重试或转人工）。"
@@ -298,11 +356,18 @@ async def refund_order(order_id: str, amount: float) -> str:
     if resp.status_code != 200:
         return f"退款失败（状态码 {resp.status_code}），请稍后重试。"
     d = resp.json()
+    # 输出校验（格式级）：refund_amount 必须是数字（排除 bool）；ticket_id / message_id 至少有一个。
+    # 否则（如故障注入 empty 返回 {}）d["message_id"] 会 KeyError，被 agent 误捕成「参数不匹配」而非「数据异常」。
+    refund_amount = d.get("refund_amount")
+    if isinstance(refund_amount, bool) or not isinstance(refund_amount, (int, float)):
+        return "退款数据异常，请联系人工客服。"
     if d.get("ticket_id"):
         # 降级回退路径（MQ 不可用，同步落库）：带工单号
-        return f"退款申请已受理，工单已生成：{d['ticket_id']}，金额 ¥{amount}，状态：待人工审批。真正的退款需人工审批后执行。"
-    # 异步路径：已受理，工单处理中
-    return f"退款申请已受理（受理号 {d['message_id']}），工单处理中。真正的退款需人工审批后执行。"
+        return f"退款申请已受理，工单已生成：{d['ticket_id']}，金额 ¥{refund_amount:g}，状态：待人工审批。真正的退款需人工审批后执行。"
+    if not d.get("message_id"):
+        return "退款数据异常，请联系人工客服。"
+    # 异步路径：已受理，工单处理中（提金额，用户申请退款关心退多少）
+    return f"退款申请已受理（受理号 {d['message_id']}），将按订单金额 ¥{refund_amount:g} 全额退款，工单处理中。真正的退款需人工审批后执行。"
 
 
 _hybrid_retriever = None
@@ -353,7 +418,7 @@ def detect_category(query: str):
 STRATEGY_HINTS = {
     "双高": "检索高置信度命中，可直接推荐给用户（确定语气）。",
     "单高一致": "检索中等置信度，用确认语气推荐（如「您是不是想要…」），并说明这是推测、可让用户确认。",
-    "单高冲突": "检索结果存在冲突，列出候选让用户选择，优先推荐第 1 条（精确词匹配那一路）。",
+    "单高冲突": "检索结果存在冲突，两路候选都列出让用户选择确认，不要偏袒某一项（精确词/语义都可能是对的）。",
 }
 
 
@@ -385,6 +450,7 @@ TOOL_MAP = {
     "search_logistics": search_logistics,
     "check_stock": check_stock,
     "get_return_policy": get_return_policy,
+    "check_online": check_online,
     "transfer_to_human": transfer_to_human,
     "refund_order": refund_order,
 }

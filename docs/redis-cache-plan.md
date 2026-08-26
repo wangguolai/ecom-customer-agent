@@ -9,7 +9,7 @@ backend 加 Redis 缓存层：订单/物流/库存**三个只读接口**走 Cach
 
 ## 二、现状
 
-- backend 已 MySQL 化，`get_order`/`get_logistics`/`get_stock` 直接查 MySQL，无缓存层。
+- backend 已 MySQL 化，`get_order`/`get_logistics`/`get_product` 直接查 MySQL，无缓存层。
 - 三个接口都是**只读**（seed 数据，HTTP 层无更新 orders/stock/logistics 的写接口）。
 - **但 `refresh.py` 会 DROP 重建真源**（seed 是唯一源）——这是「写」的真实来源，缓存副本要联动失效（见决策 5）。
 
@@ -33,14 +33,14 @@ backend 加 Redis 缓存层：订单/物流/库存**三个只读接口**走 Cach
 | `requirements.txt` | 加 `redis` |
 | `.env` | 加 `REDIS_HOST=127.0.0.1`、`REDIS_PORT=6379`（tporadowski 默认无密码） |
 | `src/backend/cache.py`(新) | UTF-8 头 + stdout reconfigure + load_dotenv 读 .env；进程级单例连接池；`get(key)`/`set(key, value, ttl)`（统一 JSON）+ 空值哨兵 + 降级 |
-| `src/backend/main.py` | `get_order`/`get_logistics`/`get_stock` 加 Cache Aside 读路径 + 缓存空值 |
+| `src/backend/main.py` | `get_order`/`get_logistics`/`get_product` 加 Cache Aside 读路径 + 缓存空值 |
 | `src/refresh.py` | 加 `FLUSHDB`——重建真源时清空缓存副本（SSOT 单向链路闭环） |
 
 ## 五、关键设计决策
 
 ### 决策 1：数据结构 + key 命名 + 序列化规范（统一 JSON）
 - **统一 JSON 序列化**：订单存 `{...订单字段}`、物流存 `[...轨迹]`、库存存 `{"qty": 120}`（**不存裸值**，消除「叫 json 却存裸数字」的歧义）。
-- **key 命名带命名空间**：`ecom:order:{id}` / `ecom:logistics:{id}` / `ecom:stock:{name}`——未来模块 4（MQ 用 list）/5（限流）/6（分布式锁）复用同一 Redis，前缀防冲突。
+- **key 命名带命名空间**：`ecom:order:{id}` / `ecom:logistics:{id}` / `ecom:product:{product_id}`（商品统一 ID 后 stock→products、name→product_id）——未来模块 4（MQ 用 list）/5（限流）/6（分布式锁）复用同一 Redis，前缀防冲突。
 
 ### 决策 2：Cache Aside 读路径
 - **读**：先 `GET` 缓存 → 命中返回；miss → 查 MySQL → `SET`（带 TTL）→ 返回。
@@ -69,7 +69,7 @@ backend 加 Redis 缓存层：订单/物流/库存**三个只读接口**走 Cach
 - 这就是 TODO「缓存一致性深度：缓存副本 vs 真源不一致」要踩的坑的落地。
 
 ### 决策 7：认知为主，不落地
-- **分布式锁**：退款幂等已在模块 2 用 DB `UNIQUE(order_id, amount)` 唯一约束实现（单机单进程内是正解），分布式锁只在「多实例部署」下才有意义，demo 无多实例 → 认知不落地。
+- **分布式锁**：退款幂等已在模块 2 用 DB `UNIQUE(order_id, amount)` 唯一约束实现、模块 5 升级 `UNIQUE(order_id)`（单机单进程内是正解），分布式锁只在「多实例部署」下才有意义，demo 无多实例 → 认知不落地。
 - **击穿**：agent 侧 `asyncio.gather` 并发查同一 key（用户同时问订单+物流）是「击穿微缩场景」——demo 量小 MySQL 扛得住，不落地互斥锁，但场景真实存在（可观测点）。
 - **雪崩**：过期随机打散，认知。
 
@@ -86,7 +86,7 @@ backend 加 Redis 缓存层：订单/物流/库存**三个只读接口**走 Cach
 - [ ] 三端点 Redis 下返回正常
 - [ ] 首次 `get_order` miss 查 MySQL + 写缓存，第二次命中直接返回（不查 MySQL）
 - [ ] 缓存有 TTL（`TTL ecom:order:{id}` 返回剩余秒数）
-- [ ] **豆腐猫砂 `get_stock` 缓存 `{"qty": 0}`（真实缺货），不是空标记**
+- [ ] **豆腐猫砂 `get_product` 缓存 `{"qty": 0}`（真实缺货），不是空标记**（商品统一 ID 后 stock→products）
 - [ ] 404 订单缓存 `__EMPTY__`，第二次同样请求不查 MySQL
 - [ ] **停掉 Redis 后三端点仍返回正确数据（降级查库）**
 - [ ] refresh 后缓存被 FLUSH（不返回旧数据）

@@ -118,9 +118,28 @@ class HybridRetriever:
         pid_map = dict(zip(self._chunk_ids, self._chunk_product_ids))
         top_n = min(RERANK_CANDIDATE_N, len(fused))
         candidates = fused[:top_n]
-        reranked = self._rerank(query, candidates, top_k, text_map, title_map, pid_map)
+
+        # 单高冲突：两路 top1 各执一词，且各自只在单路强（另一路几乎没分），RRF 融合可能把它们
+        # 挤出 top_n 候选。策略是「列候选软推、让用户选」（不是「优先信精确词」）——先保两路 top1 进候选。
+        if label == "单高冲突":
+            candidate_ids = {cid for cid, _ in candidates}
+            for keep_cid in (vec_top1, bm25_top1):
+                if keep_cid is not None and keep_cid not in candidate_ids:
+                    for cid, score in fused:  # 两路 top1 必在 fused（RRF 并集）里，找回原始 RRF 分
+                        if cid == keep_cid:
+                            candidates.append((cid, score))
+                            candidate_ids.add(cid)
+                            break
+
+        # 单高冲突时让 rerank 返回全量候选排序，才能把被挤出 top_k 的那一路 top1 补回来（列候选）
+        rerank_top_k = len(candidates) if label == "单高冲突" else top_k
+        reranked = self._rerank(query, candidates, rerank_top_k, text_map, title_map, pid_map)
         if reranked is not None:
             # Rerank 只负责排序，不做绝对分数阈值拒答（拒答已移到召回层四维判断）。
+            if label == "单高冲突":
+                reranked = self._merge_conflict_top1(
+                    reranked, candidates, top_k, text_map, title_map, pid_map, vec_top1, bm25_top1
+                )
             return label, reranked
 
         # 6. 降级：Rerank 不可用则退回 RRF 排序（附 text + title + product_id）
@@ -134,7 +153,7 @@ class HybridRetriever:
 
         - 双高：向量≥VEC_SCORE_LOW 且 BM25 有召回 且两路 top1 相同 → 直接推
         - 单高一致：只有一路强（向量高 BM25 无，或两路 top1 一致但向量弱）→ 软推 + 确认
-        - 单高冲突：两路都有 top1 但不同 → 列候选 / 优先信精确词那一路
+        - 单高冲突：两路都有 top1 但不同 → 列候选软推（两路都列，让用户选，不偏袒精确词/语义）
         - 双低：向量<VEC_SCORE_LOW 且 BM25 无 → 拒答 / 转人工
         """
         vec_high = vec_top1_score >= VEC_SCORE_LOW
@@ -159,6 +178,26 @@ class HybridRetriever:
             cid = candidates[idx][0]
             result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, "")))
         return result
+
+    def _merge_conflict_top1(self, reranked, candidates, top_k, text_map, title_map, pid_map,
+                             vec_top1, bm25_top1):
+        """单高冲突：两路 top1 都列进候选（软推、不偏袒），再跟 rerank 其余结果，截断到 top_k。
+
+        reranked 是全量候选的 rerank 降序（调用方以 top_k=len(candidates) 调用才拿得到全量）。
+        两路 top1 若被 rerank 排到 top_k 之外，仍要保证在最终候选里——否则「列候选」少一路，
+        用户没得选（等价于偷偷偏袒了另一路）。两路 top1 之间按 rerank 分排，不硬性把精确词那一路排第一。
+        """
+        keep_ids = {cid for cid in (vec_top1, bm25_top1) if cid is not None}
+        keep = [r for r in reranked if r[0] in keep_ids]  # 按 rerank 分降序，不偏袒精确词/语义
+        # 兜底：两路 top1 理应在 reranked 里，防御式从 candidates 补（rerank 给 0 分占位，只保证「列出来」）
+        for cid in (vec_top1, bm25_top1):
+            if cid is not None and cid not in {k[0] for k in keep}:
+                for ccid, _ in candidates:
+                    if ccid == cid:
+                        keep.append((cid, 0.0, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, "")))
+                        break
+        rest = [r for r in reranked if r[0] not in keep_ids]
+        return (keep + rest)[:top_k]
 
 
 # ═══════════════════════════════════════════════════════════════

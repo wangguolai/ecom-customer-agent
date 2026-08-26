@@ -21,7 +21,10 @@
 计时用 time.monotonic()（单调时钟，不受系统时间调整影响）。
 """
 
+import sys
 import time
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 class CircuitBreaker:
@@ -74,6 +77,12 @@ class CircuitBreaker:
             self._state = "open"
             self._opened_at = time.monotonic()
             self._fail_count = 0
+
+    def reset(self):
+        """重置熔断器到初始 closed 状态（评测/故障注入后清理用，避免注入超时把熔断器打挂污染后续请求）"""
+        self._fail_count = 0
+        self._state = "closed"
+        self._opened_at = 0.0
 
     @property
     def state(self) -> str:
