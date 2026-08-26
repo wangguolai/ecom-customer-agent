@@ -48,11 +48,12 @@ def _backend_up() -> bool:
     probes = ["/orders/20240818001", "/logistics/20240818001", "/products/P001"]
     try:
         for ep in probes:
-            resp = requests.get(f"{BACKEND_URL}{ep}", timeout=1.0)
+            # 探测超时放宽到 3s：后端冷启动首次查询（MySQL 连接池预热）可能超 1s，误判成「未启动」
+            resp = requests.get(f"{BACKEND_URL}{ep}", timeout=3.0)
             if not resp.ok:
                 return False
         # /debug/fault 是 POST 端点，用 clear（幂等、无副作用）探测挂载性；未挂载返回 404
-        resp = requests.post(f"{BACKEND_URL}/debug/fault/clear", json={}, timeout=1.0)
+        resp = requests.post(f"{BACKEND_URL}/debug/fault/clear", json={}, timeout=3.0)
         return resp.status_code == 200
     except requests.RequestException:
         return False

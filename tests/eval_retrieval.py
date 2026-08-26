@@ -60,6 +60,7 @@ def run_eval():
     methods = ["纯向量", "纯BM25", "混合+预过滤+Rerank"]
     agg = {m: {"recall": [], "mrr": []} for m in methods}
     failures = []  # 混合检索 top1 错的 case（数据飞轮：自动回流进池）
+    neg_total = neg_pass = 0  # 负样本（expected 空）：期望空召回，统计空返回率
 
     for query, expected in EVAL_SET:
         # 1. 纯向量
@@ -81,6 +82,14 @@ def run_eval():
         category = detect_category(query)
         _, hybrid_results = retriever.search(query, top_k=3, category=category)
         hybrid_titles = [title for _, _, _, title, _ in hybrid_results]
+
+        # 负样本（expected 空）：期望空召回，正确 = 混合检索返回空（双低拒答）。
+        # 不计 Recall/MRR（空 expected 除零无意义），单独统计空返回率；暂不回流（回归逻辑对负样本待单独设计）
+        if not expected:
+            neg_total += 1
+            if not hybrid_titles:
+                neg_pass += 1
+            continue
 
         # 失败判定：混合检索召回不足（top1 错 或 多答案召回不全）→ 记失败（自动回流进池）
         # 规范 = top_k=3 的召回上限 min(len(expected), 3)，和毕业标准同规范，不自相矛盾
@@ -112,14 +121,19 @@ def run_eval():
             agg[method]["recall"].append(recall)
             agg[method]["mrr"].append(mrr)
 
+    # 分母用「正样本数」（expected 非空），负样本已 continue 不进 agg，混入 len(EVAL_SET) 会低估 Recall
+    pos_total = len(EVAL_SET) - neg_total
     print("=" * 70)
     print(f"{'方法':<22} {'Recall@3':<12} {'MRR':<10}")
     print("-" * 70)
     for m in methods:
-        recall = sum(agg[m]["recall"]) / len(EVAL_SET)
-        mrr = sum(agg[m]["mrr"]) / len(EVAL_SET)
+        recall = sum(agg[m]["recall"]) / pos_total if pos_total else 0
+        mrr = sum(agg[m]["mrr"]) / pos_total if pos_total else 0
         print(f"{m:<22} {recall:<12.4f} {mrr:<10.4f}")
     print("=" * 70)
+    if neg_total:
+        print(f"负样本空返回率 = {neg_pass}/{neg_total} = {neg_pass/neg_total:.2%}（期望空召回，正确=混合检索返回空）")
+        print("=" * 70)
 
     # 数据飞轮：失败回流 + 池回归 + fix 型毕业
     _run_regression(retriever, failures)

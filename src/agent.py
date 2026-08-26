@@ -170,19 +170,11 @@ async def _run_routed(messages: list, routed, trace: Trace = None) -> str:
         trace.add_tool(tool_name, elapsed, 1, is_empty)
         trace.route_source = "规则"
 
-    # 构造标准的 assistant(tool_calls) + tool 消息，让 LLM 看到「已执行」的结果
-    tc_id = f"route_{tool_name}"
-    messages.append({
-        "role": "assistant",
-        "tool_calls": [{
-            "id": tc_id,
-            "type": "function",
-            "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)},
-        }],
-    })
-    messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
-
-    # 纯生成（不带 tools）：LLM 只负责把工具结果转成用户话术，不能再调工具
+    # 纯生成（不带 tools）：规则层已执行工具，这里只让 LLM 把工具结果转成用户话术。
+    # 用受信任的 user 消息注入工具结果（和 _run_browse/_run_summarize 的 guide 同类），
+    # 不伪造 assistant(tool_calls) 往返——不带 tools 的请求里 assistant 带 tool_calls 会被
+    # DeepSeek 判 400 BadRequestError（引用不存在的工具调用）。坑：规则路由纯生成路径此前全挂。
+    messages.append({"role": "user", "content": f"【规则路由已执行工具 {tool_name}，结果如下，请据此回答用户：】\n{tool_result}"})
     t1 = time.perf_counter()
     try:
         resp, usage = await chat_with_usage(messages)

@@ -42,6 +42,18 @@
       "expect_type": "fix",
       "note": "「凉」→「粮」同音错别字，期望召回狗粮（标题含犬/狗的粮），却召回狗窝",
       "status": "open"
+    },
+    {
+      "query": "小动物排尿痛频繁跑猫砂盆",
+      "expected": [
+        "泌尿呵护猫粮（喵趣牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "豆腐猫砂",
+      "added_at": "2026-08-27",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
     }
   ]
 }

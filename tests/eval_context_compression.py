@@ -13,6 +13,7 @@
 import sys
 import os
 import re
+import asyncio
 from copy import deepcopy
 from unittest import mock
 
@@ -35,7 +36,7 @@ EVAL_MAX_TOKENS = 500
 # 上下文压缩评测集已集中到 cases.py（COMPRESSION_CASES），此处不再内联定义。
 
 
-def _mock_summarize(history_messages):
+async def _mock_summarize(history_messages):
     """mock 摘要：从历史里正则提取订单号，生成「保留实体」的摘要（模拟理想 LLM 摘要）"""
     text = "".join(str(m.get("content", "")) for m in history_messages)
     order_ids = list(dict.fromkeys(ORDER_ID_PATTERN.findall(text)))  # 去重保序
@@ -59,7 +60,7 @@ def _entity_kept(messages, entities):
     return {e: (e in text) for e in entities}
 
 
-def run_eval(real=False):
+async def run_eval(real=False):
     summarize = agent._summarize if real else _mock_summarize
 
     print("=" * 76)
@@ -77,10 +78,10 @@ def run_eval(real=False):
                 agent._trim_history(messages, EVAL_MAX_TOKENS)
             else:
                 if real:
-                    agent._compress_history(messages, EVAL_MAX_TOKENS, trace=None)
+                    await agent._compress_history(messages, EVAL_MAX_TOKENS, trace=None)
                 else:
                     with mock.patch.object(agent, "_summarize", side_effect=summarize):
-                        agent._compress_history(messages, EVAL_MAX_TOKENS, trace=None)
+                        await agent._compress_history(messages, EVAL_MAX_TOKENS, trace=None)
             after = agent._messages_tokens(messages)
             ratio = after / before if before else 0
             kept = _entity_kept(messages, scene["entities"])
@@ -92,4 +93,4 @@ def run_eval(real=False):
 
 
 if __name__ == "__main__":
-    run_eval(real="--real" in sys.argv)
+    asyncio.run(run_eval(real="--real" in sys.argv))
