@@ -375,9 +375,13 @@ async def refund_order(order_id: str) -> str:
     """
     resp, err = await _http_request("POST", f"{BACKEND_URL}/refund", json={"order_id": order_id})
     if err:
-        if err == "breaker_open":
-            return "退款服务暂不可用（当前熔断中，请稍后重试或转人工）。"
-        return "退款服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
+        if err in ("breaker_open", "rate_limited"):
+            # 请求确定没到达后端（熔断拦截 / 被限流），未产生副作用，可安全重试
+            return "退款服务暂不可用（请稍后重试或转人工）。"
+        # timeout / 5xx / bad_response：请求可能已到达后端并被处理，只是应答没回来（应答丢包）。
+        # 状态失步：不能回「失败」误导用户以为退款失败，回「处理中/未确认」+ 禁止重复提交。
+        # 接受弱一致，最终一致靠外部通知（订单查询 / 人工核实）。
+        return "退款申请已提交，但处理结果未确认（服务响应异常）。系统可能已受理，请勿重复提交；稍后可查询订单状态确认，或转人工核实。"
     if resp.status_code == 404:
         return f"未查到订单 {order_id}，无法退款。"
     if resp.status_code == 400:

@@ -21,7 +21,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from src.infra.llm import chat_with_usage
 from src.infra.observability import Trace, MetricsStore
-from src.tools import TOOL_SCHEMAS, TOOL_MAP, CATEGORY_KEYWORDS
+from src.tools import TOOL_SCHEMAS, TOOL_MAP, CATEGORY_KEYWORDS, WRITE_TOOLS
 from src.intent_router import route_by_rule
 
 MAX_STEPS = 8
@@ -255,6 +255,7 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
     """核心循环：LLM 决策 → 代码执行 → 回灌，直到最终答案。原地修改 messages，返回最终答案"""
     last_action = None
     repeat_count = 0
+    called_write = set()  # 本回合已执行过的写工具：写操作只执行一次，防 ReAct 自动重试（重复退款/重复工单）
 
     for step in range(MAX_STEPS):
         print(f"📍 [step {step+1}] LLM 决策中...")
@@ -314,11 +315,18 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
                 result = f"错误：参数不是合法 JSON：{tc.function.arguments}"
             elif name not in TOOL_MAP:
                 result = f"错误：工具 {name} 不存在，可用工具：{list(TOOL_MAP)}"
+            elif name in WRITE_TOOLS and name in called_write:
+                # 写工具本回合只执行一次：退款/转人工已执行过，LLM 再调（尤其失败后自动重试）直接拒绝。
+                # message_id 幂等只拦「同一请求」重复，拦不住「模型重试产生的新请求」（新 message_id）。
+                result = "该写操作本回合已执行过，为防重复提交（重复退款/重复工单）不再重复执行。请基于已执行结果回复用户，勿再次调用写工具。"
             else:
                 try:
                     result = await TOOL_MAP[name](**args)
                 except (TypeError, KeyError) as e:
                     result = f"工具 {name} 参数不匹配：{e}"
+                else:
+                    if name in WRITE_TOOLS:
+                        called_write.add(name)  # 真正执行了写工具才标记（参数不匹配/工具不存在不标记）
             result = truncate(result)
             elapsed = time.perf_counter() - t0
             is_empty = any(sig in result for sig in _EMPTY_SIGNALS)
