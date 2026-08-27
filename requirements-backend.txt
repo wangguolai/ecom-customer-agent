@@ -1,0 +1,9 @@
+# 后端镜像最小依赖（Dockerfile 用）——只装 src/backend 真正 import 的包
+# 与主 requirements.txt 的区别：不含 agent/RAG 的 sentence-transformers(拉 torch 数百MB)、
+# qdrant-client、openai、jieba、rank-bm25、requests——后端只查 MySQL/Redis，装它们纯属镜像膨胀。
+fastapi
+uvicorn
+pymysql
+DBUtils
+redis>=8,<9  # 同主清单：代码已强制 protocol=2，兼容 RESP2
+python-dotenv

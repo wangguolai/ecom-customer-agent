@@ -1,0 +1,22 @@
+# 构建上下文排除——这些不进镜像（尤其 .env 密钥、本地 Qdrant 数据、编译产物）
+
+# 密钥：真实 MySQL 密码在 .env，绝不能打进镜像层（镜像可能被 push 到仓库）
+.env
+
+# 运行时生成物 / 本地数据（Qdrant 本地向量库、SQLite，可随时重建）
+data/
+dump.rdb
+
+# 编译产物
+__pycache__/
+*.pyc
+*.pyo
+
+# 仓库无关内容（本地资料/规则/调研，开源清理后本地-only）
+.git
+.claude/
+tests/
+docs/
+references/
+.tmp/
+.vscode/
