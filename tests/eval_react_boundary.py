@@ -92,4 +92,6 @@ async def run_eval():
 
 
 if __name__ == "__main__":
+    from src.infra.warmup import warmup_models
+    warmup_models()  # 主线程预热 embedding + rerank，避免 to_thread 里首次加载 CUDA 死锁
     asyncio.run(run_eval())

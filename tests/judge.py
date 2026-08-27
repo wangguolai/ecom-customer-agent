@@ -58,7 +58,7 @@ def _structural_faithfulness(turns, answer: str) -> dict:
 
     # 品牌校验：抓 answer 里的「XX牌」（2 字），不在白名单的判编造。
     # 排除三类误抓：① 功能词前缀（什么/这个/哪个…）②「X品牌/X牌子」普通词（提取词以「品/子」结尾）③ 已知品牌前缀。
-    known_brand_prefixes = {b[:-1] for b in FACTS["brands"]}  # 贝乐/优宠/喵趣
+    known_brand_prefixes = {b[:-1] for b in FACTS["brands"]}  # 皇家/冠能/渴望
     answer_brand_tokens = set(re.findall(r"([一-龥]{2})牌", answer))
     fake_brands = sorted(
         f"{p}牌" for p in answer_brand_tokens

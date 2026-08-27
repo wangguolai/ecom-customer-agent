@@ -96,8 +96,14 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_return_policy",
-            "description": "获取退换货政策",
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "description": "获取退换货政策（从政策知识库检索命中的政策块 + 整段政策参考）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "用户的退货政策咨询问题"}
+                },
+                "required": ["query"],
+            },
         },
     },
     {
@@ -290,9 +296,32 @@ async def check_stock(product_id: str) -> str:
     return f"「{name}」有货，库存 {qty} 件，价格 ¥{price:g}。"
 
 
-async def get_return_policy() -> str:
-    """退货政策"""
-    return RETURN_POLICY
+def _get_return_policy_sync(query: str) -> str:
+    """get_return_policy 的同步实现。embedding + rerank 是 CPU/GPU 密集，丢线程池跑（to_thread），不阻塞事件循环。
+
+    政策块缺失（BM25 索引里无 kb_type="policy"，说明没入库）→ 打印警告 + 整段兜底，不静默退化。
+    检索双低/空 → 整段兜底。命中 → 拼「命中的政策块 + 整段 RETURN_POLICY 参考」，
+    末尾附整段是补点 2：政策 4 条语义高度相近，「只返回精准单块」挡不住单高命中错块，附整段让 LLM 有完整上下文纠偏。
+    """
+    retriever = _get_hybrid_retriever()
+    if not retriever.has_kb_type("policy"):
+        print("⚠️ 政策块未入库，请先跑 python -m src.refresh")
+        return RETURN_POLICY
+    label, results = retriever.search(query, kb_type="policy")
+    if label == "双低" or not results:
+        return RETURN_POLICY
+    parts = []
+    for i, (cid, score, text, title, product_id) in enumerate(results, 1):
+        parts.append(f"[{i}] {title}\n{text}")
+    hits_text = "\n\n".join(parts)
+    return f"[来源: 退货政策]\n{hits_text}\n\n{RETURN_POLICY}"
+
+
+async def get_return_policy(query: str = None) -> str:
+    """退货政策（政策知识库 RAG）——检索命中的政策块 + 整段政策参考；query 缺失时整段兜底"""
+    if not query:
+        return RETURN_POLICY
+    return await asyncio.to_thread(_get_return_policy_sync, query)
 
 
 async def check_online() -> str:
@@ -425,7 +454,7 @@ STRATEGY_HINTS = {
 def _search_products_sync(query: str, top_k: int) -> str:
     """search_products 的同步实现。embedding + rerank 是 CPU/GPU 密集，丢线程池跑（to_thread），不阻塞事件循环。"""
     category = detect_category(query)
-    label, results = _get_hybrid_retriever().search(query, top_k=top_k, category=category)
+    label, results = _get_hybrid_retriever().search(query, top_k=top_k, category=category, kb_type="product")
 
     if label == "双低":
         return "知识库检索无高置信度匹配。请如实告知用户暂未找到相关信息、可建议联系人工客服，不要编造商品信息。"

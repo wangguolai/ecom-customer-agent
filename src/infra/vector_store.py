@@ -30,7 +30,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 COLLECTIONS = {
     "product_knowledge": {
         "description": "宠物商品知识库 RAG",
-        "payload_schema": ["chunk_id", "text", "title", "category", "source_file", "chunk_index", "product_id"],
+        "payload_schema": ["chunk_id", "text", "title", "category", "source_file", "chunk_index", "product_id", "kb_type"],
     },
 }
 
@@ -149,17 +149,20 @@ class QdrantStore:
         self,
         query_vector: list[float],
         category: str = None,
+        kb_type: str = None,
         limit: int = 5,
         score_threshold: Optional[float] = 0.5,
     ) -> list[SearchHit]:
-        """语义搜索商品知识库，可按 category 过滤"""
+        """语义搜索知识库，可按 category / kb_type 过滤（都检索前 filter，多知识域隔离）"""
         from qdrant_client.models import Filter, FieldCondition, MatchValue
 
-        query_filter = None
+        # 两个过滤维度都进 must 列表；都为空时 query_filter=None（不过滤）
+        must = []
         if category:
-            query_filter = Filter(
-                must=[FieldCondition(key="category", match=MatchValue(value=category))]
-            )
+            must.append(FieldCondition(key="category", match=MatchValue(value=category)))
+        if kb_type:
+            must.append(FieldCondition(key="kb_type", match=MatchValue(value=kb_type)))
+        query_filter = Filter(must=must) if must else None
 
         # score_threshold=None 时不过滤（混合检索需要全量返回，保证排名对称）
         kwargs = {}
@@ -175,20 +178,20 @@ class QdrantStore:
         return [SearchHit(score=r.score, payload=r.payload) for r in results.points]
 
     def scroll_all(self, collection: str = "product_knowledge") -> list:
-        """scroll 出所有 chunk 的 (chunk_id, text, title, category, product_id)，用于 BM25 建索引"""
+        """scroll 出所有 chunk 的 (chunk_id, text, title, category, product_id, kb_type)，用于 BM25 建索引"""
         results = []
         offset = None
         while True:
             points, next_offset = self._client.scroll(
                 collection_name=collection, limit=100, offset=offset,
-                with_payload=["chunk_id", "text", "title", "category", "product_id"],
+                with_payload=["chunk_id", "text", "title", "category", "product_id", "kb_type"],
             )
             for p in points:
                 if p.payload:
                     cid = p.payload.get("chunk_id")
                     text = p.payload.get("text")
                     if cid and text:  # 过滤缺失字段，避免 None 混入下游分词
-                        results.append((cid, text, p.payload.get("title", ""), p.payload.get("category", ""), p.payload.get("product_id", "")))
+                        results.append((cid, text, p.payload.get("title", ""), p.payload.get("category", ""), p.payload.get("product_id", ""), p.payload.get("kb_type", "")))
             if next_offset is None:
                 break
             offset = next_offset
@@ -213,7 +216,7 @@ if __name__ == "__main__":
 
     # 2. 写入测试数据（source_file 用 test.md，与正式 products.md 隔离）
     texts = [
-        "幼犬成长粮（贝乐牌），鸡肉糙米配方，2-12 月龄幼犬适用",
+        "幼犬成长粮（皇家牌），鸡肉糙米配方，2-12 月龄幼犬适用",
         "猫薄荷玩具球，内置猫薄荷，吸引猫咪玩耍",
     ]
     vecs = embed_texts(texts)

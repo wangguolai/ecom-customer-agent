@@ -10,8 +10,8 @@
 
 | 位置 | 商品标识 |
 |------|---------|
-| `products.md` 标题 | `幼犬成长粮（贝乐牌）` |
-| `orders.product` | `幼犬成长粮（贝乐牌）1.5kg`（多了规格） |
+| `products.md` 标题 | `幼犬成长粮（皇家牌）` |
+| `orders.product` | `幼犬成长粮（皇家牌）1.5kg`（多了规格） |
 | `stock.product_name` | `幼犬成长粮`（少了品牌） |
 
 - 向量库 chunk payload 没有 product_id（只有 title + 文本）
@@ -39,8 +39,8 @@ demo 的 SSOT 是 products.md（人工维护的 markdown），所以用**业务�
 
 ## 三、颗粒度决策：SPU vs SKU
 
-- **SPU（商品）**：`幼犬成长粮（贝乐牌）`——一个商品一个 ID。
-- **SKU（库存单位）**：`幼犬成长粮（贝乐牌）1.5kg`——一个规格一个 ID，对应一个具体价格。
+- **SPU（商品）**：`幼犬成长粮（皇家牌）`——一个商品一个 ID。
+- **SKU（库存单位）**：`幼犬成长粮（皇家牌）1.5kg`——一个规格一个 ID，对应一个具体价格。
 
 demo 用 **SPU 粒度**（一个商品一个 ID `P001`），因为源文件 products.md 本身就是「一个 `##` 块一个商品」。SKU 多规格（1.5kg ¥89 / 5kg ¥219）是生产建模，demo 不展开。
 
@@ -64,7 +64,7 @@ LLM 查价格/库存的两步链路：
   → check_stock(product_id) MySQL 精确查 → 返回 price + qty
 ```
 
-- **`check_stock` 收 `product_id`，不收商品名**：名字会歧义（「猫粮」多款）/对不上（「幼犬成长粮」vs「幼犬成长粮（贝乐牌）」），ID 唯一精确。这是「RAG 返回结构化 ID、动态数据用 ID 精确查、不用脆弱字符串匹配」的落地。
+- **`check_stock` 收 `product_id`，不收商品名**：名字会歧义（「猫粮」多款）/对不上（「幼犬成长粮」vs「幼犬成长粮（皇家牌）」），ID 唯一精确。这是「RAG 返回结构化 ID、动态数据用 ID 精确查、不用脆弱字符串匹配」的落地。
 - `search_products` 返回结果**明确带 `product_id` 字段**，tool schema 描述引导 LLM「查价格库存用 product_id（从 search_products 结果获取）」。
 - `/stock/{product_name}` 接口 → `/products/{product_id}`。
 

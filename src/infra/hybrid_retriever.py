@@ -47,12 +47,13 @@ class HybridRetriever:
 
     def _build_bm25(self):
         """从 Qdrant scroll 出所有 chunk 建 BM25 索引，保证和向量库数据对齐"""
-        chunks = self._store.scroll_all()  # [(chunk_id, text, title, category, product_id)]
-        self._chunk_ids = [cid for cid, _, _, _, _ in chunks]
-        self._chunk_texts = [text for _, text, _, _, _ in chunks]
-        self._chunk_titles = [title for _, _, title, _, _ in chunks]
-        self._chunk_categories = [cat for _, _, _, cat, _ in chunks]
-        self._chunk_product_ids = [pid for _, _, _, _, pid in chunks]
+        chunks = self._store.scroll_all()  # [(chunk_id, text, title, category, product_id, kb_type)]
+        self._chunk_ids = [cid for cid, _, _, _, _, _ in chunks]
+        self._chunk_texts = [text for _, text, _, _, _, _ in chunks]
+        self._chunk_titles = [title for _, _, title, _, _, _ in chunks]
+        self._chunk_categories = [cat for _, _, _, cat, _, _ in chunks]
+        self._chunk_product_ids = [pid for _, _, _, _, pid, _ in chunks]
+        self._chunk_kb_types = [kb for _, _, _, _, _, kb in chunks]
         if not self._chunk_texts:
             self._bm25 = None  # 知识库为空，跳过 BM25（search 里退化为纯向量）
             return
@@ -60,19 +61,20 @@ class HybridRetriever:
         self._tokenized = [jieba.lcut(t) for t in self._chunk_texts]
         self._bm25 = BM25Okapi(self._tokenized)
 
-    def search(self, query: str, top_k: int = DEFAULT_TOP_K, category: str = None):
+    def search(self, query: str, top_k: int = DEFAULT_TOP_K, category: str = None, kb_type: str = None):
         """混合检索，返回 (label, results)。
 
         label ∈ {'双高','单高一致','单高冲突','双低'} —— 四维置信度（判断层），上层据此做策略映射。
         results = [(chunk_id, score, text, title, product_id)]，双低时为空列表。
         category 不为 None 时，向量 + BM25 都只在指定类别内检索（锁类别优先，避免跨类误命中）。
+        kb_type 不为 None 时，向量 + BM25 都只在指定知识域内检索（默认 None = 全库不过滤，多知识域隔离）。
         注意：score 语义随路径变化——rerank 可用时是 sigmoid 概率(0-1)，降级时是 RRF 分数(~1/(60+rank))。
         下游只依赖相对排序，不要依赖 score 的绝对阈值。top_k 超出 RERANK_CANDIDATE_N 会被截断。
         """
         q_vec = self._model.encode(query, normalize_embeddings=True).tolist()
 
-        # 1. 向量检索（score_threshold=None 全量返回；category 过滤锁类别）
-        hits = self._store.search_knowledge(q_vec, limit=20, score_threshold=None, category=category)
+        # 1. 向量检索（score_threshold=None 全量返回；category / kb_type 过滤锁知识域）
+        hits = self._store.search_knowledge(q_vec, limit=20, score_threshold=None, category=category, kb_type=kb_type)
         vec_rank = {h.payload.get("chunk_id"): rank
                     for rank, h in enumerate(hits) if h.payload.get("chunk_id")}
         vec_top1_score = hits[0].score if hits else 0.0  # 向量 top1 的 cosine 分数，供四维判断
@@ -89,6 +91,9 @@ class HybridRetriever:
                 if scores[idx] > 0:  # 0 分文档不入排名，让 fallback_rank 承担「不在结果里」语义
                     # category 过滤：类别不匹配的 chunk 跳过（锁类别，避免跨类误命中）
                     if category and self._chunk_categories[idx] != category:
+                        continue
+                    # kb_type 过滤：知识域不匹配的 chunk 跳过（锁知识域，避免跨域污染）
+                    if kb_type and self._chunk_kb_types[idx] != kb_type:
                         continue
                     bm25_rank[self._chunk_ids[idx]] = rank
                     rank += 1  # 紧凑计数，保证和向量侧过滤后的连续 rank 语义一致
@@ -148,6 +153,10 @@ class HybridRetriever:
             result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, "")))
         return label, result
 
+    def has_kb_type(self, kb_type: str) -> bool:
+        """检查 BM25 索引里是否存在指定 kb_type 值的 chunk（政策块缺失检测：未入库时 get_return_policy 走兜底）"""
+        return kb_type in self._chunk_kb_types
+
     def _classify(self, vec_top1: str, vec_top1_score: float, bm25_top1: str) -> str:
         """四维置信度判断（判断层，硬编码规则，与策略映射/话术生成分层）。
 
@@ -206,7 +215,7 @@ class HybridRetriever:
 
 if __name__ == "__main__":
     retriever = HybridRetriever()
-    for q in ["贝乐牌有哪些粮", "肠胃敏感的粮", "幼犬吃什么"]:
+    for q in ["皇家牌有哪些粮", "肠胃敏感的粮", "幼犬吃什么"]:
         print("=" * 50)
         print(f"Q: {q}")
         label, results = retriever.search(q)

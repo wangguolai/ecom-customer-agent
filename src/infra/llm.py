@@ -33,7 +33,14 @@ def get_client():
         base_url = os.getenv("DEEPSEEK_BASE_URL")
         if not api_key:
             raise RuntimeError("未找到 DEEPSEEK_API_KEY，请检查 .env")
-        _client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        # timeout 必须设：openai SDK 默认 600s，LLM 服务端挂起（不返回、不报错）时会干等 10 分钟。
+        # 挂起≠报错，会被 ReAct 循环放大（每步都可能挂 10 分钟 × MAX_STEPS）。设 60s 让
+        # _react_loop 的 try/except 能捕获 TimeoutError → 返回「系统异常」，而非无限干等。
+        _client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=float(os.getenv("LLM_TIMEOUT", "60")),
+        )
     return _client
 
 

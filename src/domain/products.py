@@ -24,8 +24,8 @@ PRODUCTS_PATH = os.path.join(_project_root, "data", "products.md")
 class Product:
     """商品实体（products.md 的 schema 化投影）"""
     id: str             # 稳定实体 ID（业务短码，如 P001）——知识库/MySQL/向量库三处对齐的桥
-    title: str          # 完整标题，含品牌括号，如「幼犬成长粮（贝乐牌）」
-    brand: str          # 品牌名，如「贝乐牌」；无品牌为空字符串
+    title: str          # 完整标题，含品牌括号，如「幼犬成长粮（皇家牌）」
+    brand: str          # 品牌名，如「皇家牌」；无品牌为空字符串
     category: str       # 类别，如「狗粮」
     raw_chunk: str      # 原始块文本（含「## 标题」开头，供向量化）
 

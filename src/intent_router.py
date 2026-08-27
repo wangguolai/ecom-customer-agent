@@ -82,9 +82,9 @@ def route_by_rule(user_msg: str):
         if any(w in user_msg for w in _ORDER_WORDS):
             return ("tool", "search_orders", {"order_id": order_id})
 
-    # 退货政策：明确政策词
+    # 退货政策：明确政策词（query 传用户原话，get_return_policy 走政策 RAG 检索）
     if any(w in user_msg for w in _POLICY_WORDS):
-        return ("tool", "get_return_policy", {})
+        return ("tool", "get_return_policy", {"query": user_msg})
 
     # 总结意图（想对比多款）→ 反问澄清
     if any(w in user_msg for w in _SUMMARIZE_WORDS):

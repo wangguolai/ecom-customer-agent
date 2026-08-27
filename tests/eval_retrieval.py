@@ -33,7 +33,7 @@ from cases import RETRIEVAL_CASES as EVAL_SET
 def _build_title_map(store):
     """chunk_id -> title 映射（title 从 Qdrant payload 拿，不切片）"""
     title_map = {}
-    for cid, text, title, _, _ in store.scroll_all():
+    for cid, text, title, _, _, _ in store.scroll_all():
         title_map[cid] = title
     return title_map
 
@@ -65,7 +65,7 @@ def run_eval():
     for query, expected in EVAL_SET:
         # 1. 纯向量
         q_vec = model.encode(query, normalize_embeddings=True).tolist()
-        vec_hits = store.search_knowledge(q_vec, limit=3, score_threshold=None)
+        vec_hits = store.search_knowledge(q_vec, limit=3, score_threshold=None, kb_type="product")
         vec_titles = [h.payload.get("title", "") for h in vec_hits]
 
         # 2. 纯 BM25
@@ -74,13 +74,20 @@ def run_eval():
         if retriever._bm25 is not None and tokens:
             scores = retriever._bm25.get_scores(tokens)
             order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-            for idx in order[:3]:
+            rank = 0
+            for idx in order:
                 if scores[idx] > 0:
+                    # kb_type 过滤：eval 集只测商品域，政策块不入商品 BM25 指标（过滤后集合与改造前一致）
+                    if retriever._chunk_kb_types[idx] != "product":
+                        continue
                     bm25_titles.append(title_map.get(retriever._chunk_ids[idx], ""))
+                    rank += 1
+                    if rank >= 3:
+                        break
 
         # 3. 混合 + 预过滤 + Rerank（完整链路）
         category = detect_category(query)
-        _, hybrid_results = retriever.search(query, top_k=3, category=category)
+        _, hybrid_results = retriever.search(query, top_k=3, category=category, kb_type="product")
         hybrid_titles = [title for _, _, _, title, _ in hybrid_results]
 
         # 负样本（expected 空）：期望空召回，正确 = 混合检索返回空（双低拒答）。
@@ -160,7 +167,7 @@ def _run_regression(retriever, failures):
         exp = c.get("expected") or []
         expected = set(exp) if isinstance(exp, (list, tuple)) else {exp}
         category = detect_category(query)
-        _, hybrid_results = retriever.search(query, top_k=3, category=category)
+        _, hybrid_results = retriever.search(query, top_k=3, category=category, kb_type="product")
         hybrid_titles = [title for _, _, _, title, _ in hybrid_results]
         top1 = hybrid_titles[0] if hybrid_titles else ""
         recalled = len(expected & set(hybrid_titles))

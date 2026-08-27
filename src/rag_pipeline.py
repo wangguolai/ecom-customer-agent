@@ -63,9 +63,9 @@ def answer(question: str, top_k: int = TOP_K) -> str:
     retriever = _get_retriever()
     category = detect_category(question)
 
-    # 1. 混合检索（和 agent 的 search_products 同一条路径）
+    # 1. 混合检索（和 agent 的 search_products 同一条路径；显式 kb_type="product"，防政策块污染商品 RAG 回答）
     print("📍 [1/2] 混合检索 — BM25+向量+RRF+Rerank+预过滤 中...")
-    label, results = retriever.search(question, top_k=top_k, category=category)
+    label, results = retriever.search(question, top_k=top_k, category=category, kb_type="product")
 
     if label == "双低":
         return "抱歉，没有在知识库中找到相关商品信息。"

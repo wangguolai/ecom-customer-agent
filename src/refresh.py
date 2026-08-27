@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """统一 refresh 入口：从源数据重建所有「持久化派生」（向量库 + SQLite）
 
-改源数据（products.md / seed.py）后跑 `python -m src.refresh`，一次性重建：
+改源数据（products.md / policies.md / seed.py）后跑 `python -m src.refresh`，一次性重建：
 - SQLite（seed 表）：backend._init_db() 的 DROP 重建
-- 向量库（Qdrant）：index_products.build_knowledge_base()
+- 向量库（Qdrant）：index_products.build_knowledge_base()（商品 + 政策两个知识域）
+
+⚠️ 部署约束：先 `python -m src.refresh` 再启动服务进程——单例 BM25 索引在进程启动时
+从 Qdrant scroll 全量建，政策必须在启动前已入库，否则 kb_type 过滤会使商品/政策检索整体失效。
 
 内存派生（jieba 词典 / 意图触发词 / 评测白名单）不需要 refresh——运行时从源生成，重启即同步。
 """
@@ -65,7 +68,7 @@ def refresh():
     cache.flush()
     print("    Redis 缓存已清空。")
 
-    print("📍 [3/3] 向量库 — 重建 product_knowledge（embedding + 写 Qdrant）...")
+    print("📍 [3/3] 向量库 — 重建知识库（商品 + 政策）...")
     from src.index_products import build_knowledge_base
     build_knowledge_base()
 
