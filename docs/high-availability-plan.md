@@ -21,9 +21,9 @@
 - **算法选滑动窗口**（Redis ZSET），不用令牌桶。理由（plan-reviewer 修正后）：
   1. **令牌桶无法对任意墙钟窗口给出严格上限**——突发 + 期间补的令牌，一个窗口最多放进「桶容量 + 速率×窗口」两倍量；滑动窗口可以对任意时间窗严格封顶。客服查询场景要的是「封顶」不是「突发」，滑动窗口更贴合
   2. 令牌桶的「允许突发」价值在秒杀开抢瞬间洪峰，客服查询不适用
-  - **设计取舍**：令牌桶 vs 漏桶 vs 滑动窗口三算法区别要会讲（令牌桶允许突发 / 漏桶强制匀速 / 滑动窗口精确封顶），落地选滑动窗口的理由是「客服要封顶不要突发」
+  - **规范**：令牌桶 vs 漏桶 vs 滑动窗口三算法区别要会讲（令牌桶允许突发 / 漏桶强制匀速 / 滑动窗口精确封顶），落地选滑动窗口的理由是「客服要封顶不要突发」
 - **读写分离限流**：读接口（订单/物流/库存/商品）共享一个松桶，写接口（退款 + 审批/执行）单独一个严桶——与 `tools.py` 已有 `WRITE_TOOLS` 读写分离呼应
-- **桶粒度（plan-reviewer 🟡4）**：demo 用固定 client 标识（单客户端），`bucket_key = f"rl:{bucket}:{client}"`；设计取舍「生产用 per-IP + 全局双层桶，全局挡总量、per-IP 挡单客户端刷」。**注意：全局桶挡不住单客户端刷，防刷靠 per-IP 粒度，不是算法**
+- **桶粒度（plan-reviewer 🟡4）**：demo 用固定 client 标识（单客户端），`bucket_key = f"rl:{bucket}:{client}"`；规范「生产用 per-IP + 全局双层桶，全局挡总量、per-IP 挡单客户端刷」。**注意：全局桶挡不住单客户端刷，防刷靠 per-IP 粒度，不是算法**
 - **Redis 前缀 `rl:`**：与 `ecom:`（业务缓存，flush 清）、`mq:`（MQ 队列）隔离，`cache.flush()` 只清 `ecom:*`，不误删限流计数
 - **原子性（plan-reviewer 修正 🟡5/🔴 表述）**：`ZREMRANGEBYSCORE`（删窗口外）+ `ZCARD`（数）用 pipeline 只减少 RTT + 保证这两步原子；但「数 → Python 判断 → 决定是否 ZADD」的**决策在 Python 侧，check-then-add 竞态是固有的**，pipeline 消不掉。demo 接受（并发 k 最多超 k-1），**严格原子要 Lua 脚本**。ZADD 的 member 必须每次唯一（`f"{now}-{uuid4()}"`），不能用 `str(time.time())`（同毫秒覆盖 → 少计数 → 限流失效）
 - **fail-open（plan-reviewer 🟡3）**：Redis 不可用时 `rate_limit` 捕获 RedisError **放行**（记录日志），不抛异常——限流是「保护」不是「正确性」，挂了宁可放行不能全挂（对齐 `cache.py` 旁路降级哲学）
@@ -48,7 +48,7 @@
 - **原子性（plan-reviewer 修正 🟡/🟢）**：`allow()/record_*()` 状态转换**无锁**，安全仅因为**当前所有 HTTP 工具都是纯 async、走 `await` 在事件循环里执行、不进 to_thread**（`search_products` 才走 to_thread）。`allow()` 同步无 await → 状态机转换原子。**「复用 `_get_hybrid_retriever` 的双重检查锁」是误导**——DCL 只保护懒加载初始化，不保护熔断状态转换；如果将来把 HTTP 工具丢进 to_thread，无锁假设立刻崩。多进程部署（web 托管）下每个进程一个熔断器，半开单飞退化为多探针——demo 单进程没问题，方案注明此边界
 - **计时用 `time.monotonic()`**（单调时钟，不受系统时间调整影响）
 - **进程级单例**：demo 单后端一个全局熔断器；生产按下游服务粒度分（订单/物流/库存各一个）
-- **连续失败 vs 滑动窗口错误率（plan-reviewer 🟡6）**：单接口持续 500（退款逻辑 bug）而其他接口正常时，成功调用会重置连续计数 → 熔断永不触发。这是「整体挂」场景的简化模型，设计取舍准备「生产用时间窗口错误率（Hystrix 式）而非连续失败计数」——这是要点
+- **连续失败 vs 滑动窗口错误率（plan-reviewer 🟡6）**：单接口持续 500（退款逻辑 bug）而其他接口正常时，成功调用会重置连续计数 → 熔断永不触发。这是「整体挂」场景的简化模型，规范准备「生产用时间窗口错误率（Hystrix 式）而非连续失败计数」——这是要点
 
 ### 落点
 
@@ -65,7 +65,7 @@ plan-reviewer 🔴1 抓出：方案原写「`_validate_refund` 查该订单是�
 
 **解法**：把唯一约束从 `UNIQUE(order_id, amount)` 改成 `UNIQUE(order_id)`——「一个订单一个工单」由数据库硬兜底，幂等从「先查后插」升级成「撞键兜底」，和项目哲学一致：
 
-- 同订单任何金额二次退款 → 撞 `UNIQUE(order_id)` → 工单层去重（不管金额）→ 同时解决「退 50 又退 80」的洞。异步路径下 `/refund` 仍返回「已受理」，撞键去重发生在消费者落库——「受理 ≠ 完成」的又一个实例，可以说明
+- 同订单任何金额二次退款 → 撞 `UNIQUE(order_id)` → 工单层去重（不管金额）→ 同时解决「退 50 又退 80」的洞。异步路径下 `/refund` 仍返回「已受理」，撞键去重发生在消费者落库——「受理 ≠ 完成」的又一个实例，可讲
 - 并发不同金额 → 撞键兜底，并发双请求只产生 1 工单（DB 硬保证）
 - 「已退款不能再退」→ refunded 工单占着 order_id，二次退款撞键
 - 消费者处理顺序两次不同金额退款 → 第二个撞键走「duplicate 查已有」路径，**不静默丢弃**（`_create_refund_ticket` 已有撞键 → 查已有 → `duplicate=True` 逻辑，复用）
@@ -86,8 +86,8 @@ plan-reviewer 🔴1 抓出：方案原写「`_validate_refund` 查该订单是�
 - `mq.py`：状态常量 + `_transition()` 流转函数 + `_create_refund_ticket` 撞键逻辑适配 `UNIQUE(order_id)`（撞键查 `WHERE order_id=?` 不再查 amount）
 - `main.py`：`POST /refund/{ticket_id}/review`（action=approve/reject）+ `POST /refund/{ticket_id}/execute`（approved→refunded，mock）
 - `db.py` 的 `_init_db`：refunds 表 `UNIQUE(order_id, amount)` → `UNIQUE(order_id)`，且 schema 变更需 DROP 重建 refunds（demo 历史工单可清，和 seed 表一致；不再「IF NOT EXISTS 保留工单」）
-- **审批/执行接口无鉴权是新增攻击面（plan-reviewer 🟢3）**：资金敏感操作裸奔成无鉴权 HTTP，比「只能生成待审批工单」风险高一级。设计取舍「demo 可接受，生产必须鉴权 + IP 白名单」
-- **execute 后订单状态不联动（plan-reviewer 🟢6）**：refunded 后 `orders.status` 不变（mock 退款执行），设计取舍「生产退款到账要联动订单状态」
+- **审批/执行接口无鉴权是新增攻击面（plan-reviewer 🟢3）**：资金敏感操作裸奔成无鉴权 HTTP，比「只能生成待审批工单」风险高一级。规范「demo 可接受，生产必须鉴权 + IP 白名单」
+- **execute 后订单状态不联动（plan-reviewer 🟢6）**：refunded 后 `orders.status` 不变（mock 退款执行），规范「生产退款到账要联动订单状态」
 
 ## 五、审核后修订记录（plan-reviewer 抓出的关键变更）
 
@@ -127,7 +127,7 @@ plan-reviewer 🔴1 抓出：方案原写「`_validate_refund` 查该订单是�
 2. 熔断：模拟后端连续失败 5 次 → 第 6 次快速失败（不真调）；冷却后半开试探成功 → 恢复（注入时钟）
 3. 状态机：pending→approved→refunded 正常；非法流转（refunded→approved）返回 409（条件 UPDATE affected rows=0）；同订单不同金额二次退款撞 `UNIQUE(order_id)` 拒绝
 
-## 八、设计要点（记 _BACKEND.md）
+## 八、要点（记 _BACKEND.md）
 
 - 限流三算法 tradeoff（令牌桶允许突发 / 漏桶强制匀速 / 滑动窗口精确封顶），为什么客服场景选滑动窗口（令牌桶无法严格封顶）
 - 熔断三态 + 熔断 vs 降级区别 + 「4xx 不算失败、5xx 算、200 垃圾响应也算」的边界

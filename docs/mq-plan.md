@@ -68,7 +68,7 @@ agent refund_order 工具
 - **改 `src/tools.py`**：`refund_order` 文案改异步语义，按 `ticket_id` 是否为空分两套；删除 `duplicate` 分支（去重判断移到消费者）
 - **同步 docs**：`docs/backend-pitfalls.md`、`docs/architecture.md`、`docs/mysql-migration.md` 里描述同步 refund 语义的过时事实
 
-## 设计要点映射
+## 要点映射
 
 | 概念 | 落地 |
 |------|------|

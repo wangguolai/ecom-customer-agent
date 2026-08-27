@@ -24,7 +24,7 @@ backend 加 Redis 缓存层：订单/物流/库存**三个只读接口**走 Cach
 
 **RESP3 兼容坑（实现时踩）**：redis-py 8.x 默认 RESP3（连接时发 `HELLO 3`），但 tporadowski/redis 是 5.x 不支持 RESP3 → `unknown command HELLO`。解法：构造加 `protocol=2` 强制 RESP2。requirements 锁 `redis>=8,<9`（保 8.x 行为一致）。这是「新版客户端 vs 旧版服务端」的兼容坑，未来模块 4/5/6 复用同一 Redis 的读者别重踩。
 
-**Qdrant 类比**：Redis 是独立网络进程、连接池线程安全，**无 Qdrant 本地模式的 `AlreadyLocked` 文件锁坑**，不需要 `_get_hybrid_retriever` 那种双重检查锁——这是可以说明的「Redis vs Qdrant 本地模式」区别。
+**Qdrant 类比**：Redis 是独立网络进程、连接池线程安全，**无 Qdrant 本地模式的 `AlreadyLocked` 文件锁坑**，不需要 `_get_hybrid_retriever` 那种双重检查锁——这是可讲的「Redis vs Qdrant 本地模式」区别。
 
 ## 四、改动清单
 

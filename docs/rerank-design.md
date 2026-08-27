@@ -36,7 +36,7 @@ query → 向量 Top-20 + BM25 Top-20 → RRF 融合 → Top-20 候选 → Cross
 - 新建 `src/infra/reranker.py`：CrossEncoder 懒加载单例（照 embedding.py 模式），`rerank(query, candidates, top_k) -> [(score, 原始索引)]`
 - 改 `src/infra/hybrid_retriever.py`：RRF 融合后取 top_n=20 候选 → rerank → top_k；降级退 RRF
 
-## 五、关键坑（设计要点）
+## 五、关键坑（要点）
 
 1. **logits → sigmoid**：CrossEncoder 本地输出 logits（不是 0-1 概率），要 `1/(1+e^-x)` 归一化
 2. **降级**：模型没装/加载失败 → 退 RRF 排序，不拖垮检索链

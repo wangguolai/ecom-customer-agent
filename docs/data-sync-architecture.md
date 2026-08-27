@@ -110,7 +110,7 @@
 - `_SEED_STOCK` 的「商品名+价格」与 products.md 重复。**qty（库存量）是独立源**（products.md 无），价格是静态属性应归 products.md。
 - 本次解决：`_SEED_STOCK` 去价格只留 `(商品名, qty)`；`check_stock` 去价格只返回库存；价格唯一真相在 products.md（Product 实体）。
 - 分工边界：价格（静态属性）走 `search_products` 查知识库，库存（动态属性）走 `check_stock` 查工具。这同时消掉 SYSTEM_PROMPT「价格走 search_products」与 check_stock description「查库存和价格」的现有不一致。
-- 设计取舍（数据分治的判断力，不是机械规则）：demo 价格不变当静态放知识库；生产价格会变时，再把价格移到后端走工具实时查。
+- 规范（数据分治的判断力，不是机械规则）：demo 价格不变当静态放知识库；生产价格会变时，再把价格移到后端走工具实时查。
 
 ### 决策 7：eval_retrieval 标注集是「第二源（评测资产）」，不可自动派生
 - query→正确答案是人工标注的评测 ground truth，无法从源派生。但消除它对 title 格式的**手工对齐依赖**：评测运行时校验 expected 标题是否在派生层 title 集合，不在则报警（防「改名后 Recall 恒 0」静默失效）。

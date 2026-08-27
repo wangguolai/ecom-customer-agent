@@ -1,6 +1,6 @@
 # 模块 2 · MySQL 落地方案 v2（SQLite → MySQL）
 
-> 学习定位：**系统式**（后端基础给完整内容 + 为什么 + 设计要点，见 `/02-mysql.md`）。
+> 学习定位：**系统式**（后端基础给完整内容 + 为什么 + 要点，见 `/02-mysql.md`）。
 > v2：吸收 plan-reviewer 审核（2 阻塞 + 5 重要 + 6 建议已闭环）。
 
 ## 一、目标
@@ -19,7 +19,7 @@ backend 数据层 `sqlite3` → MySQL，落地「订单号唯一索引 + 连接�
 
 | 选项 | 结论 | 理由 |
 |---|---|---|
-| **pymysql + DBUtils** | ✅ | 裸 SQL 看清每条 SQL（）；DBUtils 连接池；同步阻塞在 FastAPI `def` 端点（线程池）够用 |
+| **pymysql + DBUtils** | ✅ | 裸 SQL 看清每条 SQL；DBUtils 连接池；同步阻塞在 FastAPI `def` 端点（线程池）够用 |
 | SQLAlchemy | ❌ | ORM 遮住 SQL 细节，demo 不值 |
 | aiomysql | ❌ | backend 保持同步 `def`（agent 已异步化，backend 是独立服务），不需要异步驱动 |
 
@@ -87,7 +87,7 @@ backend 数据层 `sqlite3` → MySQL，落地「订单号唯一索引 + 连接�
 ### 决策 9：amount 类型局限（标注，不改）
 - 现状：`orders.amount` 是 TEXT「¥89」（含货币符号）、`refunds.amount` 是 REAL。`UNIQUE(order_id, amount)` 建在浮点上（模块 5 改 `UNIQUE(order_id)` 后，浮点唯一键隐患消除）。
 - demo 整数金额（89.0/32.0）可精确表示，暂不影响；但这是「浮点唯一键」的隐患，生产应改 `DECIMAL(10,2)`。
-- **本次不改**（改 DECIMAL 牵动 seed + 评测金额断言，超出模块 2「SQLite→MySQL」范围），标注为已知局限 + 设计要点。
+- **本次不改**（改 DECIMAL 牵动 seed + 评测金额断言，超出模块 2「SQLite→MySQL」范围），标注为已知局限 + 要点。
 
 ## 六、实施顺序
 

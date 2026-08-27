@@ -24,7 +24,10 @@ tests/eval_results/answer_quality_retest.json
 dump.rdb
 
 # 本地-only（开源清理时从 git 历史移除，本地保留、不公开）：
-# （要点清单/问答）+ Claude Code 项目级规则/agent
+# （要点清单/问答）+ Claude Code 项目级规则/agent + 笔记（教学/深挖）
 CLAUDE.md
 .claude/
 references/
+docs//
+docs/deep-dive-points.md
+docs/asset-accumulation-plan.md
