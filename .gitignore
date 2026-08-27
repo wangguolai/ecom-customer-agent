@@ -22,3 +22,9 @@ tests/eval_results/answer_quality_retest.json
 # 本地临时产物（清理 C 盘脚本 + Redis 快照，非项目内容）
 .tmp/
 dump.rdb
+
+# 本地-only（开源清理时从 git 历史移除，本地保留、不公开）：
+# （要点清单/问答）+ Claude Code 项目级规则/agent
+CLAUDE.md
+.claude/
+references/
