@@ -26,6 +26,7 @@ from src.backend import cache
 from src.backend import fault
 from src.backend import mq
 from src.backend import ratelimit
+from src.backend import auth
 from src.backend.seed import _SEED_ORDERS, _SEED_LOGISTICS, _SEED_PRODUCTS
 
 
@@ -60,6 +61,9 @@ async def lifespan(app: FastAPI):
     _init_db() 会 DROP 重建 seed 表（重写真源），和 refresh.py 同属「重写真源」路径，
     缓存副本必须同步失效（cache.flush()），否则重启后最长 60s 返回旧数据——SSOT 单向链路闭环。
     """
+    # 鉴权配置自检（模块 8）：AUTH_SECRET 缺失直接抛错，不让后端带着「无密钥」状态起来。
+    # 放在 _init_db 之前——配置错误要在碰数据之前就暴露。
+    auth.check_auth_config()
     _init_db()
     cache.flush()
     # Redis 探活（非致命）：没起来就降级查库，但启动日志要能区分「Redis OK / 不可用」方便排障
@@ -79,14 +83,37 @@ app = FastAPI(title="电商客服后端", lifespan=lifespan)
 # ── 限流依赖（模块 5）──
 # 读接口挂 read 桶（松），写接口挂 write 桶（严：退款/审批/执行资金敏感）。
 # Depends 依赖函数：超限 raise 429。client 固定 "demo"（单客户端），生产 per-IP + 全局双层。
+#
+# 阈值配置外部化（对齐模块 7「配置外部化」规范）：默认值 = 原硬编码值，行为零变化。
+# 压测要临时放宽阈值时改环境变量即可，不用改代码。
+def _int_env(name: str, default: int) -> int:
+    """读整型环境变量，非法值回落默认（配置错不该让后端起不来）"""
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def _limit_read():
-    if not ratelimit.rate_limit("read", "demo", window=10, max_req=100):
+    if not ratelimit.rate_limit("read", "demo", window=_int_env("RL_READ_WINDOW", 10), max_req=_int_env("RL_READ_MAX", 100)):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后重试")
 
 
 def _limit_write():
-    if not ratelimit.rate_limit("write", "demo", window=10, max_req=10):
+    if not ratelimit.rate_limit("write", "demo", window=_int_env("RL_WRITE_WINDOW", 10), max_req=_int_env("RL_WRITE_MAX", 10)):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后重试")
+
+
+def _limit_auth():
+    """登录接口独立限流桶（模块 8）。
+
+    为什么不复用 write 桶：登录是暴力破解的靶子，攻击者狂刷密码会顺带把 write 桶打满，
+    退款/审批这些正常业务写操作跟着被 429 —— 攻击一个接口，瘫痪一片。
+    独立桶让爆破的代价只落在它自己身上（故障隔离，和熔断按下游分粒度同一个道理）。
+    阈值也更严：5 次/60s。
+    """
+    if not ratelimit.rate_limit("auth", "demo", window=_int_env("RL_AUTH_WINDOW", 60), max_req=_int_env("RL_AUTH_MAX", 5)):
+        raise HTTPException(status_code=429, detail="登录尝试过于频繁，请稍后重试")
 
 
 @app.get("/orders/{order_id}")
@@ -202,6 +229,12 @@ def get_product(product_id: str, _: None = Depends(_limit_read)):
     return data
 
 
+# 客服在线状态的运行时覆盖（评测用）：None = 未覆盖，回落读 CS_ONLINE 环境变量。
+# 为什么需要：CS_ONLINE 是启动时读的，容器里改要重启，而重启会 DROP 重建全部表。
+# 转人工三分支（在线 / 不在线 / 查询失败）评测必须能在一次运行内切换状态。
+_online_override = None
+
+
 @app.get("/online")
 def check_online(_: None = Depends(_limit_read)):
     """客服在线状态（动态数据走接口查，数据分治）。demo 用环境变量 CS_ONLINE mock（可测试切换），
@@ -209,6 +242,17 @@ def check_online(_: None = Depends(_limit_read)):
 
     CS_ONLINE 布尔解析：字符串 "false" 是 truthy，必须 strip().lower() == "true" 判断。
     """
+    # 故障注入（评测用）：让 transfer_to_human 走「在线状态查不到」的降级分支
+    mode = fault.apply_fault("online")
+    if mode == "timeout":
+        time.sleep(3)  # 超过 tools.py 的 2s 客户端超时
+        return {}
+    if mode == "dirty":
+        return Response(content="这不是合法JSON", media_type="application/json")
+    if mode == "empty":
+        return {}  # 缺 online 字段 → tools 侧 .get("online") 为 None → 按不在线保守处理
+    if _online_override is not None:
+        return {"online": _online_override}
     online = os.environ.get("CS_ONLINE", "true").strip().lower() == "true"
     return {"online": online}
 
@@ -228,6 +272,10 @@ def refund_order(payload: dict, _: None = Depends(_limit_write)):
     order_id = payload.get("order_id")
     if not order_id:
         raise HTTPException(status_code=400, detail="缺少 order_id")
+    # 边界清洗：孤立代理等非法码点在「错误回显」时会再炸一次 UnicodeEncodeError（fuzz 实测）。
+    # 外部输入进系统第一件事就是把非法码点降级成 ?，之后校验/回显/落库全程安全。
+    if isinstance(order_id, str):
+        order_id = order_id.encode("utf-8", "replace").decode("utf-8")
 
     # 故障注入（评测用）：命中直接 return，不写缓存（避免脏响应污染缓存）。
     # 注入的是 tools.py 已有的降级路径（超时→友好提示、脏数据→数据异常），不定义新降级行为。
@@ -255,13 +303,36 @@ def refund_order(payload: dict, _: None = Depends(_limit_write)):
     return {"status": "已受理", "message_id": None, "ticket_id": ticket["ticket_id"], "refund_amount": refund_amount}
 
 
+@app.post("/auth/token")
+def issue_token(payload: dict, _: None = Depends(_limit_auth)):
+    """签发 admin token（模块 8）。demo 账号来自环境变量，密码只存 pbkdf2 慢哈希，不存明文。
+
+    失败一律返回同一个 401「用户名或密码错误」——不区分「用户不存在」和「密码错」，防用户枚举
+    （能枚举出有效用户名，爆破范围就从「用户名×密码」缩小成「密码」，成本差几个数量级）。
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+    # 边界清洗：username/password 里的孤立代理会打崩 auth 的编码（fuzz 实测 500）。
+    # 这里先把非法码点降级，auth.authenticate 内部也有 errors="replace" 双保险。
+    username = payload.get("username")
+    password = payload.get("password")
+    username = username.encode("utf-8", "replace").decode("utf-8") if isinstance(username, str) else ""
+    password = password.encode("utf-8", "replace").decode("utf-8") if isinstance(password, str) else ""
+    role = auth.authenticate(username, password)
+    if not role:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    return {"access_token": auth.create_token(payload.get("username"), role), "token_type": "Bearer", "expires_in": auth.TOKEN_TTL}
+
+
 @app.post("/refund/{ticket_id}/review")
-def review_refund(ticket_id: str, payload: dict, _: None = Depends(_limit_write)):
+def review_refund(ticket_id: str, payload: dict, _: None = Depends(_limit_write),
+                  __: dict = Depends(auth.require_role("admin"))):
     """人工审批（代码层驱动状态机流转，不由 LLM 驱动）。action=approve/reject。
 
     并发安全：mq._apply_transition 用条件 UPDATE（WHERE status=当前状态）乐观锁，
     两个并发审批只有一个成功，另一个 409。
-    审批/执行接口无鉴权是 demo 取舍（资金敏感操作），生产必须鉴权 + IP 白名单。
+    鉴权（模块 8）：这是资金敏感操作，挂 require_role("admin")（垂直越权防线），
+    和 execute 一致。IP 白名单是生产进一步的纵深，demo 未做（知道规范即可）。
     """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
@@ -275,10 +346,15 @@ def review_refund(ticket_id: str, payload: dict, _: None = Depends(_limit_write)
 
 
 @app.post("/refund/{ticket_id}/execute")
-def execute_refund(ticket_id: str, _: None = Depends(_limit_write)):
+def execute_refund(ticket_id: str, _: None = Depends(_limit_write),
+                   __: dict = Depends(auth.require_role("admin"))):
     """退款执行（approved → refunded，mock）。真实场景接支付/财务，这里只改状态。
 
     execute 后 orders.status 不联动（demo mock），生产退款到账要联动订单状态。
+
+    鉴权（模块 8）：这里和 review 是真正的「钱闸」，必须 admin。
+    注意 /refund（agent 代客申请）刻意不加鉴权——它只生成待审工单、没有资金流，属低权操作。
+    按「资金影响」分级，而不是「凡写接口一律鉴权」：后者会白白打断 agent 链路且没有安全收益。
     """
     result = mq._apply_transition(ticket_id, "execute")
     if not result["ok"]:
@@ -295,7 +371,7 @@ if os.environ.get("ENABLE_DEBUG_FAULT", "").strip().lower() in ("1", "true", "ye
         target = payload.get("target")
         mode = payload.get("mode")
         count = payload.get("count", 1)
-        if target not in ("orders", "logistics", "products", "refund"):
+        if target not in ("orders", "logistics", "products", "refund", "online"):
             raise HTTPException(status_code=400, detail=f"非法 target：{target}")
         if mode not in ("timeout", "dirty", "empty"):
             raise HTTPException(status_code=400, detail=f"非法 mode：{mode}")
@@ -307,3 +383,19 @@ if os.environ.get("ENABLE_DEBUG_FAULT", "").strip().lower() in ("1", "true", "ye
         target = (payload or {}).get("target")
         fault.clear_fault(target)
         return {"status": "已清除"}
+
+    @app.post("/debug/online")
+    def debug_set_online(payload: dict, _: None = Depends(_limit_write)):
+        """运行时切换客服在线状态（评测用）。online=null 清除覆盖、回落 CS_ONLINE 环境变量。
+
+        和 /debug/fault 同属「评测用调试设施」，共用 ENABLE_DEBUG_FAULT 门控——
+        能改业务状态的无鉴权端点，生产必须默认关闭。
+        """
+        global _online_override
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+        value = payload.get("online")
+        if value is not None and not isinstance(value, bool):
+            raise HTTPException(status_code=400, detail=f"online 必须是布尔或 null：{value!r}")
+        _online_override = value
+        return {"status": "已设置", "online_override": _online_override}

@@ -40,9 +40,17 @@ for _w in build_jieba_words():
 class HybridRetriever:
     """BM25 + 向量 + RRF 混合检索"""
 
-    def __init__(self):
-        self._store = QdrantStore()
-        self._model = get_embedding_model()
+    def __init__(self, rrf_k: int = RRF_K, store=None, model=None):
+        # rrf_k 实例化可配（默认 = 模块级 RRF_K，生产行为零变化）。
+        # 参数化的目的是做 k 值扫描实验：k 决定 RRF 融合后哪些 chunk 进入 rerank 候选集，
+        # 所以它通过「相关 chunk 是否落在候选边界内」间接影响最终 top_k。
+        # ⚠️ 融合计算必须用 self._rrf_k，绝不能用模块级 RRF_K —— 那样扫描会静默测同一个 k，
+        # 八组结果全同，得出「k 没影响」的假结论且毫无察觉。
+        # store/model 可注入：k 扫描要在同一份数据上换 k 重跑，每个实例都新建 QdrantStore 会
+        # 触发本地文件锁冲突（AlreadyLocked）。注入共享实例，让「换 k」不碰「数据/模型」。
+        self._rrf_k = rrf_k
+        self._store = store if store is not None else QdrantStore()
+        self._model = model if model is not None else get_embedding_model()
         self._build_bm25()
 
     def _build_bm25(self):
@@ -61,7 +69,8 @@ class HybridRetriever:
         self._tokenized = [jieba.lcut(t) for t in self._chunk_texts]
         self._bm25 = BM25Okapi(self._tokenized)
 
-    def search(self, query: str, top_k: int = DEFAULT_TOP_K, category: str = None, kb_type: str = None):
+    def search(self, query: str, top_k: int = DEFAULT_TOP_K, category: str = None, kb_type: str = None,
+               use_rerank: bool = True):
         """混合检索，返回 (label, results)。
 
         label ∈ {'双高','单高一致','单高冲突','双低'} —— 四维置信度（判断层），上层据此做策略映射。
@@ -107,15 +116,7 @@ class HybridRetriever:
             return label, []
 
         # 3. RRF 融合（取两个检索器结果的并集）
-        all_cids = set(bm25_rank.keys()) | set(vec_rank.keys())
-        fallback_rank = len(self._chunk_ids)  # 没进检索结果的兜底排名
-        fused = []
-        for cid in all_cids:
-            r_bm = bm25_rank.get(cid, fallback_rank)
-            r_vec = vec_rank.get(cid, fallback_rank)
-            score = 1.0 / (RRF_K + r_bm) + 1.0 / (RRF_K + r_vec)
-            fused.append((cid, score))
-        fused.sort(key=lambda x: x[1], reverse=True)
+        fused = self._rrf_fuse(bm25_rank, vec_rank)
 
         # 4. Rerank 精排（先取 top_n 候选，用 CrossEncoder 精排到 top_k）
         text_map = dict(zip(self._chunk_ids, self._chunk_texts))
@@ -138,7 +139,10 @@ class HybridRetriever:
 
         # 单高冲突时让 rerank 返回全量候选排序，才能把被挤出 top_k 的那一路 top1 补回来（列候选）
         rerank_top_k = len(candidates) if label == "单高冲突" else top_k
-        reranked = self._rerank(query, candidates, rerank_top_k, text_map, title_map, pid_map)
+        # use_rerank=False 走的就是下面已有的「rerank 不可用 → 退回 RRF 排序」降级路径。
+        # 不是为测试新开的后门：这条降级路径本来就存在，开关只是让它可以被显式触发，
+        # 便于把「纯 RRF 排序」和「RRF + rerank」拉出来对比（k 值扫描要用）。
+        reranked = self._rerank(query, candidates, rerank_top_k, text_map, title_map, pid_map) if use_rerank else None
         if reranked is not None:
             # Rerank 只负责排序，不做绝对分数阈值拒答（拒答已移到召回层四维判断）。
             if label == "单高冲突":
@@ -152,6 +156,23 @@ class HybridRetriever:
         for cid, score in candidates[:top_k]:
             result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, "")))
         return label, result
+
+    def _rrf_fuse(self, bm25_rank: dict, vec_rank: dict) -> list:
+        """RRF 融合：取两路结果并集，按 1/(k+rank_bm25) + 1/(k+rank_vec) 打分降序。
+
+        抽成方法一是让 search() 干净，二是 k 扫描评测要直接拿「融合后的候选排序」做防呆自检
+        （对比不同 k 的候选差异），否则只能靠最终 top_k 反推、还会被 rerank 掩盖掉。
+        """
+        all_cids = set(bm25_rank.keys()) | set(vec_rank.keys())
+        fallback_rank = len(self._chunk_ids)  # 没进检索结果的兜底排名
+        fused = []
+        for cid in all_cids:
+            r_bm = bm25_rank.get(cid, fallback_rank)
+            r_vec = vec_rank.get(cid, fallback_rank)
+            score = 1.0 / (self._rrf_k + r_bm) + 1.0 / (self._rrf_k + r_vec)
+            fused.append((cid, score))
+        fused.sort(key=lambda x: x[1], reverse=True)
+        return fused
 
     def has_kb_type(self, kb_type: str) -> bool:
         """检查 BM25 索引里是否存在指定 kb_type 值的 chunk（政策块缺失检测：未入库时 get_return_policy 走兜底）"""

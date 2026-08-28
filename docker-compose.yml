@@ -39,16 +39,37 @@ services:
     build: .
     ports:
       - "8000:8000"
+    # ── 沙箱加固（Prompt Injection 架构级防御）──
+    # cap_drop ALL：丢掉全部 Linux capabilities。后端只需要监听端口 + 出网连 MySQL/Redis，
+    #   不需要 CAP_CHOWN/CAP_SETUID 之类的特权。丢光 = 即使被拿下也没有提权原语可用。
+    # no-new-privileges：禁止进程通过 setuid 二进制提权，堵死「降权后再爬回 root」的路径。
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
       # 配置外部化：代码用 os.environ.get(...) 读，这里注入覆盖——代码零改动
       # 本机跑是 127.0.0.1，容器里是服务名，靠同一套 env 机制切换，不用改代码
       MYSQL_HOST: mysql
       MYSQL_PORT: "3306"
-      MYSQL_USER: root
+      # 最小权限：不用 root 连库。ecom 账号只被授予 ecommerce.* 权限，
+      # 不能建库、不能读 mysql 系统库、无 FILE 权限（FILE 可读写宿主文件，是提权跳板）。
+      # ⚠️ 该账号不是 compose 自动创建的 —— MYSQL_USER 只在数据目录为空的首次初始化时生效，
+      # 而 mysql_data 卷早已存在。账号由 docs/security-plan.md §5.1 的 CREATE USER 手工建（不删卷）。
+      MYSQL_USER: ${BACKEND_MYSQL_USER:-ecom}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-root}
       MYSQL_DB: ecommerce
       REDIS_HOST: redis
       REDIS_PORT: "6379"
+      # ── 模块 8 鉴权 ──
+      # 代码层 fail-closed（没有 AUTH_SECRET 就拒绝启动）；这里给 demo 默认值让开箱即跑。
+      # 代价要说清楚：拿到本文件的人就能伪造 admin token，生产必须外部注入真密钥。
+      AUTH_SECRET: ${AUTH_SECRET:-dev-only-secret-change-me}
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      # 故障注入 / 在线状态切换等调试端点的总开关，默认关闭（生产不能裸奔）。
+      # 跑评测时：ENABLE_DEBUG_FAULT=1 docker compose up -d backend
+      ENABLE_DEBUG_FAULT: ${ENABLE_DEBUG_FAULT:-0}
     depends_on:
       # condition: service_healthy —— 等 MySQL/Redis 真 ready 再起，不是「容器起来了就算」
       mysql:

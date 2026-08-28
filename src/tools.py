@@ -29,6 +29,7 @@ if _project_root not in sys.path:
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from src.circuit_breaker import CircuitBreaker
+from src.infra.egress import validate_backend_url
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -151,8 +152,23 @@ TOOL_SCHEMAS = [
 
 # 订单/物流/库存已迁到后端（src/backend/main.py 的 SQLite），工具走 HTTP 查询，不再是内存 mock。
 # 后端未启动/超时 → 工具返回友好错误，不静默降级（让失败可见，可讲「真实工具的失败处理」）。
-BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+# 出网限制（架构级注入防御）：BACKEND_URL 来自环境变量，import 时就校验主机白名单。
+# 不校验的话，改掉这个变量就能把 agent 的全部工具请求（含用户订单数据）导向攻击者服务器。
+BACKEND_URL = validate_backend_url(os.environ.get("BACKEND_URL", "http://localhost:8000"))
 REQUEST_TIMEOUT = 2.0  # 秒
+
+
+def _sanitize(s) -> str:
+    """边界清洗：外部输入里的孤立代理（U+D800-U+DFFF 非法码点）替换成 ?。
+
+    为什么要清洗：孤立代理不是合法 Unicode，encode("utf-8") 会抛 UnicodeEncodeError。
+    它一路都能炸——quote()（URL 编码）、embedding 模型 .encode()、re.fullmatch 后的
+    HTTPException 回显——每一处都是雷。fuzz 实测抓到三个：auth 的 _ct_equal、后端 /refund
+    的错误回显、工具层 quote()。统一在边界把非法码点降级成 ?，后面所有环节都安全。
+    """
+    if not isinstance(s, str):
+        s = str(s)
+    return s.encode("utf-8", "replace").decode("utf-8")
 
 # 熔断器（进程级单例）：demo 单后端一个全局实例；生产按下游服务粒度分（订单/物流/库存各一个）。
 # 熔断打开时快速失败（不真调后端），保护自己不被挂掉的后端拖垮，同时给用户降级话术。
@@ -189,6 +205,13 @@ async def _http_request(method, url, json=None):
         # 只捕 ConnectError+TimeoutException 会漏 RemoteProtocolError，穿透炸 agent 循环。
         _breaker.record_failure()
         return None, "timeout"
+    except httpx.HTTPError:
+        # 非传输类 httpx 异常，典型是 InvalidURL（URL 里有空格/控制字符）。
+        # 它是 HTTPError 的直接子类、不是 TransportError 子类，上面那个 except 接不住，
+        # 会一路穿透到 agent 的 ReAct 循环。路径参数已统一 quote()，正常路径不该再触发；
+        # 这里是边界兜底——工具层绝不能把异常抛给调用方。
+        # 不计熔断失败：请求根本没发出去，是我们自己构造的 URL 坏了，不是下游故障。
+        return None, "bad_request"
     if resp.status_code >= 500:
         _breaker.record_failure()
         return None, "5xx"
@@ -225,7 +248,8 @@ RETURN_POLICY = (
 
 async def search_orders(order_id: str) -> str:
     """订单查询（真实后端接口）"""
-    resp, err = await _http_request("GET", f"{BACKEND_URL}/orders/{order_id}")
+    order_id = _sanitize(order_id)
+    resp, err = await _http_request("GET", f"{BACKEND_URL}/orders/{quote(order_id, safe='')}")
     if err:
         if err == "breaker_open":
             return "服务暂不可用（当前熔断中，请稍后重试或转人工）。"
@@ -247,7 +271,8 @@ async def search_orders(order_id: str) -> str:
 
 async def search_logistics(order_id: str) -> str:
     """物流追踪（真实后端接口）"""
-    resp, err = await _http_request("GET", f"{BACKEND_URL}/logistics/{order_id}")
+    order_id = _sanitize(order_id)
+    resp, err = await _http_request("GET", f"{BACKEND_URL}/logistics/{quote(order_id, safe='')}")
     if err:
         if err == "breaker_open":
             return "服务暂不可用（当前熔断中，请稍后重试或转人工）。"
@@ -270,7 +295,8 @@ async def search_logistics(order_id: str) -> str:
 
 async def check_stock(product_id: str) -> str:
     """实时价格 + 库存查询（真实后端接口）。动态数据（价格/库存）走工具实时查，不进向量库（数据分治）。"""
-    resp, err = await _http_request("GET", f"{BACKEND_URL}/products/{quote(product_id)}")
+    product_id = _sanitize(product_id)
+    resp, err = await _http_request("GET", f"{BACKEND_URL}/products/{quote(product_id, safe='')}")
     if err:
         if err == "breaker_open":
             return "服务暂不可用（当前熔断中，请稍后重试或转人工）。"
@@ -321,6 +347,7 @@ async def get_return_policy(query: str = None) -> str:
     """退货政策（政策知识库 RAG）——检索命中的政策块 + 整段政策参考；query 缺失时整段兜底"""
     if not query:
         return RETURN_POLICY
+    query = _sanitize(query)
     return await asyncio.to_thread(_get_return_policy_sync, query)
 
 
@@ -347,6 +374,7 @@ async def transfer_to_human(problem: str) -> str:
     /online 挂掉（后端不可用/熔断/超时）→ 降级生成工单 + 保守话术（不声称已转接），
     转人工不因查询失败而拒绝——工单生成是本地逻辑，不依赖后端。
     """
+    problem = _sanitize(problem)
     ticket_id = f"TK{uuid.uuid4().hex[:8].upper()}"
     resp, err = await _http_request("GET", f"{BACKEND_URL}/online")
     online = False
@@ -373,6 +401,7 @@ async def refund_order(order_id: str) -> str:
     按响应里 ticket_id 是否为空分两套话术——降级回退路径带工单号，异步路径带受理号。
     话术金额用响应 refund_amount（后端权威值），不引用任何局部 amount。
     """
+    order_id = _sanitize(order_id)
     resp, err = await _http_request("POST", f"{BACKEND_URL}/refund", json={"order_id": order_id})
     if err:
         if err in ("breaker_open", "rate_limited"):
@@ -473,6 +502,7 @@ def _search_products_sync(query: str, top_k: int) -> str:
 
 async def search_products(query: str, top_k: int = 3) -> str:
     """商品知识库检索（RAG）——混合检索 + category 预过滤 + 四维置信度策略映射"""
+    query = _sanitize(query)
     return await asyncio.to_thread(_search_products_sync, query, top_k)
 
 

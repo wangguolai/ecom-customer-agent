@@ -20,6 +20,17 @@ RUN pip install --no-cache-dir -r requirements-backend.txt
 # 后复制源码：源码常改，放后面，改动只重建 COPY 这一层
 COPY src/ src/
 
+# 降权到非 root（Prompt Injection 架构级防御 —— 沙箱隔离层）
+# 位置有讲究：必须放在 pip install + COPY 之后。放前面会因为没有写权限，
+# 装依赖和拷代码直接失败。
+# 为什么要降权：容器默认以 root 跑，一旦注入链路最终导致容器内命令执行，
+# 攻击者拿到的就是 root；降权后拿到的是无特权账号，配合 compose 的 cap_drop，
+# 横向移动到宿主机的成本大幅升高。
+# 本服务运行时无本地写需求（PYTHONDONTWRITEBYTECODE=1 禁 .pyc、无文件日志、
+# 数据全在 MySQL/Redis），所以降权不会踩到写权限问题。
+RUN useradd --create-home --uid 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8000
 
 # --host 0.0.0.0：容器内 127.0.0.1 只在容器内部可达，不监听 0.0.0.0 宿主机访问不到

@@ -23,8 +23,13 @@ import re
 from src.derived.categories import build_category_keywords
 
 # 订单号模式：11 位、20 开头（demo 种子数据 20240818001 这种）。
-# 锚定 20 开头 + \b 边界，防 11 位手机号（13x/15x/18x 开头）误匹配——宁可漏不可错。
-_ORDER_ID_RE = re.compile(r"\b20\d{9}\b")
+# 锚定 20 开头 + 前后不能是数字，防 11 位手机号（13x/15x/18x 开头）和「嵌在更长数字里」误匹配。
+#
+# 为什么用 (?<!\d)...(?!\d) 而不是 \b：Python 正则里中文也算 \w，
+# 所以「订单20240818001什么状态」中「单」和「2」之间**没有**词边界 → \b 匹配不到，
+# 规则路由静默失效、白白回落 LLM。而用户不打空格是常态。
+# 换成「前后非数字」的断言：中文紧贴能识别，防手机号/长数字嵌套的效果不变。
+_ORDER_ID_RE = re.compile(r"(?<!\d)20\d{9}(?!\d)")
 
 # 转人工硬触发词（投诉/人工求助）
 _HUMAN_WORDS = ("投诉", "转人工", "人工客服", "找人工")
@@ -35,6 +40,13 @@ _NEGATE_WORDS = ("不用", "不要", "别", "不想", "能不", "无需")
 _LOGISTICS_WORDS = ("到哪", "物流", "快递", "包裹", "轨迹")
 # 订单状态词
 _ORDER_WORDS = ("状态", "订单", "发货")
+
+# 写操作意图词（退款）——命中直接交 LLM，规则层不碰写操作。
+# 为什么需要这道排除：本模块文档写明「refund_order（写操作）走 LLM」，但此前代码没实现，
+# 而 _ORDER_WORDS 里的「订单」是个泛词 —— 「我要退款订单 X」会先命中订单号 + 「订单」，
+# 被路由成 search_orders，退款意图被静默吞掉（用户要退款，agent 回一段订单状态）。
+# 词表刻意收窄、不含「退货」：避免误伤下面 _POLICY_WORDS 的「退货政策」路由。
+_WRITE_INTENT_WORDS = ("退款", "退钱", "退货款")
 
 # 退货政策词（明确政策词；「能退吗/我要退货」这类模糊的走 LLM，避免和退款意图混淆）
 _POLICY_WORDS = ("退货政策", "退换货政策", "七天无理由", "无理由退货", "退货流程", "退货条件", "退货运费")
@@ -69,9 +81,16 @@ def route_by_rule(user_msg: str):
       - summarize：总结意图（想对比多款），反问澄清
     只处理「自包含、高置信」的意图。宁可漏（走 LLM）不可错（错误路由）。
     """
-    # 转人工：强意图词硬触发，排除否定句
+    # 转人工：强意图词硬触发，排除否定句。
+    # 刻意排在写意图排除之前——「转人工」是用户显式的升级信号，硬触发的存在意义就是
+    # 不依赖软 prompt；「退款不成，我要转人工」该照常转人工，不因为带「退款」二字就降级给 LLM。
     if any(w in user_msg for w in _HUMAN_WORDS) and not any(w in user_msg for w in _NEGATE_WORDS):
         return ("tool", "transfer_to_human", {"problem": user_msg})
+
+    # 写操作意图（退款）排除：规则层不碰写操作，直接交 LLM 走 ReAct。
+    # 必须放在订单号分支之前——否则「我要退款订单 X」会被 _ORDER_WORDS 的「订单」抢走。
+    if any(w in user_msg for w in _WRITE_INTENT_WORDS):
+        return None
 
     order_id = _extract_order_id(user_msg)
     if order_id:

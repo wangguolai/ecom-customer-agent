@@ -197,5 +197,119 @@ def _run_regression(retriever, failures):
     print("=" * 70)
 
 
+def run_rrf_sweep():
+    """RRF k 值扫描（零成本）：k ∈ {10,30,60,100} × 链路 ∈ {纯RRF, RRF+Rerank} 的 Recall@3/MRR 对比。
+
+    关键洞察（决定实验必须同时跑两条链路）：
+      k 只影响「哪些 chunk 进 rerank 候选集」，不影响候选集内的 rerank 重排 ——
+      所以 k 对最终 top_k 的影响是「间接」的，只发生在相关 chunk 处在候选边界附近时。
+      只测「RRF+Rerank」完整链路会得到「k 没影响」的结论，但那很可能是被 rerank 稀释了，
+      不是 k 真的没影响。必须同时测「纯 RRF」链路，才能看到 k 的真实作用。
+
+    防呆自检（先于扫描）：同一 query 用 k=10 和 k=100 跑纯 RRF，断言融合候选排序必须有差异。
+    若没有差异，要么是本数据上 k 真的不敏感（可以下结论），要么是实验坏了（k 没传进去、
+    融合还在用模块级常量）—— 必须报错让实验者去查，不能静默得出「k 没影响」的假结论。
+    """
+    print("=" * 70)
+    print("RRF k 值扫描：k × 链路 对比 Recall@3 / MRR")
+    print("-" * 70)
+
+    model = get_embedding_model()
+    base = HybridRetriever()  # 建一次索引 + 模型，之后只换 k，不碰数据/模型
+    store = base._store
+
+    # ── 防呆自检：k=10 vs k=100 的纯 RRF 结果集必须可区分（不能单靠一条 query）──
+    # 教训：最初用单条 probe query 判「融合排序是否变化」，结果误报——单条 query 可能碰巧
+    # 不重排，但 k 对整份评测集是生效的（Recall 随 k 单调变化）。防呆要防的是「k 压根没传进去
+    # 导致所有 query 结果都一模一样」，所以应该对比「整份评测集的纯 RRF 输出集合」，而非单条。
+    import jieba as _jieba
+
+    def _probe_fused(k, query):
+        qvec = model.encode(query, normalize_embeddings=True).tolist()
+        hits = store.search_knowledge(qvec, limit=20, score_threshold=None, kb_type="product")
+        vec_rank = {h.payload.get("chunk_id"): r for r, h in enumerate(hits) if h.payload.get("chunk_id")}
+        toks = _jieba.lcut(query)
+        bm25_rank = {}
+        if base._bm25 is not None and toks:
+            scores = base._bm25.get_scores(toks)
+            order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+            r = 0
+            for idx in order:
+                if scores[idx] > 0 and base._chunk_kb_types[idx] == "product":
+                    bm25_rank[base._chunk_ids[idx]] = r
+                    r += 1
+        fallback = len(base._chunk_ids)
+        fused = []
+        for cid in set(bm25_rank) | set(vec_rank):
+            sc = 1.0 / (k + bm25_rank.get(cid, fallback)) + 1.0 / (k + vec_rank.get(cid, fallback))
+            fused.append((cid, sc))
+        fused.sort(key=lambda x: x[1], reverse=True)
+        return tuple(cid for cid, _ in fused[:3])
+
+    def _probe_all(k):
+        return [_probe_fused(k, q) for q, e in EVAL_SET if e]
+
+    all_10 = _probe_all(10)
+    all_100 = _probe_all(100)
+    if all_10 == all_100:
+        print("⚠️ 防呆自检未通过：k=10 和 k=100 对整份评测集的纯 RRF top3 完全相同。")
+        print("   几乎可以断定 k 没真正传进融合（还在用模块级常量）—— 请核查 hybrid_retriever 的融合。")
+        print("   继续扫描（结果仅作参考），但结论不可信。")
+    else:
+        n_diff = sum(1 for a, b in zip(all_10, all_100) if a != b)
+        print(f"✅ 防呆自检通过：k=10 vs k=100 有 {n_diff} 条 query 的纯 RRF top3 不同（k 对候选集有真实影响）")
+
+    ks = [10, 30, 60, 100]
+    methods = ["纯RRF", "RRF+Rerank"]
+    agg = {(k, m): {"recall": [], "mrr": []} for k in ks for m in methods}
+    pos_total = 0
+
+    for k in ks:
+        base._rrf_k = k  # 换 k，复用同一份 BM25 索引 + embedding 模型
+        for query, expected in EVAL_SET:
+            if not expected:
+                continue  # 负样本不入 Recall/MRR 规范（和 run_eval 一致）
+            category = detect_category(query)
+            # 纯 RRF 链路：跳过 rerank，看 k 的真实作用
+            _, pure = base.search(query, top_k=3, category=category, kb_type="product", use_rerank=False)
+            # 完整链路：RRF → rerank，看 k 被 rerank 稀释后还剩多少作用
+            _, full = base.search(query, top_k=3, category=category, kb_type="product", use_rerank=True)
+            for method, results in (("纯RRF", pure), ("RRF+Rerank", full)):
+                titles = [title for _, _, _, title, _ in results]
+                recall = len(set(expected) & set(titles)) / len(expected)
+                mrr = 0.0
+                for i, t in enumerate(titles, 1):
+                    if t in expected:
+                        mrr = 1.0 / i
+                        break
+                agg[(k, method)]["recall"].append(recall)
+                agg[(k, method)]["mrr"].append(mrr)
+        pos_total += 1  # 每个 k 过一遍正样本，最后统一除以正样本数
+
+    pos_total = sum(1 for _, e in EVAL_SET if e)
+    print("-" * 70)
+    print(f"{'k':<6} {'链路':<12} {'Recall@3':<12} {'MRR':<10}")
+    print("-" * 70)
+    results_out = {}
+    for k in ks:
+        for m in methods:
+            recall = sum(agg[(k, m)]["recall"]) / pos_total if pos_total else 0
+            mrr = sum(agg[(k, m)]["mrr"]) / pos_total if pos_total else 0
+            print(f"{k:<6} {m:<12} {recall:<12.4f} {mrr:<10.4f}")
+            results_out[f"k={k}_{m}"] = {"recall": round(recall, 4), "mrr": round(mrr, 4)}
+    print("=" * 70)
+
+    # 落盘
+    import json as _json
+    os.makedirs(os.path.join(_project_root, "tests", "eval_results"), exist_ok=True)
+    out_path = os.path.join(_project_root, "tests", "eval_results", "rrf_k_sweep.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        _json.dump({"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "pos_total": pos_total, "results": results_out}, f, ensure_ascii=False, indent=2)
+    print(f"📁 结果已落盘：{out_path}")
+
+
 if __name__ == "__main__":
-    run_eval()
+    if "--rrf-k-sweep" in sys.argv:
+        run_rrf_sweep()
+    else:
+        run_eval()

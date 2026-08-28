@@ -255,7 +255,12 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
     """核心循环：LLM 决策 → 代码执行 → 回灌，直到最终答案。原地修改 messages，返回最终答案"""
     last_action = None
     repeat_count = 0
-    called_write = set()  # 本回合已执行过的写工具：写操作只执行一次，防 ReAct 自动重试（重复退款/重复工单）
+    # 本回合已执行过的写操作，键 = (工具名, 规范化参数)。防 ReAct 自动重试造成重复退款/重复工单。
+    # ⚠️ 粒度必须带参数，不能只按工具名：只按名拦，「把 A 和 B 两个订单都退了」（LLM 一次返回两个
+    # refund_order tool_calls）会把第二个订单误拦，用户被无声少退一单。
+    # 而同一订单重复提交，后端 refunds 表的 UNIQUE(order_id) 本来就兜底去重 ——
+    # 只按工具名拦：对同订单是冗余，对不同订单是有害。
+    called_write = set()
 
     for step in range(MAX_STEPS):
         print(f"📍 [step {step+1}] LLM 决策中...")
@@ -301,22 +306,31 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
                 if trace:
                     trace.end_reason = "死循环"
                 return "连续 3 次调用同一工具同一参数，判定死循环，已停止。"
-            parsed.append((tc, args))
+            # 写操作占位在这里做（串行区），不放到 _exec 里——_exec 并发跑，
+            # 「检查 called_write → await 工具」之间有竞态：同一批里两个完全相同的 tool_call
+            # 会双双通过检查、双双执行。串行区「检查即占位」把竞态窗口消掉。
+            blocked = False
+            if name in WRITE_TOOLS:
+                if action_key in called_write:
+                    blocked = True
+                else:
+                    called_write.add(action_key)
+            parsed.append((tc, args, blocked))
 
         # 2. 并行执行工具（Function Calling 多 tool_calls 语义上应并发）。
         # 协程方案：asyncio.gather 替代 ThreadPoolExecutor——工具已是 async（httpx 等待/检索走 to_thread），
         # 等待 I/O 时事件循环去跑别的协程，单线程并发，切换成本比线程池更低。
         # 计时从 _exec 入口开始，幻觉工具/非法参数/参数不匹配也计入 trace（这些事件可观测才能排查五类坑）
         async def _exec(item):
-            tc, args = item
+            tc, args, blocked = item
             name = tc.function.name
             t0 = time.perf_counter()
             if args is None:
                 result = f"错误：参数不是合法 JSON：{tc.function.arguments}"
             elif name not in TOOL_MAP:
                 result = f"错误：工具 {name} 不存在，可用工具：{list(TOOL_MAP)}"
-            elif name in WRITE_TOOLS and name in called_write:
-                # 写工具本回合只执行一次：退款/转人工已执行过，LLM 再调（尤其失败后自动重试）直接拒绝。
+            elif blocked:
+                # 同一写操作（工具 + 相同参数）本回合已执行过，LLM 再调（尤其失败后自动重试）直接拒绝。
                 # message_id 幂等只拦「同一请求」重复，拦不住「模型重试产生的新请求」（新 message_id）。
                 result = "该写操作本回合已执行过，为防重复提交（重复退款/重复工单）不再重复执行。请基于已执行结果回复用户，勿再次调用写工具。"
             else:
@@ -324,9 +338,17 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
                     result = await TOOL_MAP[name](**args)
                 except (TypeError, KeyError) as e:
                     result = f"工具 {name} 参数不匹配：{e}"
-                else:
-                    if name in WRITE_TOOLS:
-                        called_write.add(name)  # 真正执行了写工具才标记（参数不匹配/工具不存在不标记）
+                except Exception as e:
+                    # 兜底：任何未预期的工具异常都降级成一条 tool 消息，不让它穿透炸掉整个回合。
+                    # 真实案例：order_id 含空格/换行时 httpx 抛 InvalidURL —— 它是 HTTPError 子类、
+                    # 不是 TransportError 子类，_http_request 的 except 接不住，会一路穿透到这里。
+                    # 工具层是外部输入的边界，边界上不该有「未预期异常能穿透」的路径。
+                    # 打完整 traceback 到 stderr：降级是「不炸回合」，不是「掩盖 bug」——
+                    # 外部脏数据（用户输入）和代码缺陷（编程错误）要在日志里可区分，否则排障无从下手。
+                    import traceback as _tb
+                    print(f"⚠️ 工具 {name} 执行异常（已降级）：{type(e).__name__}", file=sys.stderr)
+                    _tb.print_exc()
+                    result = f"工具 {name} 执行异常（{type(e).__name__}），请稍后重试或转人工。"
             result = truncate(result)
             elapsed = time.perf_counter() - t0
             is_empty = any(sig in result for sig in _EMPTY_SIGNALS)
@@ -337,7 +359,7 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
         results = await asyncio.gather(*[_exec(item) for item in parsed])
 
         # 3. 按原顺序回灌结果（tool_call_id 一一对应，顺序不乱）
-        for (tc, _), result in zip(parsed, results):
+        for (tc, _, _), result in zip(parsed, results):
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     if trace:

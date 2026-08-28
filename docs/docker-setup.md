@@ -23,6 +23,39 @@ redis-1     Up (healthy)              0.0.0.0:6379->6379/tcp
 
 **设计要点已归档到 `references/_BACKEND.md` 模块 7**，本文只留操作记录和环境踩坑。
 
+## 模块 8 安全加固后的机器状态（2026-08-28）
+
+在模块 7 基础上又加了一层安全加固（见 `docs/security-plan.md`），涉及 compose 变化，这里同步记录：
+
+| 项 | 变化 |
+|----|------|
+| backend 容器用户 | root → `appuser`（非 root）+ `cap_drop: ALL` + `no-new-privileges` |
+| MySQL 连接账号 | root → `ecom`（只授 `ecommerce.*`，手工 `CREATE USER` 建，**不删卷**） |
+| 鉴权 | `/refund/{id}/review`、`/refund/{id}/execute` 挂 JWT（`src/backend/auth.py`）；新增 `POST /auth/token` 签发 |
+| 调试端点 | `/debug/fault`、`/debug/online` 由 `ENABLE_DEBUG_FAULT` 门控（默认关） |
+| 环境变量 | 新增 `AUTH_SECRET` / `ADMIN_USER` / `ADMIN_PASSWORD`（demo 默认值，生产必须外部注入） |
+
+**重建 backend 的命令**（改了 Dockerfile/compose 后）：
+
+```bash
+ENABLE_DEBUG_FAULT=1 docker compose up -d --build backend   # 跑评测时带调试端点
+docker compose up -d --build backend                        # 正常不带
+```
+
+**首次切换 ecom 账号**（已有 volume 时 `MYSQL_USER` 不自动建账号，必须手工建）：
+
+```bash
+docker compose exec -T mysql mysql -uroot -p"<密码>" -e \
+  "CREATE USER IF NOT EXISTS 'ecom'@'%' IDENTIFIED BY '<密码>'; \
+   GRANT ALL PRIVILEGES ON ecommerce.* TO 'ecom'@'%'; FLUSH PRIVILEGES;"
+```
+
+⚠️ **宿主机脚本连库要显式打 3307**：本机 `.env` 的 `MYSQL_PORT=3306` 指向本机 mysqld，
+是另一个同名 `ecommerce` 库。宿主机脚本查容器 MySQL 的数据要连 `127.0.0.1:3307`，否则「查得通、有数据、断言还全绿」，是最危险的一类静默错误。
+
+**评测脚本里登录**：`AUTH_SECRET` / `ADMIN_USER` / `ADMIN_PASSWORD` 与 compose 注入值一致
+（demo 默认 `dev-only-secret-change-me` / `admin` / `admin123`），生产换真值后评测脚本要同步改。
+
 ## 最终机器状态
 
 | 项 | 状态 |

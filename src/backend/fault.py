@@ -21,7 +21,7 @@ _lock = threading.Lock()
 
 
 def set_fault(target: str, mode: str, count: int):
-    """设置 target 接下来 count 次请求注入 mode 故障。target ∈ orders/logistics/products/refund"""
+    """设置 target 接下来 count 次请求注入 mode 故障。target ∈ orders/logistics/products/refund/online"""
     with _lock:
         _FAULTS[target] = {"mode": mode, "count": count}
 
