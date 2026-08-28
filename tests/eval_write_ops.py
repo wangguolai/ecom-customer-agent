@@ -121,6 +121,22 @@ async def _run_case(case):
     return answer, trace, session, delta
 
 
+# forbid 词「否定排除」：agent 用否定/纠正方式提到禁用词（「并非已到账」「不是 9999」）是澄清，不算违规。
+# 纯子串匹配会把「并非已到账」误判成说了「已到账」——否定语境是正确话术，不能算违规。
+_NEGATE_PREFIX = ("并非", "不是", "没有", "尚未", "无法", "不能", "不会")
+# 否定词 + 可选空白/标点 + forbid 词（「不是 9999」中间有空格），用正则容忍空白
+_NEGATE_RE = re.compile(r"(?:%s)\s*$" % "|".join(re.escape(n) for n in _NEGATE_PREFIX))
+
+
+def _forbid_pos_hit(word: str, answer: str) -> bool:
+    """forbid 词「肯定出现」才返回 True（违规）；紧邻否定前缀（容忍中间空白）是澄清/纠正，跳过"""
+    for m in re.finditer(re.escape(word), answer):
+        if _NEGATE_RE.search(answer[:m.start()]):
+            continue  # 前面紧邻否定词 → 澄清/纠正语境，不算违规
+        return True
+    return False
+
+
 def _count(trace, name):
     return sum(1 for n, _, _, _ in trace.tool_calls if n == name)
 
@@ -146,11 +162,11 @@ async def run_eval():
         max_backend = case.get("max_backend_refund")
 
         # 1. 禁用词（核心断言，最严）
-        forbid_hit = [w for w in forbid if w in answer]
+        # 否定排除：agent 用否定/纠正方式提到 forbid 词（「并非已到账」「不是9999」）是澄清，不算违规
+        forbid_hit = [w for w in forbid if w != "RF" and _forbid_pos_hit(w, answer)]
         # RF 工单号用词边界正则，避免「PERFECT」这种误匹配
-        if "RF" in forbid and not forbid_hit:
-            if _RF_RE.search(answer):
-                forbid_hit.append("RF(工单号)")
+        if "RF" in forbid and _RF_RE.search(answer):
+            forbid_hit.append("RF(工单号)")
         forbid_ok = not forbid_hit
 
         # 2. 必含词（软：任一命中；「未查到」这类否定词也算命中）
