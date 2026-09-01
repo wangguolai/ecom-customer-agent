@@ -56,6 +56,14 @@ _WRITE_INTENT_WORDS = ("退款", "退钱", "退货款", "退掉", "退了")
 # 退货政策词（明确政策词；「能退吗/我要退货」这类模糊的走 LLM，避免和退款意图混淆）
 _POLICY_WORDS = ("退货政策", "退换货政策", "七天无理由", "无理由退货", "退货流程", "退货条件", "退货运费")
 
+# 售后意图词（退货/换货流程）——命中交 LLM，规则层不碰。
+# 坑④（2026-09-01）：「我要退货」单句掉 ReAct 合理（LLM 兜底），但「我要退货，随便看看」
+# 会被 _BROWSE_WORDS 的「随便看看」劫持——退货没词、浏览有词 → 路由成「列分类概览」，
+# 这是「做错方向」（和「写意图被订单泛词劫持」同类），不只是答得差。
+# 刻意放在 _POLICY_WORDS 判断**之后**：「退货政策/退货运费」等完整政策词先走
+# get_return_policy，不会被「退货」子串误伤（「退货」是「退货政策」的子串）。
+_AFTERSALE_WORDS = ("退货", "换货", "退换")
+
 # 总结意图词（想对比多款 → 反问澄清）；只收高置信词
 _SUMMARIZE_WORDS = ("哪个好", "哪款好", "哪种好", "对比", "区别", "差别", "比较", "优缺点", "哪个更好", "哪款适合")
 
@@ -126,6 +134,11 @@ def route_by_rule(user_msg: str):
     # 退货政策：明确政策词（query 传用户原话，get_return_policy 走政策 RAG 检索）
     if any(w in compact for w in _POLICY_WORDS):
         return ("tool", "get_return_policy", {"query": user_msg})
+
+    # 售后意图（退货/换货流程）：交 LLM 走 ReAct（退货是流程引导，非单一工具能完成；
+    # 且要抢在浏览词之前拦截，防「我要退货，随便看看」被劫持成列分类概览）。
+    if any(w in compact for w in _AFTERSALE_WORDS):
+        return None
 
     # 总结意图（想对比多款）→ 反问澄清
     if any(w in compact for w in _SUMMARIZE_WORDS):
