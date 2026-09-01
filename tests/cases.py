@@ -2,7 +2,7 @@
 """集中评测 case 配置（单一入口）
 
 设计：所有「人工标注」的评测 case 集中在这个文件，造坏 case / 改 case 只改这里，不用东找西找。
-八块：
+九块：
 - RETRIEVAL_CASES：检索评测集（query -> 正确答案标题列表），跑 eval_retrieval.py
 - ANSWER_QUALITY_CASES：回答质量评测集（name/query/expected/needs_backend），跑 eval_answer_quality.py
 - COMPRESSION_CASES：上下文压缩评测集（多轮对话场景），跑 eval_context_compression.py
@@ -11,6 +11,7 @@
 - JUDGE_CALIBRATION_CASES：裁判校准评测集（name/query/reference/answer/expected），跑 eval_judge_calibration.py
 - WRITE_OPS_CASES：写操作评测集（退款/转人工/多意图链路），跑 eval_write_ops.py
 - ROBUSTNESS_CASES：全链路鲁棒性坏 case（脏输入/事实冲突/多意图/业务边界/安全/ReAct/多轮），评测脚本待接入
+- ROUTING_CASES：意图路由评测集（query -> 期望路由结果 kind/tool/order_id），跑 eval_routing.py
 
 第四、五块暂不接入的原因：现有评测脚本真实调后端、且只落盘「最终回答」，判不了「过程」——
 工具超时/返回脏数据需要后端故障注入；循环次数/重复调用需要读 trace 的 step 数。
@@ -389,4 +390,40 @@ ROBUSTNESS_CASES = [
     {"name": "意图路由-单句退货丢上下文", "query": "退货。",
      "expected": "单句「退货」无订单号，规则层路由不到（「退货」不在写意图/政策词表）、落 LLM；反问确认退哪个订单，不擅自操作",
      "category": "多轮", "needs_backend": False},
+]
+
+# ═══════════════════════════════════════════════════════════════
+# 九、意图路由评测集（eval_routing.py）
+# 标注 route_by_rule 的期望结果，判据 = 程序化三元组对比（无 LLM 打分，对称检索线 Recall/MRR）。
+# 每个 case：(name, query, expect_kind, expect_tool, expect_order_id)
+#   expect_kind ∈ {"tool", "browse", "summarize"} 或 None（None = 规则层不碰、交 LLM）
+#   expect_order_id 只在 search_orders / search_logistics 有意义，其余 None
+# 三类 case：
+#   ① 确定性路由正样本：应路由到工具/browse/summarize（规则层「能捞必捞」）
+#   ② 交 LLM：写操作/售后/模糊/带类别检索（规则层「不碰」）
+#   ③ 已知坑：脏输入绕过、售后被浏览词劫持、写意图被订单泛词劫持——修复后固化防复发
+# ═══════════════════════════════════════════════════════════════
+ROUTING_CASES = [
+    # ── ① 确定性路由正样本 ──
+    ("订单状态-干净", "订单 20240818001 什么状态", "tool", "search_orders", "20240818001"),
+    ("物流-干净", "订单 20240818001 到哪了", "tool", "search_logistics", "20240818001"),
+    ("政策-退货政策", "你们的退货政策是什么", "tool", "get_return_policy", None),
+    ("转人工-投诉", "我要投诉", "tool", "transfer_to_human", None),
+    ("浏览-随便看看", "随便看看", "browse", None, None),
+    ("总结-哪个好", "哪个好", "summarize", None, None),
+
+    # ── ② 交 LLM（规则层不碰）──
+    ("写操作-退款", "我要退款 20240818001", None, None, None),
+    ("售后-我要退货", "我要退货", None, None, None),
+    ("售后-能退吗", "能退吗", None, None, None),
+    ("检索-带类别词", "有什么推荐的猫粮", None, None, None),
+    ("转人工-否定句", "不用转人工", None, None, None),
+
+    # ── ③ 已知坑（修复后固化）──
+    ("脏输入-全角空格订单", "我的订　　单20240818001", "tool", "search_orders", "20240818001"),
+    ("脏输入-半角空格订单", "我的订 单 20240818001", "tool", "search_orders", "20240818001"),
+    ("脏输入-订单号中间空格", "订单 2024 0818001 什么状态", "tool", "search_orders", "20240818001"),
+    ("脏输入-订单号符号污染", "订单 202￥408$$$180/01 什么状态", "tool", "search_orders", "20240818001"),
+    ("坑-售后被浏览词劫持", "我要退货，随便看看", None, None, None),
+    ("坑-写意图被订单泛词劫持", "我要退款订单 20240818001", None, None, None),
 ]
