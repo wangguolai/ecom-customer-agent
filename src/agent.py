@@ -25,8 +25,10 @@ from src.tools import TOOL_SCHEMAS, TOOL_MAP, CATEGORY_KEYWORDS, WRITE_TOOLS
 from src.intent_router import route_by_rule
 
 MAX_STEPS = 8
+MAX_TOOL_CALLS_PER_TURN = 5  # 单次 LLM 决策最多返回的工具调用数，超了直接让用户收敛（防一次狂调一堆工具）
 MAX_TOOL_RESULT_LEN = 500
 MAX_HISTORY_TOKENS = 2000  # 历史 token 预算（演示用小值；这是「预算」不是「轮次」）
+MAX_OUTPUT_TOKENS = 2048   # 面向用户的 LLM 生成输出上限（纯兜底：防失控/封顶成本，不是「长度控制器」，简洁靠 prompt 约束）
 SUMMARY_PREFIX = "【历史摘要】"   # 摘要消息的 content 前缀（摘要消息也 role=user，靠前缀和真实轮次区分）
 SUMMARY_MAX_TOKENS = 300          # 摘要输出 token 上限，防摘要比原文还大（负收益）
 SUMMARY_INSTRUCTION = (
@@ -179,7 +181,7 @@ async def _run_routed(messages: list, routed, trace: Trace = None) -> str:
     messages.append({"role": "user", "content": f"【规则路由已执行工具 {tool_name}，结果如下，请据此回答用户：】\n{tool_result}"})
     t1 = time.perf_counter()
     try:
-        resp, usage = await chat_with_usage(messages)
+        resp, usage = await chat_with_usage(messages, max_tokens=MAX_OUTPUT_TOKENS)
     except Exception as e:
         if trace:
             trace.route_source = "规则"
@@ -206,7 +208,7 @@ async def _pure_generate(messages: list, guide: str, trace: Trace = None) -> str
     messages.append({"role": "user", "content": guide})
     t0 = time.perf_counter()
     try:
-        resp, usage = await chat_with_usage(messages)
+        resp, usage = await chat_with_usage(messages, max_tokens=MAX_OUTPUT_TOKENS)
     except Exception as e:
         if trace:
             trace.route_source = "规则"
@@ -267,7 +269,7 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
         print(f"📍 [step {step+1}] LLM 决策中...")
         t0 = time.perf_counter()
         try:
-            resp, usage = await chat_with_usage(messages, tools=TOOL_SCHEMAS)
+            resp, usage = await chat_with_usage(messages, tools=TOOL_SCHEMAS, max_tokens=MAX_OUTPUT_TOKENS)
         except Exception as e:
             # API 超时/网络错误：标记异常结束，返回友好错误，不让异常穿透（trace 才有机会 summary）
             if trace:
@@ -288,6 +290,15 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
             if trace:
                 trace.end_reason = "正常"
             return resp.content or "（空回复）"
+
+        # 前置判定：单次决策返回过多工具调用，直接结束本回合让用户收敛。
+        # 防 LLM 一次狂调一堆工具（幻觉批量调用），单轮执行超时/超预算。
+        # MAX_TOOL_CALLS_PER_TURN=5 是 demo 量级的值：正常多 tool_calls 也就 2-3 个
+        # （查订单+物流、search_products→check_stock 链路），5 个已是异常。生产按业务工具数 + 单轮预算调。
+        if len(resp.tool_calls) > MAX_TOOL_CALLS_PER_TURN:
+            if trace:
+                trace.end_reason = "超工具数"
+            return "一次请求内容过多，请收敛到具体某个问题。"
 
         # 1. 先串行做「参数解析 + 死循环检测」（维护 last_action 状态，执行前检测防写工具连发副作用）
         parsed = []  # [(tc, args)]

@@ -126,6 +126,20 @@ class QdrantStore:
             ),
         )
 
+    def delete_by_chunk_ids(self, collection: str, chunk_ids: list[str]):
+        """按 chunk_id 列表删除对应 point（增量更新的「删除/下架」分支用）。
+
+        只删指定的几个 chunk，不动其他——和 delete_by_source（删整个源文件）区分：
+        这是增量语义「下架商品 = 删掉它自己的那条向量」的落地。
+        """
+        from qdrant_client.models import PointIdsList
+        point_ids = [_point_id(cid) for cid in chunk_ids if cid]
+        if point_ids:
+            self._client.delete(
+                collection_name=collection,
+                points_selector=PointIdsList(points=point_ids),
+            )
+
     def drop_collection(self, name: str):
         """删除 Collection（调试用）"""
         self._client.delete_collection(name)

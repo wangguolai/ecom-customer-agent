@@ -334,6 +334,10 @@ def review_refund(ticket_id: str, payload: dict, _: None = Depends(_limit_write)
     鉴权（模块 8）：这是资金敏感操作，挂 require_role("admin")（垂直越权防线），
     和 execute 一致。IP 白名单是生产进一步的纵深，demo 未做（知道规范即可）。
     """
+    # 路径参数格式校验（对齐 orders 的 \d{8,32} / products 的 P\d{1,15} 防御水平）：
+    # 工单号由 mq._create_refund_ticket 生成，格式 RF + 8 位大写 hex。非法值拦在进库之前。
+    if not re.fullmatch(r"RF[0-9A-F]{8}", ticket_id):
+        raise HTTPException(status_code=400, detail=f"工单号格式非法：{ticket_id}")
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
     action = payload.get("action")
@@ -356,6 +360,8 @@ def execute_refund(ticket_id: str, _: None = Depends(_limit_write),
     注意 /refund（agent 代客申请）刻意不加鉴权——它只生成待审工单、没有资金流，属低权操作。
     按「资金影响」分级，而不是「凡写接口一律鉴权」：后者会白白打断 agent 链路且没有安全收益。
     """
+    if not re.fullmatch(r"RF[0-9A-F]{8}", ticket_id):
+        raise HTTPException(status_code=400, detail=f"工单号格式非法：{ticket_id}")
     result = mq._apply_transition(ticket_id, "execute")
     if not result["ok"]:
         raise HTTPException(status_code=result["status_code"], detail=result["err"])

@@ -503,6 +503,9 @@ def _search_products_sync(query: str, top_k: int) -> str:
 async def search_products(query: str, top_k: int = 3) -> str:
     """商品知识库检索（RAG）——混合检索 + category 预过滤 + 四维置信度策略映射"""
     query = _sanitize(query)
+    # 空 query 防御：LLM 偶发传空串/纯空白时，不进 embedding（避免空字符串向量化异常 + 省一次无效推理）
+    if not query.strip():
+        return "请描述一下您想了解的商品（如适用对象、成分、规格等）。"
     return await asyncio.to_thread(_search_products_sync, query, top_k)
 
 
