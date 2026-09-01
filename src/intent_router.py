@@ -30,6 +30,9 @@ from src.derived.categories import build_category_keywords
 # 规则路由静默失效、白白回落 LLM。而用户不打空格是常态。
 # 换成「前后非数字」的断言：中文紧贴能识别，防手机号/长数字嵌套的效果不变。
 _ORDER_ID_RE = re.compile(r"(?<!\d)20\d{9}(?!\d)")
+# 数字碎片清洗用的订单号格式（fullmatch 锚定首尾，无需前后断言）：11 位、20 开头。
+# 「202￥408$$$180/01」这种被打散的订单号，findall 捞数字碎片拼接后用它 fullmatch 校验。
+_ORDER_ID_FULL_RE = re.compile(r"20\d{9}")
 
 # 转人工硬触发词（投诉/人工求助）
 _HUMAN_WORDS = ("投诉", "转人工", "人工客服", "找人工")
@@ -70,7 +73,18 @@ def _has_category(query: str) -> bool:
 
 
 def _extract_order_id(text: str):
+    """提取订单号（11 位、20 开头），两级：
+
+    1. 常规正则 search——订单号完整无污染时直接命中；
+    2. 数字碎片清洗兜底——被符号/空白打散（202￥408$$$180/01）时，
+       findall 捞所有数字碎片拼接，再用 fullmatch 校验格式。
+    两级都失败返回 None（走 LLM）。
+    """
     m = _ORDER_ID_RE.search(text)
+    if m:
+        return m.group(0)
+    digits = "".join(re.findall(r"\d+", text))
+    m = _ORDER_ID_FULL_RE.fullmatch(digits)
     return m.group(0) if m else None
 
 
@@ -83,36 +97,42 @@ def route_by_rule(user_msg: str):
       - summarize：总结意图（想对比多款），反问澄清
     只处理「自包含、高置信」的意图。宁可漏（走 LLM）不可错（错误路由）。
     """
+    # 去空格副本：删所有空白（含全角空格 　），规则层关键词/订单号都在副本上匹配。
+    # 中文空格是噪声不是词边界（和英文相反）——「订　　单」被全角空格打断时，
+    # _ORDER_WORDS 的「订单」子串匹配会 miss → 订单意图绕过规则层、掉进 LLM 裸奔。
+    # 原始 user_msg 原样流转给 LLM/RAG/trace（不清洗，防丢信息/篡改语义）。
+    compact = re.sub(r"\s+", "", user_msg)
+
     # 转人工：强意图词硬触发，排除否定句。
     # 刻意排在写意图排除之前——「转人工」是用户显式的升级信号，硬触发的存在意义就是
     # 不依赖软 prompt；「退款不成，我要转人工」该照常转人工，不因为带「退款」二字就降级给 LLM。
-    if any(w in user_msg for w in _HUMAN_WORDS) and not any(w in user_msg for w in _NEGATE_WORDS):
+    if any(w in compact for w in _HUMAN_WORDS) and not any(w in compact for w in _NEGATE_WORDS):
         return ("tool", "transfer_to_human", {"problem": user_msg})
 
     # 写操作意图（退款）排除：规则层不碰写操作，直接交 LLM 走 ReAct。
     # 必须放在订单号分支之前——否则「我要退款订单 X」会被 _ORDER_WORDS 的「订单」抢走。
-    if any(w in user_msg for w in _WRITE_INTENT_WORDS):
+    if any(w in compact for w in _WRITE_INTENT_WORDS):
         return None
 
-    order_id = _extract_order_id(user_msg)
+    order_id = _extract_order_id(compact)
     if order_id:
         # 物流：轨迹词
-        if any(w in user_msg for w in _LOGISTICS_WORDS):
+        if any(w in compact for w in _LOGISTICS_WORDS):
             return ("tool", "search_logistics", {"order_id": order_id})
         # 订单状态：状态词
-        if any(w in user_msg for w in _ORDER_WORDS):
+        if any(w in compact for w in _ORDER_WORDS):
             return ("tool", "search_orders", {"order_id": order_id})
 
     # 退货政策：明确政策词（query 传用户原话，get_return_policy 走政策 RAG 检索）
-    if any(w in user_msg for w in _POLICY_WORDS):
+    if any(w in compact for w in _POLICY_WORDS):
         return ("tool", "get_return_policy", {"query": user_msg})
 
     # 总结意图（想对比多款）→ 反问澄清
-    if any(w in user_msg for w in _SUMMARIZE_WORDS):
+    if any(w in compact for w in _SUMMARIZE_WORDS):
         return ("summarize", None, None)
 
     # 浏览意图（无明确目标）→ 列分类概览；带明确类别（「有什么推荐的猫粮」）是检索该类别，回落 LLM
-    if any(w in user_msg for w in _BROWSE_WORDS) and not _has_category(user_msg):
+    if any(w in compact for w in _BROWSE_WORDS) and not _has_category(compact):
         return ("browse", None, None)
 
     return None
