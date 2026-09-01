@@ -65,3 +65,51 @@ async def chat(messages: list[dict], tools: Optional[list[dict]] = None, model: 
     """单轮对话，返回完整 message 对象（含 content 和 tool_calls）。兼容旧调用，不需要 usage 时用这个"""
     message, _ = await chat_with_usage(messages, tools, model, temperature)
     return message
+
+
+async def stream_events(messages: list[dict], tools: Optional[list[dict]] = None, model: Optional[str] = None, temperature: float = 0.0, max_tokens: Optional[int] = None):
+    """流式对话，产出事件序列：("text", delta) 逐 token 文本 + ("tool_calls", 完整累积列表)。
+
+    为什么要同时产出 text 和 tool_calls：agent 的 ReAct 循环无法预知某一轮是「决策」（返回
+    tool_calls）还是「最终答案」（返回 content），流式下必须边收 delta 边判断。text 逐 token
+    透出（答案轮），tool_calls 在流式结束后一次性产出完整累积（决策轮）。
+
+    流式 tool_calls 是增量分片（OpenAI 兼容）：delta.tool_calls[].function.arguments 是 JSON
+    分片，必须 += 拼接；function.name 只在首个 chunk 出现（后续为 None）。按 index 累积，
+    结束按 index 排序产出，返回 [{"id", "name", "arguments"}, ...] 简化结构。
+
+    注意：流式默认不返回 usage（token 计数），调用方按估算或记 0 处理。
+    """
+    if model is None:
+        model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    params = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": True,
+    }
+    if tools:
+        params["tools"] = tools
+    if max_tokens is not None:
+        params["max_tokens"] = max_tokens
+    stream = await get_client().chat.completions.create(**params)
+    tool_calls = {}  # index -> {"id", "name", "arguments"}
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta is None:
+            continue
+        if delta.content:
+            yield ("text", delta.content)
+        for tc in (delta.tool_calls or []):
+            acc = tool_calls.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
+            if tc.id:
+                acc["id"] = tc.id
+            if tc.function and tc.function.name:
+                acc["name"] = tc.function.name
+            if tc.function and tc.function.arguments:
+                acc["arguments"] += tc.function.arguments
+    if tool_calls:
+        ordered = [tool_calls[i] for i in sorted(tool_calls)]
+        yield ("tool_calls", ordered)

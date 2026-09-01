@@ -9,12 +9,15 @@ import sys
 import os
 import re
 import time
+import json
+import asyncio
 import threading
 from contextlib import asynccontextmanager
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from fastapi import FastAPI, HTTPException, Depends, Response
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
+from fastapi.responses import StreamingResponse
 
 # 确保项目根目录在 Python 路径中
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -301,6 +304,59 @@ def refund_order(payload: dict, _: None = Depends(_limit_write)):
     # 降级回退：MQ 不可用 → 同步落库（refund_amount 是订单金额）
     ticket = mq._create_refund_ticket(order_id, refund_amount)
     return {"status": "已受理", "message_id": None, "ticket_id": ticket["ticket_id"], "refund_amount": refund_amount}
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_read)):
+    """SSE 流式输出最终答案（text/event-stream，逐 token）。
+
+    客户端断开检测（踩坑修正）：
+      - 被动 CancelledError 不可靠：uvicorn 不会在客户端断开时立即 cancel 生成器 task，
+        实测客户端收 5 个 delta 断开后，服务端继续把完整答案生成完（Trace 耗时 21s）——
+        客户端走了服务端还在烧 token + 占连接。
+      - 正确做法 = 主动检测：每次 yield 后 await request.is_disconnected() 检查底层 socket
+        是否断开，断开就 break → async for 的隐式 aclose 逐层关闭 session.stream_chat →
+        _react_loop_stream → stream_events → 底层 LLM 流式连接，停止拉 token。
+      - CancelledError 保留作兜底（uvicorn 主动 cancel 生成器 task 时能接住）。
+    """
+    # 惰性 import：避免后端启动即加载 agent 的重依赖（只在 /chat/stream 请求时才加载）
+    from src.agent import AgentSession
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+    user_msg = payload.get("message")
+    if not isinstance(user_msg, str) or not user_msg.strip():
+        raise HTTPException(status_code=400, detail="缺少 message")
+    # 边界清洗：孤立代理等非法码点在流式链路（LLM/SSE）里一样会炸，进系统第一件事先降级
+    user_msg = user_msg.encode("utf-8", "replace").decode("utf-8")
+
+    session = AgentSession()
+
+    async def event_gen():
+        # 假流式（debug，零付费）：FAKE_STREAM=1 时用假内容 + sleep 模拟慢速流式，
+        # 专门验证「断开检测」机制，不真调 LLM。和 ENABLE_DEBUG_FAULT 同性质的调试能力。
+        if os.environ.get("FAKE_STREAM", "").strip().lower() in ("1", "true", "yes"):
+            try:
+                for i in range(500):
+                    yield f"data: {json.dumps({'delta': f'假内容第{i}段'}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.02)
+                    if await request.is_disconnected():
+                        print("客户端已断开，停止流式输出")
+                        return
+            except asyncio.CancelledError:
+                print("客户端已断开，停止流式输出")
+            return
+
+        try:
+            async for delta in session.stream_chat(user_msg):
+                yield f"data: {json.dumps({'delta': delta}, ensure_ascii=False)}\n\n"
+                if await request.is_disconnected():
+                    print("客户端已断开，停止流式输出")
+                    break
+        except asyncio.CancelledError:
+            # 兜底：uvicorn 主动 cancel 生成器 task 时能接住，同样让请求体面结束
+            print("客户端已断开，停止流式输出")
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 @app.post("/auth/token")

@@ -19,7 +19,7 @@ if _project_root not in sys.path:
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from src.infra.llm import chat_with_usage
+from src.infra.llm import chat_with_usage, stream_events
 from src.infra.observability import Trace, MetricsStore
 from src.tools import TOOL_SCHEMAS, TOOL_MAP, CATEGORY_KEYWORDS, WRITE_TOOLS
 from src.intent_router import route_by_rule
@@ -379,6 +379,133 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
     return "达到最大步数仍未得到答案，已停止。"
 
 
+async def _react_loop_stream(messages: list, trace: Trace = None):
+    """流式版 ReAct 循环：LLM 用流式调用，最终答案逐 token yield，工具调用后台执行。
+
+    镜像 _react_loop，只替换「LLM 调用」为流式 stream_events：
+      - 答案轮（无 tool_calls）：边收 delta 边 yield（逐 token 流式输出）
+      - 决策轮（有 tool_calls）：复用工具解析/死循环检测/写操作拦截/执行/回灌
+    关键假设：function calling 决策轮 content 通常为空，边收边 yield 不会把决策内容漏给用户；
+    决策轮若意外带 content，一并 yield（过渡话术，无害）。
+
+    流式默认无 usage：trace 的 token 计 0（token 观测待 stream_options 支持后再补）。
+    """
+    last_action = None
+    repeat_count = 0
+    called_write = set()
+
+    for step in range(MAX_STEPS):
+        print(f"📍 [step {step+1}] LLM 决策中（流式）...")
+        text_parts = []
+        tool_calls_list = []
+        t0 = time.perf_counter()
+        try:
+            async for ev in stream_events(messages, tools=TOOL_SCHEMAS, max_tokens=MAX_OUTPUT_TOKENS):
+                if ev[0] == "text":
+                    text_parts.append(ev[1])
+                    yield ev[1]  # 逐 token 流式输出
+                else:  # "tool_calls"
+                    tool_calls_list = ev[1]
+        except Exception as e:
+            # API 超时/网络错误：和 _react_loop 同规范，标记异常返回友好错误
+            if trace:
+                trace.end_reason = "异常"
+            yield f"系统异常：{type(e).__name__}"
+            return
+        elapsed = time.perf_counter() - t0
+        if trace:
+            trace.add_llm(step + 1, elapsed, 0, 0, 0, 0)
+
+        content_text = "".join(text_parts)
+
+        if not tool_calls_list:
+            # 答案轮：text 已边收边 yield，回填 assistant(content) 供后续轮次上下文用
+            if trace:
+                trace.end_reason = "正常"
+            messages.append({"role": "assistant", "content": content_text or "（空回复）"})
+            return
+
+        # 决策轮：回填 assistant(tool_calls)（content 为空则不带，对齐非流式 exclude_none=True）
+        assistant_msg = {"role": "assistant", "tool_calls": [
+            {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+            for tc in tool_calls_list
+        ]}
+        if content_text:
+            assistant_msg["content"] = content_text
+        messages.append(assistant_msg)
+
+        if len(tool_calls_list) > MAX_TOOL_CALLS_PER_TURN:
+            if trace:
+                trace.end_reason = "超工具数"
+            yield "一次请求内容过多，请收敛到具体某个问题。"
+            return
+
+        # 1. 串行做「参数解析 + 死循环检测 + 写操作占位」（镜像 _react_loop，tc 为 dict）
+        parsed = []
+        for tc in tool_calls_list:
+            name = tc["name"]
+            args = None
+            try:
+                args = json.loads(tc["arguments"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+            action_key = (name, json.dumps(args, sort_keys=True)) if args is not None else (name, "INVALID_JSON")
+            if action_key == last_action:
+                repeat_count += 1
+            else:
+                last_action, repeat_count = action_key, 1
+            if repeat_count >= 3:
+                if trace:
+                    trace.end_reason = "死循环"
+                yield "连续 3 次调用同一工具同一参数，判定死循环，已停止。"
+                return
+            blocked = False
+            if name in WRITE_TOOLS:
+                if action_key in called_write:
+                    blocked = True
+                else:
+                    called_write.add(action_key)
+            parsed.append((tc, args, blocked))
+
+        # 2. 并行执行工具（镜像 _react_loop 的 _exec，tc 为 dict）
+        async def _exec(item):
+            tc, args, blocked = item
+            name = tc["name"]
+            t0 = time.perf_counter()
+            if args is None:
+                result = f"错误：参数不是合法 JSON：{tc['arguments']}"
+            elif name not in TOOL_MAP:
+                result = f"错误：工具 {name} 不存在，可用工具：{list(TOOL_MAP)}"
+            elif blocked:
+                result = "该写操作本回合已执行过，为防重复提交（重复退款/重复工单）不再重复执行。请基于已执行结果回复用户，勿再次调用写工具。"
+            else:
+                try:
+                    result = await TOOL_MAP[name](**args)
+                except (TypeError, KeyError) as e:
+                    result = f"工具 {name} 参数不匹配：{e}"
+                except Exception as e:
+                    import traceback as _tb
+                    print(f"⚠️ 工具 {name} 执行异常（已降级）：{type(e).__name__}", file=sys.stderr)
+                    _tb.print_exc()
+                    result = f"工具 {name} 执行异常（{type(e).__name__}），请稍后重试或转人工。"
+            result = truncate(result)
+            elapsed = time.perf_counter() - t0
+            is_empty = any(sig in result for sig in _EMPTY_SIGNALS)
+            if trace:
+                trace.add_tool(name, elapsed, step + 1, is_empty)
+            return result
+
+        results = await asyncio.gather(*[_exec(item) for item in parsed])
+
+        # 3. 回灌（tool_call_id 一一对应，顺序不乱）
+        for (tc, _, _), result in zip(parsed, results):
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+    if trace:
+        trace.end_reason = "超步数"
+    yield "达到最大步数仍未得到答案，已停止。"
+
+
 # 全局指标聚合（进程内多次对话的统计：技术成功率 / P99 / 平均延迟 / 平均 token）
 METRICS = MetricsStore()
 
@@ -411,6 +538,34 @@ class AgentSession:
         METRICS.record(trace)
         print(trace)  # 每次对话打印 trace 摘要（可观测）
         return result
+
+    async def stream_chat(self, user_msg: str):
+        """流式一轮对话：逐 token yield 最终答案。
+
+        规则路由命中时本次非流式（复用现有非流式路径，一次性 yield 完整话术）；未命中走
+        _react_loop_stream（ReAct 循环流式）。规则路由话术流式列为后续。
+        """
+        self.messages.append({"role": "user", "content": user_msg})
+        trace = Trace()
+        self._last_trace = trace
+        await _compress_history(self.messages, MAX_HISTORY_TOKENS, trace)
+        routed = route_by_rule(user_msg)
+        if routed:
+            kind = routed[0]
+            if kind == "tool":
+                result = await _run_routed(self.messages, (routed[1], routed[2]), trace)
+            elif kind == "browse":
+                result = await _run_browse(self.messages, trace)
+            else:  # summarize
+                result = await _run_summarize(self.messages, trace)
+            METRICS.record(trace)
+            print(trace)
+            yield result
+            return
+        async for delta in _react_loop_stream(self.messages, trace):
+            yield delta
+        METRICS.record(trace)
+        print(trace)
 
     def get_last_trace(self) -> Trace:
         """返回最近一轮对话的 trace（只覆盖当前 session 的最近一次，跨轮取不到）"""
