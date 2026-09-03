@@ -310,14 +310,20 @@ def refund_order(payload: dict, _: None = Depends(_limit_write)):
 async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_read)):
     """SSE 流式输出最终答案（text/event-stream，逐 token）。
 
-    客户端断开检测（踩坑修正）：
-      - 被动 CancelledError 不可靠：uvicorn 不会在客户端断开时立即 cancel 生成器 task，
-        实测客户端收 5 个 delta 断开后，服务端继续把完整答案生成完（Trace 耗时 21s）——
-        客户端走了服务端还在烧 token + 占连接。
-      - 正确做法 = 主动检测：每次 yield 后 await request.is_disconnected() 检查底层 socket
-        是否断开，断开就 break → async for 的隐式 aclose 逐层关闭 session.stream_chat →
-        _react_loop_stream → stream_events → 底层 LLM 流式连接，停止拉 token。
-      - CancelledError 保留作兜底（uvicorn 主动 cancel 生成器 task 时能接住）。
+    客户端断开检测：由 Starlette 1.6 的 StreamingResponse 内置兜住，代码不重复造轮子。
+
+    踩坑复盘（2026-09-02 误判 → 2026-09-03 纠正）：
+      - 早先以为「客户端断开后服务端继续把答案生成完」要自己写检测，加了
+        request.is_disconnected()。但它不可靠：Starlette 1.6 用 anyio CancelScope(cs.cancel())
+        做「非阻塞 receive」，cancel 立即触发，await _receive() 还没等到 uvicorn 的
+        message_event 就被打断，永远拿不到 http.disconnect——这是死代码。
+      - 实际 Starlette 1.6 的 StreamingResponse.__call__ 已按 ASGI spec_version 分支处理断开：
+        spec < 2.4 用内置 listen_for_disconnect（start_soon 跑流式 + await listen_for_disconnect，
+        断开 cancel 整个 task_group）；spec >= 2.4 靠 ASGI 2.4 规范「send 到断开连接抛 OSError」
+        捕获。当前 uvicorn 0.52 发 spec_version 2.3，走 listen_for_disconnect 可靠分支
+        （FAKE_STREAM 假流式 + 原始 socket 断开实测：只发 3 段就停止）。
+      - 所以断开时 Starlette 主动 cancel 本生成器，这里只保留 CancelledError 兜底：接住让
+        请求体面结束（LLM 流已随 cancel 级联关闭，停止烧 token）。
     """
     # 惰性 import：避免后端启动即加载 agent 的重依赖（只在 /chat/stream 请求时才加载）
     from src.agent import AgentSession
@@ -332,28 +338,20 @@ async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_
     session = AgentSession()
 
     async def event_gen():
-        # 假流式（debug，零付费）：FAKE_STREAM=1 时用假内容 + sleep 模拟慢速流式，
-        # 专门验证「断开检测」机制，不真调 LLM。和 ENABLE_DEBUG_FAULT 同性质的调试能力。
-        if os.environ.get("FAKE_STREAM", "").strip().lower() in ("1", "true", "yes"):
-            try:
+        try:
+            # 假流式（debug，零付费）：FAKE_STREAM=1 时用假内容 + sleep 模拟慢速流式，
+            # 专门验证「断开检测」机制，不真调 LLM。和 ENABLE_DEBUG_FAULT 同性质的调试能力。
+            if os.environ.get("FAKE_STREAM", "").strip().lower() in ("1", "true", "yes"):
                 for i in range(500):
                     yield f"data: {json.dumps({'delta': f'假内容第{i}段'}, ensure_ascii=False)}\n\n"
                     await asyncio.sleep(0.02)
-                    if await request.is_disconnected():
-                        print("客户端已断开，停止流式输出")
-                        return
-            except asyncio.CancelledError:
-                print("客户端已断开，停止流式输出")
-            return
-
-        try:
+                print("假流式跑完 500 段（客户端未断开）")
+                return
             async for delta in session.stream_chat(user_msg):
                 yield f"data: {json.dumps({'delta': delta}, ensure_ascii=False)}\n\n"
-                if await request.is_disconnected():
-                    print("客户端已断开，停止流式输出")
-                    break
         except asyncio.CancelledError:
-            # 兜底：uvicorn 主动 cancel 生成器 task 时能接住，同样让请求体面结束
+            # Starlette 1.6 内置 listen_for_disconnect 检测到断开会 cancel 本生成器，
+            # 接住让请求体面结束；LLM 流已随 cancel 级联关闭，停止烧 token。
             print("客户端已断开，停止流式输出")
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
