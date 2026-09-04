@@ -15,7 +15,7 @@ data/ecommerce.db
 # 评测临时结果（baseline 定稿保留，其余临时产物不入库）
 tests/eval_results/answer_quality_after.json
 tests/eval_results/answer_quality_retest.json
-# 压测/fuzz/RRF 扫描的生成结果（脚本可重跑复现，数据已提炼进 ）
+# 压测/fuzz/RRF 扫描的生成结果（脚本可重跑复现）
 tests/eval_results/bench_backend.json
 tests/eval_results/bench_agent.json
 tests/eval_results/fuzz_report.json
@@ -33,7 +33,7 @@ dump.rdb
 CLAUDE.md
 .claude/
 references/
-docs//
+docs/backend-teaching/
 docs/deep-dive-points.md
 docs/asset-accumulation-plan.md
 # 学习/求职向文档（2026-09-04 增补，跟项目技术实现无关，不上传）
