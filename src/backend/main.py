@@ -138,24 +138,22 @@ def get_order(order_id: str, _: None = Depends(_limit_read)):
     if mode == "empty":
         return {}  # 合法 JSON 缺字段，触发工具层「数据异常」降级
     cache_key = f"ecom:order:{order_id}"
-    hit, data = cache.get_json(cache_key)
-    if hit:
-        if data is None:  # 命中空标记（不存在）
-            raise HTTPException(status_code=404, detail=f"未查到订单号 {order_id}")
-        return data
 
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT status, created_at, product, amount FROM orders WHERE order_id=%s", (order_id,))
-        row = cur.fetchone()
-    finally:
-        close_conn(conn)
-    if row is None:
-        cache.set_empty(cache_key, 30)  # 缓存空标记防穿透
+    def rebuild():
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT status, created_at, product, amount FROM orders WHERE order_id=%s", (order_id,))
+            row = cur.fetchone()
+        finally:
+            close_conn(conn)
+        if row is None:
+            return False, None
+        return True, {"order_id": order_id, "status": row[0], "created_at": row[1], "product": row[2], "amount": row[3]}
+
+    _, data = cache.get_or_rebuild(cache_key, 60, rebuild)
+    if data is None:  # 命中空标记（不存在）
         raise HTTPException(status_code=404, detail=f"未查到订单号 {order_id}")
-    data = {"order_id": order_id, "status": row[0], "created_at": row[1], "product": row[2], "amount": row[3]}
-    cache.set_json(cache_key, data, 60)
     return data
 
 
@@ -173,24 +171,22 @@ def get_logistics(order_id: str, _: None = Depends(_limit_read)):
     if mode == "empty":
         return {}  # 合法 JSON 缺字段，触发工具层「数据异常」降级
     cache_key = f"ecom:logistics:{order_id}"
-    hit, data = cache.get_json(cache_key)
-    if hit:
-        if data is None:
-            raise HTTPException(status_code=404, detail=f"未查到订单号 {order_id} 的物流信息")
-        return data
 
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT time, location, status FROM logistics WHERE order_id=%s ORDER BY time", (order_id,))
-        rows = cur.fetchall()
-    finally:
-        close_conn(conn)
-    if not rows:
-        cache.set_empty(cache_key, 30)
+    def rebuild():
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT time, location, status FROM logistics WHERE order_id=%s ORDER BY time", (order_id,))
+            rows = cur.fetchall()
+        finally:
+            close_conn(conn)
+        if not rows:
+            return False, None
+        return True, {"order_id": order_id, "traces": [{"time": r[0], "location": r[1], "status": r[2]} for r in rows]}
+
+    _, data = cache.get_or_rebuild(cache_key, 60, rebuild)
+    if data is None:
         raise HTTPException(status_code=404, detail=f"未查到订单号 {order_id} 的物流信息")
-    data = {"order_id": order_id, "traces": [{"time": r[0], "location": r[1], "status": r[2]} for r in rows]}
-    cache.set_json(cache_key, data, 60)
     return data
 
 
@@ -211,24 +207,22 @@ def get_product(product_id: str, _: None = Depends(_limit_read)):
     if mode == "empty":
         return {}  # 合法 JSON 缺字段，触发工具层「数据异常」降级
     cache_key = f"ecom:product:{product_id}"
-    hit, data = cache.get_json(cache_key)
-    if hit:
-        if data is None:
-            raise HTTPException(status_code=404, detail=f"未查到商品 {product_id}")
-        return data
 
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT name, price, qty FROM products WHERE product_id=%s", (product_id,))
-        row = cur.fetchone()
-    finally:
-        close_conn(conn)
-    if row is None:
-        cache.set_empty(cache_key, 30)
+    def rebuild():
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT name, price, qty FROM products WHERE product_id=%s", (product_id,))
+            row = cur.fetchone()
+        finally:
+            close_conn(conn)
+        if row is None:
+            return False, None
+        return True, {"product_id": product_id, "name": row[0], "price": row[1], "qty": row[2]}  # qty=0 是真实数据（缺货），正常缓存
+
+    _, data = cache.get_or_rebuild(cache_key, 30, rebuild)
+    if data is None:
         raise HTTPException(status_code=404, detail=f"未查到商品 {product_id}")
-    data = {"product_id": product_id, "name": row[0], "price": row[1], "qty": row[2]}  # qty=0 是真实数据（缺货），正常缓存
-    cache.set_json(cache_key, data, 30)
     return data
 
 

@@ -13,6 +13,11 @@ from urllib.parse import quote
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# 确保项目根目录在 Python 路径中（直跑 python tests/xxx.py 时 sys.path[0]=tests/）
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import httpx
 from src.backend import cache
 
@@ -53,7 +58,7 @@ def main():
     hit, data = cache.get_json("ecom:order:20240818001")
     assert hit and data and data.get("status") == "已发货", f"缓存未写入: hit={hit} data={data}"
     ttl = cache._redis.ttl("ecom:order:20240818001")
-    assert ttl is not None and 0 < ttl <= 60, f"TTL 异常: {ttl}"
+    assert ttl is not None and 0 < ttl <= 65, f"TTL 异常: {ttl}"  # 60 + ±5 雪崩抖动
     print(f"  ✅ 首次 miss 查 MySQL 后写缓存，TTL={ttl}s")
     r2 = get("/orders/20240818001")
     assert r2.status_code == 200 and r2.json() == r1.json(), "二次请求缓存返回不一致"
