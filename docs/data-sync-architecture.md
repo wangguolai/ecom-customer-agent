@@ -137,8 +137,6 @@
 
 ## 八、文档同步（改造后描述失真，需一并更新）
 
-- `docs/migration-assets.md`：「CATEGORY_KEYWORDS 硬编码 6 类」条目
-- `.md`：数据分治 / 架构演进相关条目（「硬编码→配置化」升级为「SSOT 三层架构」）
 - `docs/backend-pitfalls.md`：价格存两处的坑 → 标注已识别、待收敛
 - 编码规范自查：5 个新 .py 文件加 UTF-8 头 + `sys.stdout.reconfigure`
 

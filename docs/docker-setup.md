@@ -21,7 +21,7 @@ redis-1     Up (healthy)              0.0.0.0:6379->6379/tcp
 启动日志顺序 `mysql Started → Waiting → Healthy → backend Starting`，证明 `condition: service_healthy` 生效。
 本机另有 mysqld 占着宿主机 3306，backend 全程未连到它 —— 证明容器间走的是内部网络（服务名 `mysql:3306`）。
 
-**设计要点已归档到 `references/_BACKEND.md` 模块 7**，本文只留操作记录和环境踩坑。
+本文只留操作记录和环境踩坑。
 
 ## 模块 8 安全加固后的机器状态（2026-08-28）
 
@@ -189,6 +189,6 @@ docker system df                         # 看镜像/容器/卷占了多少磁�
 
 ## 部署要点
 
-已归档到 **`references/_BACKEND.md` → 模块 7 · 部署运维**（8 条，含 3 条 🔴 ）。
+
 
 本文只留操作步骤和环境踩坑，要点不在这里重复维护，避免两处漂移。

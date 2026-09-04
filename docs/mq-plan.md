@@ -1,6 +1,5 @@
 # 模块 4 · MQ 落地方案（退款工单异步化）
 
-> 学习定位：系统式（知识教学见 `/04-mq.md`），落地演示「解耦 / 削峰 / 异步 / 幂等消费」四概念。
 > demo 用 Redis list 模拟 MQ（复用模块 3 的 Redis），不引真 Kafka/RabbitMQ。
 > 方案经 plan-reviewer 审核，修了「MQ 键被 cache.flush() 误删」「降级回退路径未定义」两个阻塞项。
 

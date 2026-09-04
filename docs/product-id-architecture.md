@@ -85,7 +85,7 @@ LLM 查价格/库存的两步链路：
 | **`search` 4→5 元组解包三处** | `tests/eval_retrieval.py`、`src/tools.py`、`src/infra/hybrid_retriever.py` 自测 |
 | **接口探针连带** | `tests/test_redis_cache.py`（/stock 断言）、`tests/eval_answer_quality.py` 的 `_backend_up` 探针 |
 | 评测 | 回答质量评测回归（baseline 含第二价格引用，需重跑）；检索评测回归（raw_chunk 变 → embedding 变） |
-| docs | `architecture.md` / `data-sync-architecture.md` / `-mine.md` / `backend-pitfalls.md` / `category_synonyms.md` / 数据分治要点 |
+| docs | `architecture.md` / `data-sync-architecture.md` /  / `backend-pitfalls.md` / `category_synonyms.md` / 数据分治要点 |
 
 **ID 唯一性校验**（新增）：`refresh.py` 校验「ID 集合内唯一 + products.md 标题集合 ↔ `_SEED_PRODUCTS` product_id 双向一致」，防人工加漏/加重 ID 导致 products 表主键冲突、md↔seed 漂移。
 
@@ -106,4 +106,4 @@ LLM 查价格/库存的两步链路：
 - 不做商品增删改的运营后台（ID 在 products.md 人工维护，refresh 同步）
 - 订单的 order_id 仍是业务单号 VARCHAR 主键（合理，天然唯一，不是「乱定」）
 - orders 表不做 product_id 关联（订单 product 字段是「下单快照字符串」，非商品实体引用；「订单→商品实时价」场景 demo 没有，做了是过度设计）
-- **已知取舍（规范）**：问「5kg 装多少钱」会给主价 ¥89 顶替——SPU 粒度下「规格级价格」不存在，这是「答错」不是「拒答」。讲法：「demo 用 SPU 主价，SKU 级价格是生产建模（加 SKU 表 + 规格维度），当前主动承认只支持主价」。
+- **已知取舍（规范）**：问「5kg 装多少钱」会给主价 ¥89 顶替——SPU 粒度下「规格级价格」不存在，这是「答错」不是「拒答」。说明：「demo 用 SPU 主价，SKU 级价格是生产建模（加 SKU 表 + 规格维度），当前主动承认只支持主价」。

@@ -42,7 +42,7 @@ RRF 公式 `1/(k+rank_bm25) + 1/(k+rank_vec)`：
 ### 1.4 产出
 
 - 对比表落盘 `tests/eval_results/rrf_k_sweep.json`
-- 结论写 `references/.md`：k 的物理含义 + 实测敏感度 + 为什么最终仍选 60
+- k 的物理含义 + 实测敏感度 + 为什么最终仍选 60
 
 ---
 
@@ -146,7 +146,7 @@ order_id 含空格 / `#` / `?` / 换行时 URL 畸形，httpx 抛 `httpx.Invalid
 ### 3.4 产出
 
 失败项落 `tests/eval_results/fuzz_report.json`；抓到的 bug 修完重跑至全绿。
-要点写 `references/.md`（agent 线）/ `_BACKEND.md`（后端线）。
+
 
 ---
 

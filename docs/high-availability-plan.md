@@ -1,13 +1,12 @@
 # 模块 5 · 高可用 落地方案（plan-reviewer 审核后修订版）
 
-> 定位：🔴 ，系统设计环节 70% 在这。限流 / 熔断 / 降级 / 幂等四件套。
-> ：`docs//05-high-availability.md` | ：`docs/backend-fundamentals.md` 模块 5
+> 定位：🔴 核心，系统设计环节的关键。限流 / 熔断 / 降级 / 幂等四件套。
 > 落地三块：① 后端接口限流 ② agent 侧熔断 ③ 退款幂等系统化（状态机）
 > 本版吸收 plan-reviewer 审核结论（🔴1 阻塞 / 🟡1-7 建议 / 🟢1-8 补充），核心变更见「五、审核后修订记录」。
 
 ## 一、背景与现状
 
-| 现状 | 问题 | 对应 |
+| 现状 | 问题 | 对应方案 |
 |------|------|-------------|
 | `tools.py` 有 `REQUEST_TIMEOUT=2.0`，catch ConnectError/Timeout → 返回友好错误 | 每次请求都打后端，后端连续挂 100 次也照样等 2s——**只有超时，没有熔断** | 熔断三态 |
 | 后端接口（main.py）无限流 | 任何客户端可无限刷接口 | 限流三算法 |
@@ -61,7 +60,7 @@
 
 ### 核心变更：`UNIQUE(order_id, amount)` → `UNIQUE(order_id)`（DB 兜底，不用「先查后插」）
 
-plan-reviewer 🔴1 抓出：方案原写「`_validate_refund` 查该订单是否有非 rejected 工单，有则拒绝」是 **check-then-act，无 DB 约束兜底**——两个不同金额的并发退款（退 50 + 退 80）都先查库都通过，都插入 → 同订单两条进行中工单，「一个订单一个工单」不变量被打破。这正是模块 2 自己记的坑（`_BACKEND.md` 坑 3：先查后插有并发竞态，改唯一约束让数据库兜底）。
+plan-reviewer 🔴1 抓出：方案原写「`_validate_refund` 查该订单是否有非 rejected 工单，有则拒绝」是 **check-then-act，无 DB 约束兜底**——两个不同金额的并发退款（退 50 + 退 80）都先查库都通过，都插入 → 同订单两条进行中工单，「一个订单一个工单」不变量被打破。这正是模块 2 自己记的坑。
 
 **解法**：把唯一约束从 `UNIQUE(order_id, amount)` 改成 `UNIQUE(order_id)`——「一个订单一个工单」由数据库硬兜底，幂等从「先查后插」升级成「撞键兜底」，和项目哲学一致：
 
@@ -119,7 +118,6 @@ plan-reviewer 🔴1 抓出：方案原写「`_validate_refund` 查该订单是�
 | `tests/test_ratelimit.py` | 新增：限流测试（常驻回归，对齐 test_mq.py） |
 | `tests/test_circuit_breaker.py` | 新增：熔断测试（常驻回归） |
 | `tests/test_refund_state_machine.py` | 新增：状态机测试（常驻回归） |
-| `_BACKEND.md` | 补模块 5 要点 |
 
 ## 七、测试验证
 
@@ -127,7 +125,7 @@ plan-reviewer 🔴1 抓出：方案原写「`_validate_refund` 查该订单是�
 2. 熔断：模拟后端连续失败 5 次 → 第 6 次快速失败（不真调）；冷却后半开试探成功 → 恢复（注入时钟）
 3. 状态机：pending→approved→refunded 正常；非法流转（refunded→approved）返回 409（条件 UPDATE affected rows=0）；同订单不同金额二次退款撞 `UNIQUE(order_id)` 拒绝
 
-## 八、要点（记 _BACKEND.md）
+## 八、要点
 
 - 限流三算法 tradeoff（令牌桶允许突发 / 漏桶强制匀速 / 滑动窗口精确封顶），为什么客服场景选滑动窗口（令牌桶无法严格封顶）
 - 熔断三态 + 熔断 vs 降级区别 + 「4xx 不算失败、5xx 算、200 垃圾响应也算」的边界
