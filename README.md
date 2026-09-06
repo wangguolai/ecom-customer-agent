@@ -1,83 +1,148 @@
 # 电商客服 Agent
 
-> 独立新项目。目标：AI Agent 岗。
-> 这不是练手玩具，每个深挖问题都要有真东西可讲。
+一个从 0 到 1 实现的电商客服智能体，覆盖「意图识别 → 工具调用 → RAG → 多轮对话 → 转人工」完整链路。核心卖点是**生产级工程能力**，而不是「调 API 跑通对话」——手写 ReAct 循环、混合检索 + Rerank、后端横切组件（幂等 / 缓存 / 限流 / 熔断 / 鉴权）、Prompt Injection 多层防御。
 
-## 项目定位
+## 核心能力
 
-电商客服 Agent，覆盖「意图识别 → 工具调用 → RAG → 多轮对话 → 转人工」完整链路。
+### 1. 手写 ReAct 循环（不套框架）
 
-## 北极星目标
+刻意不用 LangChain / LangGraph，手写 `Thought → Action → Observation` 循环，理解「LLM 只输出 JSON 指令、代码才真正执行」的本质。循环内处理五类生产坑：
 
-门槛不是「会调 API」，是「整体架构 + 拆任务 + 做规划」。本项目要覆盖三大主线：
+| 生产坑 | 防御 |
+|--------|------|
+| 死循环 | 连续相同动作检测 + 最大步数上限 |
+| 幻觉工具调用 | 工具名白名单校验，未知直接报错 |
+| 上下文污染 | 滑动窗口截断 + 摘要压缩 |
+| Token 爆炸 | 工具返回截断 + 分页 |
+| Prompt Injection | 数据/指令分离 + 写权限开关 + 出网白名单 + 沙箱降权（四层防御） |
 
-| 主线 | 内容 | 验收 |
-|------|------|------|
-| **工具调用 / ReAct** | 能手写 Thought→Action→Observation 循环，说明「LLM 只输出 JSON 指令、代码才真正执行」 | 工具调用 ≥3 个真实工具 + 幻觉工具校验 |
-| **RAG Pipeline** | 混合检索（BM25+向量）+ Rerank + 切割策略 | 不止「用了向量库」 |
-| **系统设计** | 能画架构图，说明技术选型为什么这么选 | 架构图 + 选型理由 |
+### 2. RAG 混合检索 + Rerank
 
-## 五类生产坑（要真实踩到并解决）
+- 检索链：类别预过滤 → BM25 + 向量双路召回 → RRF 融合 → BGE-Reranker 精排
+- 召回策略「召回优先、拒答兜底」：四维置信度（双高 / 单高一致 / 单高冲突 / 双低）映射不同策略
+- 数据分治：静态属性（材质/规格/品牌）进向量库，动态属性（价格/库存/订单/物流）走工具实时查
+- 增量更新：稳定 chunk_id 做锚点，新增/修改/删除/不变四分支 diff，更新后集合对账防漂移
 
-「踩过什么坑」是绕不开的问题。做本项目时几乎必然撞上，撞上就解决、就记录：
+### 3. 后端横切组件（FastAPI + MySQL + Redis）
 
-1. **死循环** —— 工具失败反复重试 → 最大步数限制 + 连续相同动作检测
-2. **幻觉工具调用** —— LLM 调不存在的工具 → 严格校验工具名，未知直接报错
-3. **上下文污染** —— 历史对话影响当前判断 → 上下文截断 + 任务重置
-4. **Token 爆炸** —— 工具返回超大数据 → 输出截断 + 分页
-5. **Prompt Injection** —— 外部数据含恶意指令 → 数据/指令分离，代码级限制
+- **MySQL**：连接池 + 唯一约束幂等（并发双请求只产生 1 工单）
+- **Redis**：Cache Aside 缓存 + 空值哨兵防穿透 + 互斥锁防击穿 + TTL 抖动防雪崩 + 降级
+- **MQ**：Redis List 模拟，退款工单异步削峰 + 幂等消费 + 降级回退同步
+- **高可用**：滑动窗口限流（read/write/auth 三桶）+ 三态熔断 + 退款状态机（条件 UPDATE 乐观锁）
+- **安全**：手写 HS256 JWT 鉴权 + 出网白名单 + 容器降权（非 root + cap_drop ALL）
 
-## 项目完成标准
+### 4. 评测与可观测
 
-> ⚠️ 2026-08-21 校准：原清单是「demo 级」，5 天做完 ≠ 生产级。真实生产级岗（3-5 年）要「后端基础盘 + 生产级深度」。
-> ⚠️ 2026-08-26 同步：后端入门 3 模块（asyncio/MySQL/Redis）+ 后端进阶 2 模块（MQ/高可用）已落地，基础线 9 项全做完。当前 gap 是「后端进阶（分布式）+ 系统设计 + 真实上线量化」——即进阶线。
+- 检索层（Recall@3 + MRR）+ 回答层（accuracy + faithfulness 结构化下沉）两层评测
+- 坏 case 数据飞轮：评测失败自动回流成回归集
+- 自研 Trace（单次埋点）+ MetricsStore（聚合指标）+ 故障注入 + Fuzzing
 
-### 基础线（agent 骨架 + 后端入门）
+## 架构
 
-agent 骨架（6 项，已做）：
-- [x] 工具调用 ≥3 个真实工具，处理了幻觉工具调用校验
-- [x] RAG 上了混合检索 + Rerank（不是只有向量检索）
-- [x] 多轮对话有记忆，处理了上下文污染/截断
-- [x] 踩过并解决 ≥3 个生产坑，每个能讲「现象→定位→解决」
-- [x] 有一个量化数据（准确率 / 延迟 / 成本，随便哪个）
-- [x] 能画出架构图，说明「为什么用这个框架不用那个」
+```
+用户问题（自然语言）
+        ↓
+AgentSession（多轮会话 + token 预算 + 摘要压缩）
+        ↓
+意图路由（规则优先命中高频命令，长尾/模糊 LLM 兜底）
+        ↓
+ReAct 循环（LLM 决策 → 工具 → 回灌，max 8 步）
+        ↓
+工具层（8 个 Function Calling 工具）
+        ↓                        ↓
+RAG 检索（混合）          FastAPI 后端（真实数据源）
+BM25+向量+RRF+Rerank      /orders /logistics /products /refund
+                           MySQL + Redis 横切组件
+```
 
-后端入门（3 项，已做，补齐）：
-- [x] asyncio 异步：把 agent 从同步改异步，说明协程 / 事件循环 / GIL（踩了懒加载单例并发竞态 → 双重检查锁）
-- [x] MySQL：索引（B+树 / 联合索引 / 最左前缀）、事务（ACID / 隔离级别 / MVCC）（SQLite→MySQL，连接池 + 唯一约束幂等 + 二级索引）
-- [x] Redis：缓存一致性、击穿 / 穿透 / 雪崩、分布式锁（Cache Aside + 空值哨兵 + 降级）
-
-### 进阶线（生产级 + 后端进阶 + 系统设计）
-
-agent 生产级（原 4 项「升级」，当前是 demo 级）：
-- [x] 可观测性：手写 Trace + MetricsStore（demo 级）→ 需接 OTel/LangSmith + 告警
-- [ ] 评测体系：Agent Eval 完整版（LLM-as-judge + 回归集）
-- [x] 成本优化：上下文压缩（demo 级，预算 2000 是负收益）→ 需模型路由 + 缓存 + 真实正收益
-- [x] 安全：Prompt Injection demo 级防御 → 需生产级（沙箱 + human-in-the-loop + 审计）
-
-后端进阶（进行中）：
-- [x] 高可用：限流 / 熔断 / 降级 / 幂等（滑动窗口限流 + 三态熔断 + 退款状态机 + 条件 UPDATE 乐观锁；负载均衡偏认知未落地）
-- [x] 消息队列：削峰 / 解耦 / 可靠性（Redis list 模拟 MQ，退款工单异步化 + 幂等消费 + 降级）
-- [ ] 分布式：CAP / 一致性 / 分布式锁
-
-系统设计（未做）：
-- [ ] 高并发架构：10 万并发怎么设计
-- [ ] 容量估算、性能优化
-
-真实量化（未做）：
-- [ ] 一个真实上线 + 准确率 / 延迟 / 成本的真实数字（不是自测 demo 数据）
+数据流采用 SSOT 三层架构：`源数据（products.md / seed.py）→ 实体层（Domain）→ 派生层（向量库 / BM25 / 词典 / 白名单 / MySQL / Redis）`，单向流动，派生可重建。
 
 ## 技术栈
 
-- 编排：手写 ReAct 循环（不用 LangGraph/LangChain，理由见 docs/framework-selection.md）
-- RAG：Qdrant + 混合检索（BM25+向量+RRF）+ Rerank
-- 后端：FastAPI + MySQL（订单/物流/库存真实数据源，连接池 + 唯一约束幂等）
-- 缓存：Redis（Cache Aside 读缓存 + 空值哨兵防穿透 + 互斥锁防击穿 + TTL 抖动防雪崩 + 降级，减轻 MySQL 读压力）
-- 接口：FastAPI（SSE 流式是规划、未落地）
-- 模型：DeepSeek（Kimi 等多模型分工是规划、未落地）
-- 语言：Python
+| 层 | 选型 |
+|----|------|
+| LLM | DeepSeek（deepseek-chat） |
+| Agent 编排 | 手写 ReAct（不用 LangChain / LangGraph） |
+| Embedding | BGE-small-zh-v1.5（512 维，本地） |
+| Rerank | BGE-Reranker-v2-m3（CrossEncoder，CUDA 加速） |
+| 向量库 | Qdrant（本地文件模式） |
+| 后端 | FastAPI + MySQL 8.0 + Redis |
+| 语言 | Python 3.13 |
 
-## 与过来Agent 的边界
+## 快速开始
 
-本项目是独立项目，不复用过来Agent 的业务层（视频导演/生图生视频规则）。
-只平移通用层：Qdrant 知识库基础设施、多模型分工经验、编码/git/调研等通用规则。
+### 环境要求
+
+- Python 3.13
+- MySQL 8.0、Redis 6+
+- DeepSeek API Key
+
+### 方式一：Docker（推荐）
+
+后端 + MySQL + Redis 用 Docker Compose 起，agent/RAG 链路（需要 torch）留在宿主机：
+
+```bash
+# 1. 起 MySQL + Redis + 后端（三容器）
+docker compose up -d
+
+# 2. 安装 agent/RAG 依赖（宿主机）
+pip install -r requirements.txt
+
+# 3. 配置 .env（参考下方「环境变量」）
+cp .env.example .env   # 填入 DEEPSEEK_API_KEY 等
+
+# 4. 初始化数据（重建 MySQL seed + 向量库）
+python -m src.refresh
+
+# 5. 跑内置 demo（商品咨询 + 订单查询两个示例）
+python -m src.agent
+```
+
+### 方式二：全本机
+
+```bash
+pip install -r requirements.txt
+
+# 本机起好 MySQL / Redis 后，配 .env
+python -m src.refresh                       # 初始化数据
+uvicorn src.backend.main:app --port 8000    # 起后端（另开终端）
+python -m src.agent                         # 跑 agent demo
+```
+
+### 环境变量（`.env`）
+
+| 变量 | 说明 | 默认 |
+|------|------|------|
+| `DEEPSEEK_API_KEY` | 必填，DeepSeek API Key | — |
+| `DEEPSEEK_BASE_URL` | API 地址 | 官方默认 |
+| `DEEPSEEK_MODEL` | 模型名 | `deepseek-chat` |
+| `MYSQL_HOST` / `MYSQL_PORT` | MySQL 地址 | `127.0.0.1` / `3306` |
+| `MYSQL_USER` / `MYSQL_PASSWORD` | MySQL 账号 | `root` / 空 |
+| `REDIS_HOST` / `REDIS_PORT` | Redis 地址 | `127.0.0.1` / `6379` |
+| `AUTH_SECRET` | JWT 签名密钥（生产必须改） | `dev-only-secret-change-me` |
+| `BACKEND_URL` | agent 连后端的地址 | `http://localhost:8000` |
+
+## 量化结果
+
+| 指标 | 数值 |
+|------|------|
+| 混合检索 Recall@3 | 0.57 → **0.97**（推翻 Rerank 绝对阈值误杀口语 query） |
+| Rerank 延迟 | 170ms → **16ms**（torch CPU → CUDA） |
+| 后端压测 | 限流器先于连接池成为并发瓶颈（每请求 4 次 Redis 往返） |
+| Fuzzing | 后端 163 断言 + 工具 210 断言，抓到「孤立代理三连炸」真实边界 bug |
+
+## 目录结构
+
+```
+src/
+├── agent.py            # ReAct 循环 + 意图路由 + 多轮会话
+├── rag_pipeline.py     # RAG 生成链路
+├── intent_router.py    # 规则优先、LLM 兜底的路由层
+├── tools.py            # 8 个 Function Calling 工具
+├── refresh.py          # 统一数据重建入口（SSOT → 派生）
+├── index_products.py   # 向量库全量/增量索引
+├── infra/              # 基础设施（embedding/rerank/向量库/LLM/可观测）
+├── domain/             # 实体层（products/policies schema）
+├── derived/            # 派生层（白名单/类别/词典）
+└── backend/            # FastAPI 后端（MySQL/Redis/MQ/限流/熔断/鉴权）
+```
