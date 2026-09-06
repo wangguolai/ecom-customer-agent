@@ -77,8 +77,22 @@ def build_knowledge_base():
     store.delete_by_source("product_knowledge", "policies.md")
     store.upsert_knowledge(payloads, vectors)
 
-    info = store.collection_info("product_knowledge")
-    print(f"✅ 全量重建完成：product_knowledge {info['points_count']} points（商品 {len(products)} + 政策 {len(policies)}）")
+    # 对账：重建后库内 chunk_id 集合必须 == 源数据 chunk_id 集合。全量重建的静默失败风险
+    # 和增量更新同源——delete_by_source 没删干净（残留旧 chunk）、embedding 失败、upsert 漏写，
+    # 都会让集合漂移。和 update_knowledge_base 用同一套集合对账。
+    actual_ids = {cid for cid, _, _, _, _, _ in store.scroll_all()}
+    desired_ids = {p["chunk_id"] for p in payloads}
+    if actual_ids != desired_ids:
+        missing = sorted(desired_ids - actual_ids)
+        extra = sorted(actual_ids - desired_ids)
+        store.close()  # 先释放文件锁再抛错，否则本地模式文件锁泄漏
+        raise RuntimeError(
+            f"全量重建对账失败：源数据 {len(desired_ids)} 条，向量库实际 {len(actual_ids)} 条。"
+            f"缺 {len(missing)} 条 {missing}，多 {len(extra)} 条 {extra}。"
+            f"请检查 delete_by_source / upsert 是否静默失败后重跑。"
+        )
+
+    print(f"✅ 全量重建完成：product_knowledge {len(actual_ids)} points（商品 {len(products)} + 政策 {len(policies)}），对账通过。")
     store.close()  # 显式释放文件锁，允许同进程后续再开新实例（不靠进程退出 atexit 兜底）
 
 
@@ -122,20 +136,31 @@ def update_knowledge_base():
         if cid not in desired:
             to_delete.append(cid)              # 删除（源里没了 = 下架）
 
-    if not to_upsert and not to_delete:
-        print("✅ 增量更新：无变化，跳过。")
-        store.close()  # 显式释放文件锁，允许同进程后续再开新实例（不靠进程退出 atexit 兜底）
-        return
-
     if to_upsert:
         vectors = embed_texts([p["text"] for p in to_upsert])
         store.upsert_knowledge(to_upsert, vectors)
     if to_delete:
         store.delete_by_chunk_ids("product_knowledge", to_delete)
 
-    info = store.collection_info("product_knowledge")
-    print(f"✅ 增量更新完成：新增/修改 {len(to_upsert)}，删除 {len(to_delete)}，不变 {unchanged}。"
-          f"库内共 {info['points_count']} points。")
+    # 对账：更新后库内 chunk_id 集合必须 == 源数据 chunk_id 集合，不一致说明 upsert/delete
+    # 静默失败（漂移）。点数对账只抓「漏增漏删」，集合对账还能抓「删错一个又插错一个、
+    # 总数碰巧相等」的错位——demo 规模 scroll 很便宜，直接上集合对账。
+    # 即使「无变化」也走对账：历史遗留的漂移（上次更新漏删/漏插）这次也能抓出来。
+    actual_ids = {cid for cid, _, _, _, _, _ in store.scroll_all()}
+    desired_ids = set(desired.keys())
+    if actual_ids != desired_ids:
+        missing = sorted(desired_ids - actual_ids)
+        extra = sorted(actual_ids - desired_ids)
+        store.close()  # 先释放文件锁再抛错，否则本地模式文件锁泄漏
+        raise RuntimeError(
+            f"增量更新对账失败：源数据 {len(desired_ids)} 条，向量库实际 {len(actual_ids)} 条。"
+            f"缺 {len(missing)} 条 {missing}，多 {len(extra)} 条 {extra}。"
+            f"请检查 upsert/delete 是否静默失败后重跑。"
+        )
+
+    action = (f"新增/修改 {len(to_upsert)}，删除 {len(to_delete)}，不变 {unchanged}"
+              if (to_upsert or to_delete) else "无变化")
+    print(f"✅ 增量更新完成：{action}。对账通过：库内 {len(actual_ids)} == 源数据 {len(desired_ids)}。")
     store.close()  # 显式释放文件锁，允许同进程后续再开新实例（不靠进程退出 atexit 兜底）
 
 
