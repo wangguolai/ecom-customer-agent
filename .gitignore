@@ -43,3 +43,8 @@ docs/backend-plan.md
 docs/migration-assets.md
 # 旧 README 的完成标准/路线图（项目往下做的规划，内部用）
 docs/project-roadmap.md
+
+# 爬虫登录凭证 + 临时生成物（不提交）
+scripts/jd_cookies.json
+scripts/seed_snippet.txt
+scripts/smzdm_products.json

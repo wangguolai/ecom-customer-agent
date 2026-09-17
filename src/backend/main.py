@@ -17,7 +17,8 @@ from contextlib import asynccontextmanager
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from fastapi import FastAPI, HTTPException, Depends, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 # 确保项目根目录在 Python 路径中
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -81,6 +82,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="电商客服后端", lifespan=lifespan)
+
+
+# 商品图静态服务（图片本体在 data/product_images，前端通过 /product_images/{file} 加载）
+app.mount("/product_images", StaticFiles(directory=os.path.join(_project_root, "data", "product_images")), name="product_images")
+
+
+# 前端对话页面（web/index.html）
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(os.path.join(_project_root, "web", "index.html"))
 
 
 # ── 限流依赖（模块 5）──
@@ -343,6 +354,12 @@ async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_
                 return
             async for delta in session.stream_chat(user_msg):
                 yield f"data: {json.dumps({'delta': delta}, ensure_ascii=False)}\n\n"
+            # 流式结束：把本轮检索命中的商品图作为单独事件发给前端渲染（图不进 LLM 文本）
+            from src.tools import pop_collected_images
+            images = pop_collected_images()
+            if images:
+                yield f"data: {json.dumps({'images': images}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
             # Starlette 1.6 内置 listen_for_disconnect 检测到断开会 cancel 本生成器，
             # 接住让请求体面结束；LLM 流已随 cancel 级联关闭，停止烧 token。

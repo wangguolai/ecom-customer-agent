@@ -337,7 +337,7 @@ def _get_return_policy_sync(query: str) -> str:
     if label == "双低" or not results:
         return RETURN_POLICY
     parts = []
-    for i, (cid, score, text, title, product_id) in enumerate(results, 1):
+    for i, (cid, score, text, title, product_id, _image) in enumerate(results, 1):
         parts.append(f"[{i}] {title}\n{text}")
     hits_text = "\n\n".join(parts)
     return f"[来源: 退货政策]\n{hits_text}\n\n{RETURN_POLICY}"
@@ -484,6 +484,43 @@ STRATEGY_HINTS = {
 }
 
 
+# 本轮对话检索命中的商品图（模块级收集器：search_products 命中即收集，agent 每轮对话结束后
+# 由 pop_collected_images 读取并清空）。图片是「展示层数据」，不进 LLM 文本（LLM 只处理语义，
+# 图片路径对它是噪声），由 agent 在流式输出前/后单独发给前端渲染。
+_collected_images = []
+
+
+def _record_images(results):
+    """从检索结果收集商品图（去重），供展示层渲染。results 是六元组 (cid, score, text, title, product_id, image)。
+
+    图必须带「介绍」——光图没文字是废的，用户不知道这商品是什么/有什么特点。
+    从 chunk 文本里抽「特点」行（没有则抽「类别」）作为 intro，和图一起给前端，保证「商品↔图↔介绍」一一对应。
+    """
+    for r in results:
+        if len(r) > 5 and r[5]:
+            intro = ""
+            for line in r[2].split("\n"):
+                if line.startswith("- 特点："):
+                    intro = line[4:].strip()  # 「特点：xxx」
+                    break
+            if not intro:
+                for line in r[2].split("\n"):
+                    if line.startswith("- 类别："):
+                        intro = line[4:].strip()  # 「类别：狗粮」
+                        break
+            item = {"product_id": r[4], "title": r[3], "image": r[5], "intro": intro}
+            if item not in _collected_images:
+                _collected_images.append(item)
+
+
+def pop_collected_images():
+    """读取并清空本轮收集的商品图（agent 每轮对话结束后调用）"""
+    global _collected_images
+    imgs = list(_collected_images)
+    _collected_images = []
+    return imgs
+
+
 def _search_products_sync(query: str, top_k: int) -> str:
     """search_products 的同步实现。embedding + rerank 是 CPU/GPU 密集，丢线程池跑（to_thread），不阻塞事件循环。"""
     category = detect_category(query)
@@ -492,8 +529,9 @@ def _search_products_sync(query: str, top_k: int) -> str:
     if label == "双低":
         return "知识库检索无高置信度匹配。请如实告知用户暂未找到相关信息、可建议联系人工客服，不要编造商品信息。"
 
+    _record_images(results)  # 商品图单独收集，供前端渲染（不进 LLM 文本）
     parts = []
-    for i, (cid, score, text, title, product_id) in enumerate(results, 1):
+    for i, (cid, score, text, title, product_id, image) in enumerate(results, 1):
         parts.append(f"[{i}] {title}（product_id: {product_id}）\n{text}")
 
     # 策略提示（系统生成的受信任指令）+ 检索结果（外部数据），分开标注，不混进「数据/指令分离」的防御里

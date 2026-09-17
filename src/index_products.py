@@ -41,6 +41,7 @@ def _build_payloads():
             "source_file": "products.md",
             "chunk_index": i,
             "product_id": p.id,  # 稳定实体 ID，打通「向量检索 → MySQL 查价」链路
+            "image": p.image,    # 商品图相对路径（product_images/P001.jpg），检索命中随 payload 返回
             "kb_type": "product",
         })
     for i, p in enumerate(policies):
@@ -80,7 +81,7 @@ def build_knowledge_base():
     # 对账：重建后库内 chunk_id 集合必须 == 源数据 chunk_id 集合。全量重建的静默失败风险
     # 和增量更新同源——delete_by_source 没删干净（残留旧 chunk）、embedding 失败、upsert 漏写，
     # 都会让集合漂移。和 update_knowledge_base 用同一套集合对账。
-    actual_ids = {cid for cid, _, _, _, _, _ in store.scroll_all()}
+    actual_ids = {cid for cid, _, _, _, _, _, _ in store.scroll_all()}
     desired_ids = {p["chunk_id"] for p in payloads}
     if actual_ids != desired_ids:
         missing = sorted(desired_ids - actual_ids)
@@ -120,7 +121,7 @@ def update_knowledge_base():
     store.ensure_collections()
 
     # 库内现状：{chunk_id: text}（scroll_all 返回 (chunk_id, text, title, category, product_id, kb_type)）
-    existing = {cid: text for cid, text, _, _, _, _ in store.scroll_all()}
+    existing = {cid: text for cid, text, _, _, _, _, _ in store.scroll_all()}
 
     to_upsert = []   # 新增 + 修改
     to_delete = []   # 删除（下架）
@@ -146,7 +147,7 @@ def update_knowledge_base():
     # 静默失败（漂移）。点数对账只抓「漏增漏删」，集合对账还能抓「删错一个又插错一个、
     # 总数碰巧相等」的错位——demo 规模 scroll 很便宜，直接上集合对账。
     # 即使「无变化」也走对账：历史遗留的漂移（上次更新漏删/漏插）这次也能抓出来。
-    actual_ids = {cid for cid, _, _, _, _, _ in store.scroll_all()}
+    actual_ids = {cid for cid, _, _, _, _, _, _ in store.scroll_all()}
     desired_ids = set(desired.keys())
     if actual_ids != desired_ids:
         missing = sorted(desired_ids - actual_ids)

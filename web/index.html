@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>宠物电商客服 Agent</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f5f6f7; display: flex; flex-direction: column; height: 100vh;
+}
+.header {
+    background: linear-gradient(135deg, #2b5876, #4e4376); color: #fff;
+    padding: 14px 20px; font-size: 1.1em; font-weight: 600; flex-shrink: 0;
+}
+.header small { font-weight: 400; opacity: .8; margin-left: 10px; }
+.chat {
+    flex: 1; overflow-y: auto; padding: 16px; max-width: 860px; width: 100%; margin: 0 auto;
+}
+.msg { margin-bottom: 16px; display: flex; gap: 10px; }
+.msg.user { justify-content: flex-end; }
+.bubble {
+    max-width: 78%; padding: 10px 14px; border-radius: 12px; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-word; font-size: .95em;
+}
+.msg.user .bubble { background: #4e4376; color: #fff; border-bottom-right-radius: 3px; }
+.msg.assistant .bubble { background: #fff; color: #333; border: 1px solid #e5e6e8; border-bottom-left-radius: 3px; }
+.avatar {
+    width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; font-size: 1.1em;
+}
+.msg.user .avatar { background: #dfe4ea; }
+.msg.assistant .avatar { background: #e8f0fe; }
+.images { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.images figure { width: 140px; text-align: center; }
+.images img {
+    width: 140px; height: 140px; object-fit: cover; border-radius: 10px;
+    border: 1px solid #e5e6e8; cursor: zoom-in; background: #fff;
+}
+.images figcaption { font-size: .72em; color: #888; margin-top: 4px; line-height: 1.4; }
+.product-intro { display: block; color: #4e4376; margin-top: 2px; font-size: .95em; }
+.input-area {
+    flex-shrink: 0; padding: 12px 16px; background: #fff; border-top: 1px solid #e5e6e8;
+    display: flex; gap: 10px; max-width: 860px; width: 100%; margin: 0 auto;
+}
+.input-area input {
+    flex: 1; padding: 10px 14px; border: 1px solid #d0d3d8; border-radius: 8px; font-size: .95em; outline: none;
+}
+.input-area input:focus { border-color: #4e4376; }
+.input-area button {
+    padding: 10px 22px; background: #4e4376; color: #fff; border: none; border-radius: 8px;
+    font-size: .95em; cursor: pointer; transition: background .2s;
+}
+.input-area button:hover { background: #3b3360; }
+.input-area button:disabled { background: #b0aec4; cursor: default; }
+/* 大图浮层 */
+.lightbox {
+    position: fixed; inset: 0; background: rgba(0,0,0,.8); display: none;
+    align-items: center; justify-content: center; z-index: 999;
+}
+.lightbox img { max-width: 90vw; max-height: 90vh; border-radius: 8px; }
+</style>
+</head>
+<body>
+<div class="header">🐾 宠物电商客服 Agent <small>真实商品库 · 162 个商品 · 混合检索 + Rerank</small></div>
+<div class="chat" id="chat"></div>
+<div class="input-area">
+    <input id="msg" placeholder="问点什么：幼犬吃什么粮？有肠胃敏感的猫粮吗？" onkeydown="if(event.key==='Enter')send()">
+    <button id="send-btn" onclick="send()">发送</button>
+</div>
+<div class="lightbox" id="lightbox" onclick="this.style.display='none'"><img id="lightbox-img" src=""></div>
+
+<script>
+const chatEl = document.getElementById('chat');
+const msgEl = document.getElementById('msg');
+const sendBtn = document.getElementById('send-btn');
+
+function addMsg(role) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    avatar.textContent = role === 'user' ? '🙂' : '🐾';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    div.appendChild(role === 'user' ? bubble : avatar);
+    div.appendChild(role === 'user' ? avatar : bubble);
+    chatEl.appendChild(div);
+    chatEl.scrollTop = chatEl.scrollHeight;
+    return bubble;
+}
+
+function renderImages(images, container) {
+    const box = document.createElement('div');
+    box.className = 'images';
+    for (const it of images) {
+        const fig = document.createElement('figure');
+        const img = document.createElement('img');
+        img.src = '/' + it.image;
+        img.alt = it.title || '';
+        img.onclick = () => {
+            document.getElementById('lightbox-img').src = img.src;
+            document.getElementById('lightbox').style.display = 'flex';
+        };
+        const cap = document.createElement('figcaption');
+        cap.textContent = it.title || '';
+        if (it.intro) {
+            const intro = document.createElement('span');
+            intro.className = 'product-intro';
+            intro.textContent = it.intro;
+            cap.appendChild(intro);
+        }
+        fig.appendChild(img); fig.appendChild(cap);
+        box.appendChild(fig);
+    }
+    container.appendChild(box);
+    chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+async function send() {
+    const msg = msgEl.value.trim();
+    if (!msg) return;
+    addMsg('user').textContent = msg;
+    msgEl.value = '';
+    sendBtn.disabled = true;
+    const bubble = addMsg('assistant');
+
+    try {
+        const resp = await fetch('/chat/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: msg }),
+        });
+        if (!resp.ok) {
+            bubble.textContent = '请求失败（HTTP ' + resp.status + '），请确认后端已启动。';
+            return;
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const events = buffer.split('\n\n');
+            buffer = events.pop();
+            for (const ev of events) {
+                for (const line of ev.split('\n')) {
+                    if (!line.startsWith('data: ')) continue;
+                    const data = line.slice(6);
+                    if (data === '[DONE]') continue;
+                    let obj;
+                    try { obj = JSON.parse(data); } catch (e) { continue; }
+                    if (obj.delta) {
+                        bubble.textContent += obj.delta;
+                        chatEl.scrollTop = chatEl.scrollHeight;
+                    }
+                    if (obj.images) {
+                        renderImages(obj.images, bubble);
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        bubble.textContent = '连接异常：' + e.message;
+    } finally {
+        sendBtn.disabled = false;
+    }
+}
+</script>
+</body>
+</html>

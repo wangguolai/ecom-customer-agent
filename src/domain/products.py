@@ -27,7 +27,8 @@ class Product:
     title: str          # 完整标题，含品牌括号，如「幼犬成长粮（皇家牌）」
     brand: str          # 品牌名，如「皇家牌」；无品牌为空字符串
     category: str       # 类别，如「狗粮」
-    raw_chunk: str      # 原始块文本（含「## 标题」开头，供向量化）
+    raw_chunk: str      # 原始块文本（含「## 标题」开头，供向量化；已剥离图片行）
+    image: str = ""     # 图片相对路径（product_images/P001.jpg）；不进向量，挂 payload 随检索返回
 
 
 def _chunk_markdown(text: str) -> list[str]:
@@ -51,8 +52,12 @@ def parse_products() -> list[Product]:
         category = cm.group(1).strip() if cm else ""
         im = re.search(r"ID：(\S+)", chunk)
         pid = im.group(1) if im else ""  # 缺 ID 会被 refresh 的唯一性校验抓出
+        imgm = re.search(r"图片：(\S+)", chunk)
+        image = imgm.group(1) if imgm else ""
+        # 图片路径不进向量（无语义，是噪声），从 raw_chunk 剥离，单独挂 payload
+        chunk_no_img = re.sub(r"- 图片：.+\n?", "", chunk)
         products.append(Product(
             id=pid, title=title, brand=brand, category=category,
-            raw_chunk=chunk,
+            raw_chunk=chunk_no_img, image=image,
         ))
     return products

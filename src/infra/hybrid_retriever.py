@@ -55,13 +55,14 @@ class HybridRetriever:
 
     def _build_bm25(self):
         """从 Qdrant scroll 出所有 chunk 建 BM25 索引，保证和向量库数据对齐"""
-        chunks = self._store.scroll_all()  # [(chunk_id, text, title, category, product_id, kb_type)]
-        self._chunk_ids = [cid for cid, _, _, _, _, _ in chunks]
-        self._chunk_texts = [text for _, text, _, _, _, _ in chunks]
-        self._chunk_titles = [title for _, _, title, _, _, _ in chunks]
-        self._chunk_categories = [cat for _, _, _, cat, _, _ in chunks]
-        self._chunk_product_ids = [pid for _, _, _, _, pid, _ in chunks]
-        self._chunk_kb_types = [kb for _, _, _, _, _, kb in chunks]
+        chunks = self._store.scroll_all()  # [(chunk_id, text, title, category, product_id, image, kb_type)]
+        self._chunk_ids = [cid for cid, _, _, _, _, _, _ in chunks]
+        self._chunk_texts = [text for _, text, _, _, _, _, _ in chunks]
+        self._chunk_titles = [title for _, _, title, _, _, _, _ in chunks]
+        self._chunk_categories = [cat for _, _, _, cat, _, _, _ in chunks]
+        self._chunk_product_ids = [pid for _, _, _, _, pid, _, _ in chunks]
+        self._chunk_images = [img for _, _, _, _, _, img, _ in chunks]
+        self._chunk_kb_types = [kb for _, _, _, _, _, _, kb in chunks]
         if not self._chunk_texts:
             self._bm25 = None  # 知识库为空，跳过 BM25（search 里退化为纯向量）
             return
@@ -122,6 +123,7 @@ class HybridRetriever:
         text_map = dict(zip(self._chunk_ids, self._chunk_texts))
         title_map = dict(zip(self._chunk_ids, self._chunk_titles))
         pid_map = dict(zip(self._chunk_ids, self._chunk_product_ids))
+        img_map = dict(zip(self._chunk_ids, self._chunk_images))
         top_n = min(RERANK_CANDIDATE_N, len(fused))
         candidates = fused[:top_n]
 
@@ -142,19 +144,19 @@ class HybridRetriever:
         # use_rerank=False 走的就是下面已有的「rerank 不可用 → 退回 RRF 排序」降级路径。
         # 不是为测试新开的后门：这条降级路径本来就存在，开关只是让它可以被显式触发，
         # 便于把「纯 RRF 排序」和「RRF + rerank」拉出来对比（k 值扫描要用）。
-        reranked = self._rerank(query, candidates, rerank_top_k, text_map, title_map, pid_map) if use_rerank else None
+        reranked = self._rerank(query, candidates, rerank_top_k, text_map, title_map, pid_map, img_map) if use_rerank else None
         if reranked is not None:
             # Rerank 只负责排序，不做绝对分数阈值拒答（拒答已移到召回层四维判断）。
             if label == "单高冲突":
                 reranked = self._merge_conflict_top1(
-                    reranked, candidates, top_k, text_map, title_map, pid_map, vec_top1, bm25_top1
+                    reranked, candidates, top_k, text_map, title_map, pid_map, img_map, vec_top1, bm25_top1
                 )
             return label, reranked
 
-        # 6. 降级：Rerank 不可用则退回 RRF 排序（附 text + title + product_id）
+        # 6. 降级：Rerank 不可用则退回 RRF 排序（附 text + title + product_id + image）
         result = []
         for cid, score in candidates[:top_k]:
-            result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, "")))
+            result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, ""), img_map.get(cid, "")))
         return label, result
 
     def _rrf_fuse(self, bm25_rank: dict, vec_rank: dict) -> list:
@@ -197,8 +199,8 @@ class HybridRetriever:
             return "双高" if vec_high else "单高一致"
         return "单高冲突"  # 两路 top1 不同
 
-    def _rerank(self, query: str, candidates: list, top_k: int, text_map: dict, title_map: dict, pid_map: dict):
-        """CrossEncoder 精排候选，返回 [(chunk_id, rerank_score, text, title, product_id)]；不可用返回 None"""
+    def _rerank(self, query: str, candidates: list, top_k: int, text_map: dict, title_map: dict, pid_map: dict, img_map: dict):
+        """CrossEncoder 精排候选，返回 [(chunk_id, rerank_score, text, title, product_id, image)]；不可用返回 None"""
         texts = [text_map.get(cid, "") for cid, _ in candidates]
         ranked = reranker.rerank(query, texts, top_k=top_k)
         if ranked is None:
@@ -206,10 +208,10 @@ class HybridRetriever:
         result = []
         for score, idx in ranked:
             cid = candidates[idx][0]
-            result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, "")))
+            result.append((cid, score, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, ""), img_map.get(cid, "")))
         return result
 
-    def _merge_conflict_top1(self, reranked, candidates, top_k, text_map, title_map, pid_map,
+    def _merge_conflict_top1(self, reranked, candidates, top_k, text_map, title_map, pid_map, img_map,
                              vec_top1, bm25_top1):
         """单高冲突：两路 top1 都列进候选（软推、不偏袒），再跟 rerank 其余结果，截断到 top_k。
 
@@ -224,7 +226,7 @@ class HybridRetriever:
             if cid is not None and cid not in {k[0] for k in keep}:
                 for ccid, _ in candidates:
                     if ccid == cid:
-                        keep.append((cid, 0.0, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, "")))
+                        keep.append((cid, 0.0, text_map.get(cid, ""), title_map.get(cid, ""), pid_map.get(cid, ""), img_map.get(cid, "")))
                         break
         rest = [r for r in reranked if r[0] not in keep_ids]
         return (keep + rest)[:top_k]
@@ -241,5 +243,5 @@ if __name__ == "__main__":
         print(f"Q: {q}")
         label, results = retriever.search(q)
         print(f"  置信度: {label}")
-        for cid, score, text, title, pid in results:
-            print(f"  ({score:.4f}) {title} [{pid}]")
+        for cid, score, text, title, pid, img in results:
+            print(f"  ({score:.4f}) {title} [{pid}] {img}")
