@@ -6,10 +6,46 @@ body {
     background: #f5f6f7;
 }
 
+/* 左栏 + 主区：方向是 row，右区内部再自己 column。
+   ⚠️ 加左侧栏时这里是关键——原来 #root 是 flex-direction:column，
+   直接往里塞 <aside> 只会让它变成顶部的一条横杠，而不是左侧竖栏。 */
 #root {
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     height: 100vh;
+}
+
+/* 右侧主区：header / chat / menu / input 的容器。
+   min-width:0 是必需的——没有它，flex 子项会被内部内容撑破，侧栏被挤扁。 */
+.app-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+/* 左侧「测试订单」栏：点订单号填入输入框，给演示/自测挑样本用 */
+.sidebar {
+    width: 192px; flex-shrink: 0; background: #fff; border-right: 1px solid #e5e6e8;
+    padding: 14px 12px; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 6px;
+}
+.sidebar-title { font-size: .85em; font-weight: 600; color: #4e4376; }
+.sidebar-hint { font-size: .72em; color: #999; margin-bottom: 2px; }
+.sidebar-order {
+    text-align: left; padding: 7px 9px; border: 1px solid #e5e6e8; border-radius: 6px;
+    background: #fafafb; cursor: pointer; font-family: inherit;
+    display: flex; flex-direction: column; gap: 2px; transition: all .15s;
+}
+.sidebar-order:hover:not(:disabled) { border-color: #4e4376; background: #f2f0f8; }
+.sidebar-order:disabled { opacity: .5; cursor: default; }
+.sidebar-order-id { font-family: ui-monospace, Consolas, monospace; font-size: .76em; color: #333; }
+.sidebar-order-status { font-size: .7em; color: #888; }
+
+/* 窄屏隐藏侧栏：内容区 max-width 是 860px，加上侧栏 192px 共约 1050px，
+   900px 以下不隐藏的话主区会被压得比内容宽度还窄。 */
+@media (max-width: 900px) {
+    .sidebar { display: none; }
 }
 
 .header {
@@ -87,3 +123,79 @@ body {
     align-items: center; justify-content: center; z-index: 999;
 }
 .lightbox img { max-width: 90vw; max-height: 90vh; border-radius: 8px; }
+
+/* 助手消息的「气泡 + 评分控件」竖列。
+   包这层是必需的：.msg 是 flex row，评分控件直接塞进去会跑到头像右边。 */
+.msg-col { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; }
+
+/* 侧栏「执行步骤」区：实时显示这一轮 agent 在做什么 */
+.sidebar-steps {
+    list-style: none; font-size: .74em; display: flex; flex-direction: column; gap: 3px;
+    margin-bottom: 4px;
+}
+.sidebar-steps li {
+    padding: 5px 8px; border-radius: 6px; line-height: 1.4;
+    background: #f7f6fb; color: #666; border-left: 2px solid #ded8ee;
+}
+/* 进行中：唯一一条高亮 + 左侧色条加粗 */
+.sidebar-steps li.step-running {
+    background: #f2f0f8; color: #4e4376; font-weight: 600; border-left-color: #4e4376;
+}
+.sidebar-steps li.step-done { opacity: .72; }
+/* 「测试订单」与「执行步骤」之间的分组间距 */
+.sidebar-title-gap { margin-top: 12px; }
+
+/* ── 评分控件 ── */
+.feedback { margin-top: 6px; font-size: .78em; }
+.feedback-row { display: flex; align-items: center; gap: 6px; color: #999; }
+.feedback-label { font-size: .95em; }
+.feedback-btn {
+    border: 1px solid transparent; background: none; cursor: pointer;
+    font-size: 1.15em; line-height: 1; padding: 2px 5px; border-radius: 6px;
+    filter: grayscale(1); opacity: .55; transition: all .15s;
+}
+.feedback-btn:hover:not(:disabled) { filter: none; opacity: 1; background: #f2f0f8; border-color: #ded8ee; }
+.feedback-btn:disabled { cursor: default; opacity: .3; }
+
+/* 30 秒无输入时提亮整块（内联卡片，不是弹窗——调研明确「不 modal、不强制」） */
+.feedback-nudge {
+    background: #f7f6fb; border: 1px solid #ded8ee; border-radius: 10px;
+    padding: 8px 10px; margin-top: 8px;
+}
+.feedback-nudge .feedback-label { color: #4e4376; font-weight: 600; }
+
+.feedback-panel { margin-top: 8px; display: flex; flex-direction: column; gap: 7px; }
+.feedback-reasons { display: flex; flex-wrap: wrap; gap: 6px; }
+.feedback-chip {
+    padding: 3px 10px; border-radius: 999px; cursor: pointer; font-family: inherit;
+    font-size: .95em; border: 1px solid #ded8ee; background: #fff; color: #4e4376;
+    transition: all .15s;
+}
+.feedback-chip:hover:not(:disabled) { border-color: #4e4376; }
+.feedback-chip-on { background: #4e4376; color: #fff; border-color: #4e4376; }
+.feedback-comment {
+    padding: 6px 10px; border: 1px solid #d0d3d8; border-radius: 6px;
+    font-size: .95em; font-family: inherit; outline: none;
+}
+.feedback-comment:focus { border-color: #4e4376; }
+.feedback-actions { display: flex; gap: 8px; }
+.feedback-submit {
+    padding: 4px 14px; background: #4e4376; color: #fff; border: none;
+    border-radius: 6px; cursor: pointer; font-family: inherit; font-size: .95em;
+}
+.feedback-submit:disabled { background: #b0aec4; cursor: default; }
+.feedback-cancel {
+    padding: 4px 12px; background: #fff; color: #777; border: 1px solid #e5e6e8;
+    border-radius: 6px; cursor: pointer; font-family: inherit; font-size: .95em;
+}
+.feedback-done {
+    color: #888; margin-top: 6px; font-size: .78em;
+    display: flex; align-items: center; gap: 8px;
+}
+/* 「改一下」：弱化成一个文字链接，别把已完成的评分显得像还要操作 */
+.feedback-revise {
+    border: none; background: none; padding: 0; cursor: pointer;
+    color: #4e4376; font-family: inherit; font-size: 1em;
+    text-decoration: underline; text-underline-offset: 2px;
+}
+.feedback-err { color: #c0392b; margin-top: 5px; font-size: .95em; }

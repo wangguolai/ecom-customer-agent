@@ -10,6 +10,7 @@ import os
 import re
 import time
 import json
+import uuid
 import asyncio
 import threading
 from contextlib import asynccontextmanager
@@ -33,7 +34,7 @@ from src.backend import mq
 from src.backend import ratelimit
 from src.backend import auth
 from src.backend.seed import _SEED_ORDERS, _SEED_LOGISTICS, _SEED_PRODUCTS
-from src.config.settings import MEMORY_MAX_PER_CATEGORY
+from src.config.settings import MEMORY_MAX_PER_CATEGORY, FEEDBACK_COMMENT_MAX
 from src.config.rules import (
     MEMORY_CATEGORIES,
     MEMORY_SENSITIVE_PATTERNS,
@@ -41,6 +42,9 @@ from src.config.rules import (
     REFUND_STATUS_APPROVED,
     REFUND_STATUS_REFUNDED,
     REFUND_STATUS_REJECTED,
+    FEEDBACK_REASONS,
+    FEEDBACK_RATINGS,
+    FEEDBACK_TRACE_ID_RE,
 )
 
 import pymysql  # 只为捕获唯一的 IntegrityError（画像写入的幂等分支）
@@ -52,6 +56,13 @@ def _init_db():
     refunds 也 DROP 重建：模块 5 改 UNIQUE(order_id,amount) → UNIQUE(order_id)（状态机幂等，
     一个订单一个工单），schema 变更需重建；demo 历史工单是本地测试产物，无需保留。
     """
+    # seed 自洽校验（纯函数、零副作用）：把「演示数据自相矛盾」变成**启动期不变式**，
+    # 而不是「记得跑 refresh」的约定——uvicorn 直起、或容器里没跑 refresh 时同样要挡住。
+    # 校验内容见 src/refresh.py：商品 ID 一致性、订单商品名/金额/单号格式、库存覆盖表 id 存在性。
+    from src.refresh import _validate_product_ids, _validate_orders
+    _validate_product_ids()
+    _validate_orders()
+
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -89,6 +100,15 @@ def _init_db():
             "KEY idx_user (user_id, status, category)"
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
         )
+
+        # trace 落盘表：同样 IF NOT EXISTS、**不参与 DROP 重建**——它是运行时累积的排障数据，
+        # 丢了就再也复现不了当时发生了什么（而这张表存在的唯一意义就是复现）。
+        from src.backend.trace_store import CREATE_SQL as TRACES_DDL
+        cur.execute(TRACES_DDL)
+
+        # 反馈评分表：同上。评分是**用户手动产生的数据**，丢了没有任何地方能重建。
+        from src.backend.feedback_store import CREATE_SQL as FEEDBACK_DDL
+        cur.execute(FEEDBACK_DDL)
     finally:
         close_conn(conn)
 
@@ -217,6 +237,20 @@ def _limit_admin():
     """
     if not ratelimit.rate_limit("admin", "demo", window=_int_env("RL_ADMIN_WINDOW", 10), max_req=_int_env("RL_ADMIN_MAX", 100)):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后重试")
+
+
+def _limit_feedback():
+    """评分接口独立限流桶（10s/20）。
+
+    为什么独立（同 _limit_auth / _limit_memory 的故障隔离道理）：
+    这是**匿名可写**接口——不需要登录，任何能打开页面的人都能提交。
+      · 混 read 桶（100/10s）：灌评分会把正常聊天请求打成 429，聊天页直接不可用；
+      · 混 write 桶（10/10s）：更糟——灌评分会挡住**真实退款请求**，把噪声的代价
+        转嫁到最不该受影响的那条业务线上。
+    阈值 20：真人评分的物理上限是「每条回答点一次」，20/10s 已远超正常，只拦机器刷。
+    """
+    if not ratelimit.rate_limit("feedback", "demo", window=_int_env("RL_FEEDBACK_WINDOW", 10), max_req=_int_env("RL_FEEDBACK_MAX", 20)):
+        raise HTTPException(status_code=429, detail="提交过于频繁，请稍后重试")
 
 
 @app.get("/orders/{order_id}")
@@ -460,11 +494,18 @@ async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_
     if not user_id:
         user_id = session_id
 
-    session = AgentSession(history, user_id=user_id)
+    # trace_id 在**请求开始时**生成：它要同时到达三处 —— SSE 首帧（前端评分时带回）、
+    # trace 落库、后台回溯。让 Trace 自己生成的话，调用方要等请求结束才拿得到，首帧就发不出去。
+    trace_id = uuid.uuid4().hex[:16]
+    session = AgentSession(history, user_id=user_id, trace_id=trace_id)
 
     async def event_gen():
         answer = ""
+        interrupted = False
         try:
+            # 首帧就发 trace_id（在任何可能的早退分支之前），保证前端一定拿得到。
+            # 这是「trace ↔ feedback」那条线的起点：没有它，评分就是孤立数字。
+            yield f"data: {json.dumps({'trace_id': trace_id}, ensure_ascii=False)}\n\n"
             # 假流式（debug，零付费）：FAKE_STREAM=1 时用假内容 + sleep 模拟慢速流式，
             # 专门验证「断开检测」机制，不真调 LLM。和 ENABLE_DEBUG_FAULT 同性质的调试能力。
             if os.environ.get("FAKE_STREAM", "").strip().lower() in ("1", "true", "yes"):
@@ -473,9 +514,19 @@ async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_
                     await asyncio.sleep(0.02)
                 print("假流式跑完 500 段（客户端未断开）")
                 return
-            async for delta in session.stream_chat(user_msg):
-                answer += delta  # 累积完整答案供会话层落历史（SSE 单向流，生成器外面拿不到最终文本）
-                yield f"data: {json.dumps({'delta': delta}, ensure_ascii=False)}\n\n"
+            # stream_chat 产出二元组 (kind, payload)：kind ∈ {"text", "step"}（契约）。
+            # ⚠️ **必须显式列举，不能用 `else` 兜**：`stream_events` 内部还有
+            # ("tool_calls",…) / ("usage",…) 两种事件，一旦漏穿透到这里，
+            # `else` 会把它们当步骤事件下发给前端（内容是工具调用参数 JSON）。
+            async for kind, payload in session.stream_chat(user_msg):
+                if kind == "text":
+                    answer += payload  # 累积完整答案供会话层落历史（SSE 拿不到最终文本）
+                    yield f"data: {json.dumps({'delta': payload}, ensure_ascii=False)}\n\n"
+                elif kind == "step":
+                    yield f"data: {json.dumps({'step': payload}, ensure_ascii=False)}\n\n"
+                else:
+                    # 不静默丢弃：协议漂移要看得见
+                    print(f"⚠️ stream_chat 产出未知事件类型 {kind!r}（已丢弃）", file=sys.stderr)
             # 流式结束：把本轮检索命中的商品图作为单独事件发给前端渲染（图不进 LLM 文本）
             from src.tools import pop_collected_images
             images = pop_collected_images()
@@ -486,7 +537,39 @@ async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_
             # Starlette 1.6 内置 listen_for_disconnect 检测到断开会 cancel 本生成器，
             # 接住让请求体面结束；LLM 流已随 cancel 级联关闭，停止烧 token。
             print("客户端已断开，停止流式输出")
+            interrupted = True
         finally:
+            # 清掉本轮收集的商品图。
+            # **为什么必须在这里兜一道**：正常路径上面已经 pop 并发给前端了，
+            # 但客户端断开走的是 `except asyncio.CancelledError`，try 内剩下的代码不会执行 →
+            # `_collected_images` 残留，**上一轮的商品图/介绍会泄漏进下一轮对话**。
+            # pop 是「读取并清空」，重复调用安全（正常路径这里拿到空）。
+            # ⚠️ 已知限制：`_collected_images` 是模块级 list，多请求并发时会互相串
+            # （A 的 pop 会弹走 B 的图）。demo 单用户 + 前端 streaming 期间禁用输入，
+            # 当前不会触发；要支持并发得改成 per-session 存储。
+            from src.tools import pop_collected_images, pop_collected_retrievals
+            retrieved_ids = pop_collected_retrievals()
+            pop_collected_images()
+
+            # ── trace 落盘 ──
+            # ⚠️ **必须单独包一层 try/except**：finally 里的异常会吞掉同一个 finally 中
+            # **排在它后面**的语句，而 session_store.save / spawn_extract 正排在后面。
+            try:
+                last_trace = session.get_last_trace()
+                # last_trace 为 None 是正常情况：trace 在 stream_chat 首次 __anext__ 才创建，
+                # 而 FAKE_STREAM 分支压根不调它（test_stream_disconnect.py 走的正是这条路）。
+                if last_trace is not None:
+                    last_trace.retrieved_ids = retrieved_ids
+                    if interrupted:
+                        # 断开时 answer 是半截的、usage 可能从未收到（token 全 0）。
+                        # 不单独标出来的话，它会和「跑完但没设值」的样本混在一起，SQL 分不开。
+                        last_trace.end_reason = "断开"
+                    from src.backend import trace_store
+                    trace_store.save(last_trace, session_id, user_id, user_msg, answer)
+            except Exception as e:  # noqa: BLE001 —— 落盘绝不能影响对话主链路
+                print(f"⚠️ trace 落盘调用异常（不影响对话）：{type(e).__name__}: {e}",
+                      file=sys.stderr)
+
             # 落历史：answer 为空（断开/异常）时 save 内部直接返回，不把半截回复写进上下文
             session_store.save(session_id, history, user_msg, answer)
             # 画像抽取（后台任务，不阻塞返回）。
@@ -952,6 +1035,219 @@ def admin_metrics(
     # 么补依赖，要么把指标改成独立模块。面试被问「你的指标怎么采集」要能说清这条。
     from src.agent import METRICS
     return METRICS.snapshot()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 反馈评分（模块 D）—— 评价一条回答，并回溯当时到底发生了什么
+# ═══════════════════════════════════════════════════════════════
+#
+# 这条线的价值**全在「评分 ↔ trace」的关联**上。没有它，一个差评就是个孤立数字：
+# 只能聚合（「FAQ 意图低分占 30%」），无法复现失败——不知道当时的 prompt 版本、
+# 检索命中了哪些 chunk、工具调用序列是什么。调研原话：「**这正是飞轮死掉的地方**」。
+# 所以 `trace_id` 从 `/chat/stream` 首帧下发 → 前端挂在消息上 → 评分时带回来，
+# 中间任何一环断了，这条线就退化成「收集了一堆数字」。
+
+def _maybe_json_list(raw):
+    """tool_calls / retrieved_ids 是 JSON 字符串，但**被截断时不是合法 JSON**
+    （落盘按字符截的，见 trace_store._truncate_json）。
+
+    截断是**刻意留痕**的（`end_reason` 会带「+截断」后缀），所以这里如实把
+    原始字符串返回给前端展示，而不是假装解析成功、给一个残缺数组——
+    后者会让读的人以为「当时只调了这些工具」，恰好掩盖了最该看的病态样本。
+    """
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, list) else []
+    except (ValueError, TypeError):
+        return raw
+
+
+@app.post("/api/feedback")
+def submit_feedback(payload: dict, _: None = Depends(_limit_feedback)):
+    """提交评分（👍/👎 + 原因标签）。
+
+    幂等：同一 trace 重复提交是**更新不是新增**（用户改主意），见 feedback_store.upsert。
+
+    ⚠️ **本接口不得 import `tests.regression`，也不得写坏 case 池**。
+    低分进的是「待复核队列」而不是池：池的毕业判据是客观的 `top1 ∈ expected`，
+    用户评分是主观的、没有 expected → 直接进池会在**一次回归跑之后假阳性毕业**
+    （系统判定「已修复」，其实压根没修）。从外部记录到内部记录**必须经过人工**：
+    读样本 → 聚类失败模式 → 手写 case 进 tests/cases.py。
+    这条约束由 `tests/test_feedback.py` 的静态守卫钉死（源码文本断言，不靠自觉）。
+
+    校验口径与项目其它写接口一致：**白名单 + 截断 + 独立限流桶 + 理由注释**。
+    匿名可写接口尤其不能省——它是唯一不需要登录就能往库里写数据的入口。
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+
+    trace_id = payload.get("trace_id")
+    if not isinstance(trace_id, str) or not re.fullmatch(FEEDBACK_TRACE_ID_RE, trace_id):
+        raise HTTPException(status_code=400, detail="trace_id 格式非法")
+    # ⚠️ **格式校验挡的是脏字符，挡不住伪造**：任何 16 位小写 hex 都能通过，
+    # 包括库里根本不存在的 id。所以「悬空行」这个口子是**开着的**，不是被这段挡住的——
+    # 靠的是 trace_id 只能从 `/chat/stream` 的 SSE 首帧拿到，而那个接口有限流（read 桶 100/10s）。
+    # 已知缺口（记 TODO）：匿名写 + 无存在性校验 → 构造 `0000000000000000/1/2…` 循环提交
+    # 就能把差评队列灌满，后台默认视图（只看差评）会全是 has_trace=false 的垃圾行。
+    # 不能简单加「必须存在于 traces」——落盘是尽力而为的，**trace 暂时不在不等于 id 是伪造的**
+    # （R12：trace 缺失是正常态）。要真正堵住得给 trace_id 加签名或时效 token，属生产化范畴。
+
+    rating = payload.get("rating")
+    # ⚠️ 两道类型检查缺一不可，且都不是「防御性冗余」：
+    #   · `isinstance(rating, bool)` —— `True in (1, -1)` **是 True**（bool 是 int 子类），
+    #     `{"rating": true}` 会被当好评收下；
+    #   · `not isinstance(rating, int)` —— `1.0 in (1, -1)` **也是 True**（数值相等），
+    #     JSON 里写 `"rating": 1.0` 完全合法，只挡 bool 会漏浮点。
+    # 白名单的「包含判断」在动态类型语言里**不等于类型校验**，这是本次踩到的坑。
+    if isinstance(rating, bool) or not isinstance(rating, int) or rating not in FEEDBACK_RATINGS:
+        raise HTTPException(status_code=400, detail=f"rating 非法，只支持 {list(FEEDBACK_RATINGS)}")
+
+    # reason 只在差评时必填（好评直接提交，不逼用户选标签——调研：客服差评常与答案无关，
+    # 标签是给差评做归因的；好评没有归因需求，多一步就多一次流失）。
+    reason = payload.get("reason")
+    reason = reason.strip() if isinstance(reason, str) else ""
+    if rating == -1:
+        if reason not in FEEDBACK_REASONS:
+            raise HTTPException(status_code=400, detail=f"reason 非法，只支持 {list(FEEDBACK_REASONS)}")
+    else:
+        reason = ""   # 好评携带的 reason 一律清空，不落库（避免「好评+答非所问」这种脏组合）
+
+    comment = _clean_field(payload.get("comment"), FEEDBACK_COMMENT_MAX)
+    session_id = _clean_field(payload.get("session_id"), 64)
+
+    from src.backend import feedback_store
+    try:
+        status = feedback_store.upsert(trace_id, session_id, int(rating), reason, comment)
+    except Exception as e:  # noqa: BLE001
+        # ⚠️ 与 trace 落盘**相反**：这里必须让用户知道没存上。
+        # 吞掉的话表现是「点了没反应、刷新后也没有」——最难排查的一类现象。
+        print(f"⚠️ 反馈写入失败：{type(e).__name__}: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail="反馈提交失败，请稍后重试")
+
+    return {"ok": True, "status": status, "feedback_id": trace_id}
+
+
+@app.get("/api/admin/feedback")
+def admin_list_feedback(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    rating: int = Query(0, description="筛选：1=好评 / -1=差评 / 0=全部"),
+    _auth: None = Depends(auth.require_role("admin")),
+    _rl: None = Depends(_limit_admin),
+):
+    """评分列表（LEFT JOIN traces 带出 query，一眼看出评的是哪个问题）。
+
+    ⚠️ 口径标注（照抄 `/api/admin/metrics` 的先例）：只有 Web 链路会写 feedback
+    （CLI / 评测脚本不经过 `/chat/stream`），返回体带 `sample_source`，
+    否则同一个后台里两套口径放在一起，看的人必然误读。
+    """
+    if rating not in (0, 1, -1):
+        raise HTTPException(status_code=400, detail="rating 筛选只支持 1 / -1 / 0(全部)")
+    limit, offset = _page_bounds(page, size)
+    where = " WHERE f.rating = %s" if rating != 0 else ""
+    params: tuple = (rating,) if rating != 0 else ()
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT COUNT(*) FROM feedback f{where}", params)  # noqa: S608 —— where 是内部常量拼接，无外部输入
+        total = cur.fetchone()[0]
+        cur.execute(
+            "SELECT f.feedback_id, f.trace_id, f.session_id, f.rating, f.reason, f.comment, "
+            "       f.created_at, f.updated_at, t.trace_id, t.query, t.end_reason "
+            "FROM feedback f LEFT JOIN traces t ON t.trace_id = f.trace_id"
+            + where +
+            # 排序用 updated_at 不是 created_at：**用户把好评改成差评，是最该被复盘的信号**，
+            # 按 created_at 排它仍停在首次评分的位置，队列里根本浮不上来。
+            # 二级排序键：updated_at 是秒级精度，同秒的多个评分顺序不确定，
+            # 翻页边界落在 tie 组内会重复/漏行（orders 用 order_id、refunds 用 ticket_id 同理）。
+            " ORDER BY f.updated_at DESC, f.feedback_id DESC LIMIT %s OFFSET %s",
+            params + (limit, offset),
+        )
+        items = [
+            {
+                "feedback_id": r[0],
+                "trace_id": r[1],
+                "session_id": r[2],
+                "rating": int(r[3]),
+                "reason": r[4],
+                "comment": r[5],
+                "created_at": r[6],
+                "updated_at": r[7],
+                # trace 缺失（落盘失败 / FAKE_STREAM 早退）是**正常态不是错误**：
+                # 反馈照样收了，只是回溯不到现场。前端渲染成「该轮记录未保存」而非报错。
+                #
+                # ⚠️ 判据用 **t.trace_id**（LEFT JOIN 是否命中的本体），不是 t.query：
+                # 与详情接口的 `t is not None` 同源。query 列可空，
+                # 用 query 判会出现「列表说没保存、点进去却有完整 trace」的自相矛盾。
+                "has_trace": r[8] is not None,
+                "query": r[9],
+                "end_reason": r[10],
+            }
+            for r in cur.fetchall()
+        ]
+    finally:
+        close_conn(conn)
+    return {"total": total, "page": page, "size": size, "items": items,
+            "scope": "single-process", "sample_source": "web"}
+
+
+@app.get("/api/admin/feedback/{trace_id}")
+def admin_feedback_detail(
+    trace_id: str,
+    _auth: None = Depends(auth.require_role("admin")),
+    _rl: None = Depends(_limit_admin),
+):
+    """单条评分的详情 = 评分 + 它对应的完整 trace。
+
+    `trace` 为 null 是**正常态**（同上 has_trace 的理由），此时前端显示
+    「该轮记录未保存」——**不返回 404**：反馈本身是存在的，404 会让调用方以为整条都不存在。
+    """
+    if not re.fullmatch(FEEDBACK_TRACE_ID_RE, trace_id):
+        raise HTTPException(status_code=400, detail="trace_id 格式非法")
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT feedback_id, trace_id, session_id, rating, reason, comment, created_at, updated_at "
+            "FROM feedback WHERE feedback_id=%s",
+            (trace_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="该评分不存在")
+        feedback = {
+            "feedback_id": row[0], "trace_id": row[1], "session_id": row[2],
+            "rating": int(row[3]), "reason": row[4], "comment": row[5],
+            "created_at": row[6], "updated_at": row[7],
+        }
+
+        cur.execute(
+            "SELECT trace_id, session_id, user_id, query, answer, route_source, end_reason, "
+            "       total_sec, total_tokens, cache_hit, cache_miss, llm_steps, "
+            "       tool_calls, retrieved_ids, prompt_version, kb_version, created_at "
+            "FROM traces WHERE trace_id=%s",
+            (trace_id,),
+        )
+        t = cur.fetchone()
+        trace = None
+        if t is not None:
+            trace = {
+                "trace_id": t[0], "session_id": t[1], "user_id": t[2],
+                "query": t[3], "answer": t[4],
+                "route_source": t[5], "end_reason": t[6],
+                "total_sec": t[7], "total_tokens": t[8],
+                "cache_hit": t[9], "cache_miss": t[10], "llm_steps": t[11],
+                "tool_calls": _maybe_json_list(t[12]),
+                "retrieved_ids": _maybe_json_list(t[13]),
+                "prompt_version": t[14], "kb_version": t[15], "created_at": t[16],
+            }
+    finally:
+        close_conn(conn)
+    return {"feedback": feedback, "trace": trace, "sample_source": "web"}
 
 
 # ═══════════════════════════════════════════════════════════════

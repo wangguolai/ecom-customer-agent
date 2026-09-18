@@ -24,7 +24,11 @@ from src.infra.observability import Trace, MetricsStore
 from src.tools import TOOL_SCHEMAS, TOOL_MAP, CATEGORY_KEYWORDS, WRITE_TOOLS
 from src.intent_router import route_by_rule
 from src.config.prompts import SYSTEM_PROMPT, SUMMARY_INSTRUCTION, SUMMARY_PREFIX, MEMORY_INJECT_PREFIX
-from src.config.rules import EMPTY_SIGNALS as _EMPTY_SIGNALS
+from src.config.rules import (
+    EMPTY_SIGNALS as _EMPTY_SIGNALS,
+    TOOL_ACTION_TEXT as _TOOL_ACTION_TEXT,
+    TOOL_ACTION_FALLBACK as _TOOL_ACTION_FALLBACK,
+)
 from src.config.settings import (
     MAX_STEPS,
     MAX_TOOL_CALLS_PER_TURN,
@@ -231,6 +235,147 @@ async def _run_summarize(messages: list, trace: Trace = None) -> str:
     return await _pure_generate(messages, guide, trace)
 
 
+async def _run_browse_stream(messages: list, trace: Trace = None):
+    """`_run_browse` 的流式版（guide 文案与非流式版保持一致，改一处要改两处）"""
+    categories = list(CATEGORY_KEYWORDS.keys())
+    guide = (
+        f"【路由引导：浏览】用户在逛、没有明确目标。请友好地介绍我们的商品分类"
+        f"（{'、'.join(categories)}），引导用户说出感兴趣的方向。不要直接推荐具体商品。"
+    )
+    yield ("step", {"text": "整理商品分类"})
+    async for ev in _pure_generate_stream(messages, guide, trace):
+        yield ev
+
+
+async def _run_summarize_stream(messages: list, trace: Trace = None):
+    """`_run_summarize` 的流式版"""
+    guide = (
+        "【路由引导：总结】用户想对比多款商品，但没说清具体对比哪几款。"
+        "请反问用户想对比哪些商品（或哪类商品），等用户明确后再检索对比。"
+    )
+    yield ("step", {"text": "准备商品对比"})
+    async for ev in _pure_generate_stream(messages, guide, trace):
+        yield ev
+
+
+# ═══════════════════════════════════════════════════════════════
+# 规则路由的流式版本
+# ═══════════════════════════════════════════════════════════════
+# 为什么需要它们：规则路由命中时 `stream_chat` 走的是非流式路径（`yield 整段`），
+# 用户沉默数秒后整段文字突然出现。实测（2026-09-18）：查订单场景首个文本 delta
+# 延迟 5393ms，而其中工具只占 3ms —— 其余全是一次性生成的时间。
+# 流式化后首个 delta 应该降到 LLM 首 token 延迟。
+#
+# 产出协议：与 `_react_loop_stream` 一致 —— `("text", str)` / `("step", dict)`。
+#
+# ⚠️ 事件白名单**必须显式含 "usage"**：`stream_events` 现在每次都会产出 usage 事件，
+# 把它当「意外事件」告警的话，规则路由每一次请求都刷一条日志，告警很快没人看。
+
+async def _stream_generate(messages: list, trace: Trace = None):
+    """流式纯生成（不带 tools）—— `_pure_generate` 的流式版。
+
+    被 `_pure_generate_stream` 与 `_run_routed_stream` 共用：它们的差别只在
+    「往 messages 里追加什么引导消息」，生成部分完全一样。
+    不抽出来的话，token 统计 / 空回复兜底 / 历史回填这些收尾逻辑要写两遍，必然漂移。
+    """
+    t0 = time.perf_counter()
+    text_parts = []
+    usage_obj = None
+    try:
+        async for ev in stream_events(messages, max_tokens=MAX_OUTPUT_TOKENS):
+            if ev[0] == "text":
+                text_parts.append(ev[1])
+                yield ("text", ev[1])
+            elif ev[0] == "usage":
+                usage_obj = ev[1]
+            elif ev[0] == "tool_calls":
+                # 纯生成不带 tools，理论上不该有 tool_calls。真出现要看得见——
+                # 静默忽略正是这类协议问题最难查的形态。
+                print(f"⚠️ 纯生成路径收到意外的 tool_calls（已忽略）：{ev[1]!r}", file=sys.stderr)
+            else:
+                print(f"⚠️ stream_events 未知事件类型 {ev[0]!r}（已忽略）", file=sys.stderr)
+    except Exception as e:
+        if trace:
+            trace.route_source = "规则"
+            trace.end_reason = "异常"
+        # 异常也必须给用户**可见的文本**：只发 step 不发 text 的话，answer 为空 →
+        # 本轮不入历史（session_store.save 对空 answer 直接返回）→ 用户看到空气泡。
+        yield ("text", "抱歉，系统暂时无法处理，请稍后重试或转人工。")
+        return
+
+    elapsed = time.perf_counter() - t0
+    content = "".join(text_parts)
+    if trace:
+        trace.route_source = "规则"
+        trace.add_llm(
+            1, elapsed,
+            getattr(usage_obj, "total_tokens", 0) or 0,
+            getattr(usage_obj, "prompt_tokens", 0) or 0,
+            getattr(usage_obj, "prompt_cache_hit_tokens", 0) or 0,
+            getattr(usage_obj, "prompt_cache_miss_tokens", 0) or 0,
+        )
+        trace.end_reason = "正常"
+
+    # ⚠️ 流式后没有 `resp` 对象了，这两件事必须手动重建（不可省略）：
+    #   ① **空回复兜底要发给用户**：只写进 messages 的话用户看到空气泡，
+    #      而且 answer 为空 → 本轮不入历史 → 下一轮指代消解断掉。
+    #      （`_react_loop_stream` 那条路径就只补进了 messages、没补进用户可见输出——
+    #        这个坑不复制到新路径上。）
+    #   ② **assistant 历史回填**：不做的话 self.messages 里这轮只剩 user 消息。
+    #      Web 链路每请求新建 session 看不出来，但 CLI / 单测 / 摘要压缩的 token 估算会受影响。
+    if not content:
+        yield ("text", "抱歉，我没能生成出回复，请再问一次。")
+    messages.append({"role": "assistant", "content": content or "（空回复）"})
+
+
+async def _pure_generate_stream(messages: list, guide: str, trace: Trace = None):
+    """`_pure_generate` 的流式版：注入引导消息 + 流式纯生成（浏览/总结共用）"""
+    messages.append({"role": "user", "content": guide})
+    async for ev in _stream_generate(messages, trace):
+        yield ev
+
+
+async def _run_routed_stream(messages: list, routed, trace: Trace = None):
+    """`_run_routed` 的流式版：执行工具 + 流式生成话术。
+
+    与非流式版的行为必须逐项对齐（否则两条路会漂移）：
+    工具异常 → 友好文案 + trace 标异常；`truncate`；`_EMPTY_SIGNALS` 判空 → `trace.add_tool`；
+    两处 `route_source = "规则"`；`end_reason`。
+    """
+    tool_name, args = routed
+
+    # 步骤事件：**在工具调用之前发**，用户立刻看到「在查订单」。
+    # 工具执行那段虽然只有几毫秒（实测），但「立刻有反馈」本身有价值。
+    yield ("step", {"text": _TOOL_ACTION_TEXT.get(tool_name, _TOOL_ACTION_FALLBACK)})
+
+    t0 = time.perf_counter()
+    try:
+        tool_result = await TOOL_MAP[tool_name](**args)
+    except Exception as e:
+        if trace:
+            trace.route_source = "规则"
+            trace.end_reason = "异常"
+        # 不给用户看异常类名（ConnectTimeout / BadRequestError 属实现细节）
+        yield ("text", "抱歉，查询暂时失败，请稍后重试或转人工。")
+        return
+    tool_result = truncate(tool_result)
+    elapsed = time.perf_counter() - t0
+    is_empty = any(sig in tool_result for sig in _EMPTY_SIGNALS)
+    if trace:
+        trace.add_tool(tool_name, elapsed, 1, is_empty)
+        trace.route_source = "规则"
+
+    # 用受信任的 user 消息注入工具结果（同 `_run_routed`）：
+    # 不伪造 assistant(tool_calls) 往返——不带 tools 的请求里 assistant 带 tool_calls
+    # 会被 DeepSeek 判 400。
+    messages.append({
+        "role": "user",
+        "content": f"【规则路由已执行工具 {tool_name}，结果如下，请据此回答用户：】\n{tool_result}",
+    })
+    async for ev in _stream_generate(messages, trace):
+        yield ev
+
+
 async def _react_loop(messages: list, trace: Trace = None) -> str:
     """核心循环：LLM 决策 → 代码执行 → 回灌，直到最终答案。原地修改 messages，返回最终答案"""
     last_action = None
@@ -365,7 +510,12 @@ async def _react_loop_stream(messages: list, trace: Trace = None):
     关键假设：function calling 决策轮 content 通常为空，边收边 yield 不会把决策内容漏给用户；
     决策轮若意外带 content，一并 yield（过渡话术，无害）。
 
-    流式默认无 usage：trace 的 token 计 0（token 观测待 stream_options 支持后再补）。
+    **产出协议（契约）**：`("text", str)` 逐 token 文本 / `("step", dict)` 执行步骤事件。
+    出边界的 kind **只有这两种** —— `stream_events` 的 `("tool_calls",…)` / `("usage",…)`
+    属它的内部协议，**不得穿透到调用方**（穿透了会被 `main.py` 当步骤事件下发给前端）。
+
+    token 统计靠 `stream_events` 的 usage 事件回填（需 `stream_options.include_usage`），
+    不再像早期那样恒记 0。
     """
     last_action = None
     repeat_count = 0
@@ -373,25 +523,52 @@ async def _react_loop_stream(messages: list, trace: Trace = None):
 
     for step in range(MAX_STEPS):
         print(f"📍 [step {step+1}] LLM 决策中（流式）...")
+        # 步骤事件：**统一叫「思考中」、不区分决策轮/答案轮** —— 流式下只有收到第一个
+        # delta 才知道这一轮是哪种，循环顶部无法预知（想区分就得等文本已经开始流了才发，
+        # 那样步骤会排在正文后面，顺序错乱）。
+        # 用**循环变量** step 而不是 len(trace.steps)+1：trace 可能是 None。
+        yield ("step", {"text": f"思考中（第 {step + 1} 步）"})
         text_parts = []
         tool_calls_list = []
+        usage_obj = None
         t0 = time.perf_counter()
         try:
+            # ⚠️ 三个分支必须**显式列出**，不能写成 `else: tool_calls_list = ev[1]`。
+            # stream_events 现在产出三种事件（text / tool_calls / usage），而 usage 挂在
+            # **最后一个 chunk** 上、跟在 tool_calls 之后 —— 用 `else` 兜的话：
+            #   · 决策轮：usage 对象会覆盖 tool_calls_list → 下面 tc["name"] 直接 TypeError
+            #   · 答案轮（主路）：唯一的非 text 事件就是 usage → `if not tool_calls_list`
+            #     对 pydantic 对象**判为假** → 走错分支 → 同样崩
+            # 也就是「一开 include_usage，所有流式回答都炸」。这不是理论风险。
             async for ev in stream_events(messages, tools=TOOL_SCHEMAS, max_tokens=MAX_OUTPUT_TOKENS):
                 if ev[0] == "text":
                     text_parts.append(ev[1])
-                    yield ev[1]  # 逐 token 流式输出
-                else:  # "tool_calls"
+                    yield ("text", ev[1])  # 逐 token 流式输出
+                elif ev[0] == "tool_calls":
                     tool_calls_list = ev[1]
+                elif ev[0] == "usage":
+                    usage_obj = ev[1]
+                else:
+                    # 不静默丢弃：协议漂移要看得见（静默丢弃是这类 bug 最难查的形态）
+                    print(f"⚠️ stream_events 未知事件类型 {ev[0]!r}（已忽略）", file=sys.stderr)
         except Exception as e:
             # API 超时/网络错误：和 _react_loop 同规范，标记异常返回友好错误
             if trace:
                 trace.end_reason = "异常"
-            yield f"系统异常：{type(e).__name__}"
+            yield ("text", f"系统异常：{type(e).__name__}")
             return
         elapsed = time.perf_counter() - t0
         if trace:
-            trace.add_llm(step + 1, elapsed, 0, 0, 0, 0)
+            # 用 usage 回填 token / cache。此前这里写死 0（因为流式拿不到 usage）——
+            # 不回填的话，落盘的 total_tokens / cache_hit 永远是 0，而这两个字段正是
+            # 抓「Token 爆炸 / 上下文污染」的抓手，也让 /admin/metrics 的缓存命中率失真。
+            trace.add_llm(
+                step + 1, elapsed,
+                getattr(usage_obj, "total_tokens", 0) or 0,
+                getattr(usage_obj, "prompt_tokens", 0) or 0,
+                getattr(usage_obj, "prompt_cache_hit_tokens", 0) or 0,
+                getattr(usage_obj, "prompt_cache_miss_tokens", 0) or 0,
+            )
 
         content_text = "".join(text_parts)
 
@@ -414,7 +591,7 @@ async def _react_loop_stream(messages: list, trace: Trace = None):
         if len(tool_calls_list) > MAX_TOOL_CALLS_PER_TURN:
             if trace:
                 trace.end_reason = "超工具数"
-            yield "一次请求内容过多，请收敛到具体某个问题。"
+            yield ("text", "一次请求内容过多，请收敛到具体某个问题。")
             return
 
         # 1. 串行做「参数解析 + 死循环检测 + 写操作占位」（镜像 _react_loop，tc 为 dict）
@@ -434,7 +611,7 @@ async def _react_loop_stream(messages: list, trace: Trace = None):
             if repeat_count >= 3:
                 if trace:
                     trace.end_reason = "死循环"
-                yield "连续 3 次调用同一工具同一参数，判定死循环，已停止。"
+                yield ("text", "连续 3 次调用同一工具同一参数，判定死循环，已停止。")
                 return
             blocked = False
             if name in WRITE_TOOLS:
@@ -472,6 +649,13 @@ async def _react_loop_stream(messages: list, trace: Trace = None):
                 trace.add_tool(name, elapsed, step + 1, is_empty)
             return result
 
+        # 步骤事件：**必须在 gather 之前、按 parsed 顺序逐条发**。两个都不能改：
+        #   · 不能写在 `_exec` 里 —— 它是**协程**，协程里 yield 无法交给外层生成器（结构不成立）
+        #   · 不能等 gather 完成后按完成顺序发 —— 并发完成的先后取决于 I/O，步骤顺序会抖
+        # parsed 的顺序在上面那个串行区（参数解析/死循环检测）就已确定，稳定。
+        for tc, _args, _blocked in parsed:
+            yield ("step", {"text": _TOOL_ACTION_TEXT.get(tc["name"], _TOOL_ACTION_FALLBACK)})
+
         results = await asyncio.gather(*[_exec(item) for item in parsed])
 
         # 3. 回灌（tool_call_id 一一对应，顺序不乱）
@@ -480,7 +664,7 @@ async def _react_loop_stream(messages: list, trace: Trace = None):
 
     if trace:
         trace.end_reason = "超步数"
-    yield "达到最大步数仍未得到答案，已停止。"
+    yield ("text", "达到最大步数仍未得到答案，已停止。")
 
 
 # 全局指标聚合（进程内多次对话的统计：技术成功率 / P99 / 平均延迟 / 平均 token）
@@ -545,7 +729,8 @@ async def _inject_memory(messages: list, user_id, user_msg: str) -> None:
 class AgentSession:
     """多轮会话：维护跨轮次的历史 messages，让 agent 记住之前聊过什么"""
 
-    def __init__(self, history: list[dict] | None = None, user_id: str | None = None):
+    def __init__(self, history: list[dict] | None = None, user_id: str | None = None,
+                 trace_id: str | None = None):
         """history：跨轮对话历史（[{role, content}]），由调用方从会话层取（Web 链路传 Redis 里的历史）。
 
         只放 user/assistant 文本对：ReAct 中间态（tool_calls / tool 结果）不进历史——
@@ -561,6 +746,10 @@ class AgentSession:
         if history:
             self.messages.extend(history)
         self._user_id = user_id or None
+        # trace_id 由调用方（Web 链路的 main.py）在**请求开始时**生成并传入：
+        # 它要同时到达三处——SSE 首帧（给前端评分时带回）、落库记录、后台回溯。
+        # 若让 Trace 自己生成，调用方就得等请求结束才能拿到，首帧发不出去。
+        self._trace_id = trace_id or None
         self._last_trace = None
 
     async def chat(self, user_msg: str) -> str:
@@ -569,7 +758,7 @@ class AgentSession:
         画像注入的三步顺序（清旧 → 压缩 → 注入新）**不可调换**，理由见 _inject_memory 的注释。
         """
         self.messages.append({"role": "user", "content": user_msg})
-        trace = Trace()
+        trace = Trace(self._trace_id)
         self._last_trace = trace
         _strip_memory_injection(self.messages)  # 先清上一轮注入（防累积 + 防被当成真实用户轮次）
         await _compress_history(self.messages, MAX_HISTORY_TOKENS, trace)
@@ -595,13 +784,21 @@ class AgentSession:
         return result
 
     async def stream_chat(self, user_msg: str):
-        """流式一轮对话：逐 token yield 最终答案。
+        """流式一轮对话。**产出二元组 `(kind, payload)`**，kind ∈ {"text", "step"}。
 
-        规则路由命中时本次非流式（复用现有非流式路径，一次性 yield 完整话术）；未命中走
-        _react_loop_stream（ReAct 循环流式）。规则路由话术流式列为后续。
+          - `("text", str)`  逐 token 的答案文本
+          - `("step", dict)` 执行步骤事件（前端左侧栏展示「第几步、在做什么」）
+
+        两条路径**都是流式的**：规则路由命中走 `_run_routed_stream` / `_run_browse_stream` /
+        `_run_summarize_stream`，未命中走 `_react_loop_stream`。
+        （此前规则路由是非流式——`await` 整段生成完再 `yield`，实测「查订单」场景
+          首个文本 delta 延迟 5393ms，而其中工具只占 3ms，其余全是生成时间。）
+
+        ⚠️ 出边界的 kind **只有 text / step**：`stream_events` 的 `tool_calls` / `usage`
+        是它的内部协议，不得穿透到调用方（穿透了会被 `main.py` 当步骤事件下发给前端）。
         """
         self.messages.append({"role": "user", "content": user_msg})
-        trace = Trace()
+        trace = Trace(self._trace_id)
         self._last_trace = trace
         _strip_memory_injection(self.messages)
         await _compress_history(self.messages, MAX_HISTORY_TOKENS, trace)
@@ -609,18 +806,24 @@ class AgentSession:
         routed = route_by_rule(user_msg)
         if routed:
             kind = routed[0]
+            # 三条规则分支都走流式版（此前是「整段生成完再一次 yield」，用户沉默数秒后
+            # 文字突然出现；实测查订单场景首个 delta 延迟 5393ms，而工具只占 3ms）
             if kind == "tool":
-                result = await _run_routed(self.messages, (routed[1], routed[2]), trace)
+                agen = _run_routed_stream(self.messages, (routed[1], routed[2]), trace)
             elif kind == "browse":
-                result = await _run_browse(self.messages, trace)
+                agen = _run_browse_stream(self.messages, trace)
             else:  # summarize
-                result = await _run_summarize(self.messages, trace)
+                agen = _run_summarize_stream(self.messages, trace)
+            async for ev in agen:
+                yield ev
+            # ⚠️ record/print 必须在流式循环**之后**：放在循环前的话，
+            # Trace.summary() 会在 LLM 调用完成前求值 → steps 为空、耗时不含生成时间，
+            # 该轮样本的「总耗时/LLM 次数/平均延迟」全错。
             METRICS.record(trace)
             print(trace)
-            yield result
             return
-        async for delta in _react_loop_stream(self.messages, trace):
-            yield delta
+        async for ev in _react_loop_stream(self.messages, trace):
+            yield ev
         METRICS.record(trace)
         print(trace)
 

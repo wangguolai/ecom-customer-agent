@@ -110,8 +110,9 @@ async def test_react_loop_stream_answer():
     trace = Trace()
     got = []
     with patch.object(agent, "stream_events", side_effect=_gen_answer):
-        async for delta in agent._react_loop_stream(msgs, trace):
-            got.append(delta)
+        async for _kind, _payload in agent._react_loop_stream(msgs, trace):
+            if _kind == "text":
+                got.append(_payload)
     check("答案轮逐 token yield", got == ["订", "单状态正常"], str(got))
     check("答案轮 trace 正常结束", trace.end_reason == "正常", trace.end_reason)
 
@@ -136,11 +137,72 @@ async def test_react_loop_stream_tool_exec():
     with patch.dict(agent.TOOL_MAP, {"search_orders": fake_search_orders}), \
          patch.object(agent, "stream_events", side_effect=responses):
         got = []
-        async for delta in agent._react_loop_stream(msgs, trace):
-            got.append(delta)
+        async for _kind, _payload in agent._react_loop_stream(msgs, trace):
+            if _kind == "text":
+                got.append(_payload)
     check("决策轮执行工具", calls["n"] == 1, str(calls))
     check("决策轮后答案逐 token yield", got == ["订", "单状态正常"], str(got))
     check("trace 正常结束", trace.end_reason == "正常", trace.end_reason)
+
+
+def _usage_chunk(total=10, prompt=9, completion=1, hit=0, miss=9):
+    """带 usage 的 chunk。
+
+    刻意构造成 **choices 非空**——这是实测到的 DeepSeek 真实形态（usage 绑在最后一个
+    内容块上），不是 OpenAI 标准的「空 choices 块」。两种形态解析路径不同，测试要贴真实。
+    """
+    return SimpleNamespace(
+        choices=[SimpleNamespace(delta=_delta(content=None))],
+        usage=SimpleNamespace(
+            total_tokens=total, prompt_tokens=prompt, completion_tokens=completion,
+            prompt_cache_hit_tokens=hit, prompt_cache_miss_tokens=miss,
+        ),
+    )
+
+
+async def test_stream_events_usage():
+    """usage 事件必须产出，且**排在 tool_calls 之后**（调用方靠顺序区分决策/答案轮）"""
+    chunks = [
+        _chunk(_delta(tool_calls=[_tc(0, id="c1", name="search_orders", args="{}")])),
+        _usage_chunk(),
+    ]
+    with patch.object(llm, "get_client", return_value=_FakeClient(chunks)):
+        events = await _collect(llm.stream_events([{"role": "user", "content": "x"}]))
+    kinds = [k for k, _ in events]
+    check("stream_events 产出 usage 事件", "usage" in kinds, str(kinds))
+    check("usage 排在 tool_calls 之后", kinds == ["tool_calls", "usage"], str(kinds))
+
+
+async def _gen_answer_with_usage(messages=None, tools=None, max_tokens=None):
+    yield ("text", "订")
+    yield ("text", "单状态正常")
+    yield ("usage", SimpleNamespace(total_tokens=10, prompt_tokens=9,
+                                    prompt_cache_hit_tokens=3, prompt_cache_miss_tokens=6))
+
+
+async def test_react_loop_stream_answer_with_usage():
+    """🔴 回归守卫：答案轮收到 usage 必须**不崩**。
+
+    这是 `include_usage` 引入时最容易炸的地方，而现有用例全都 mock 成不产 usage，
+    所以**一条都测不到**。改之前的写法 `else: tool_calls_list = ev[1]` 会把 usage 对象
+    塞进 tool_calls_list，而 `if not tool_calls_list` 对 pydantic 对象判为假 →
+    走错分支（决策轮）→ 崩。答案轮是主路，等于「一开 include_usage 所有流式回答都炸」。
+    """
+    msgs = [{"role": "system", "content": "sys"}]
+    trace = Trace()
+    got = []
+    with patch.object(agent, "stream_events", side_effect=_gen_answer_with_usage):
+        try:
+            async for _kind, _payload in agent._react_loop_stream(msgs, trace):
+                if _kind == "text":
+                    got.append(_payload)
+        except Exception as e:  # noqa: BLE001 —— 崩了就是这条用例要抓的
+            check("答案轮遇 usage 不崩", False, f"{type(e).__name__}: {e}")
+            return
+    check("答案轮遇 usage 不崩且文本正常", got == ["订", "单状态正常"], str(got))
+    check("答案轮 trace 正常结束", trace.end_reason == "正常", trace.end_reason)
+    check("usage 回填进 trace（token 不再是 0）",
+          sum(s[2] for s in trace.steps) == 10, str(trace.steps))
 
 
 def main():
@@ -150,7 +212,9 @@ def main():
     print("-" * 60)
     asyncio.run(test_stream_events_text())
     asyncio.run(test_stream_events_tool_calls())
+    asyncio.run(test_stream_events_usage())
     asyncio.run(test_react_loop_stream_answer())
+    asyncio.run(test_react_loop_stream_answer_with_usage())
     asyncio.run(test_react_loop_stream_tool_exec())
     print("-" * 60)
     print(f"通过 {_passed} / 失败 {_failed}")

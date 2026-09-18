@@ -123,6 +123,34 @@ def _count_orders():
         conn.close()
 
 
+def _cleanup_fuzz_feedback(trace_id):
+    """删掉 feedback 靶点用固定 trace_id 造出来的测试行。
+
+    ⚠️ **只删这一个固定 id**——feedback 表里混着真实用户评分，
+    按 `LIKE`/时间范围之类的「顺手清理」会把真数据一起带走。
+    失败不影响 fuzz 结论（脏数据最多留一行，比误删好）。
+
+    ⚠️ **必须 `autocommit=True`**：本文件其余连接只做 SELECT（`_count_orders` 等），
+    所以默认的 autocommit=False 一直没暴露问题；DELETE 落在未提交的事务里，
+    `conn.close()` 时被**静默回滚**——函数不报错、行却没删掉。
+    这正是「测试自己写的清理」最容易骗过人的地方：它看起来跑了，实际什么也没做。
+    """
+    try:
+        conn = pymysql.connect(
+            host="127.0.0.1", port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD,
+            database=MYSQL_DB, connect_timeout=3, autocommit=True,
+        )
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM feedback WHERE feedback_id=%s", (trace_id,))
+            if cur.rowcount:
+                print(f"   🧹 已清理 feedback 测试行：{trace_id}")
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️ feedback 测试行清理失败（不影响结论）：{type(e).__name__}: {e}")
+
+
 def _orders_table_exists():
     """orders 表是否还在（被 DROP 就是灾难）"""
     conn = pymysql.connect(
@@ -278,6 +306,8 @@ def main():
     _clear_ratelimit("read")
     _clear_ratelimit("write")
     _clear_ratelimit("auth")
+    _clear_ratelimit("admin")
+    _clear_ratelimit("feedback")
 
     count_before = _count_orders()
     print(f"📍 [前置] orders 表行数快照 = {count_before}")
@@ -320,12 +350,38 @@ def main():
         ("auth-body-数字", "123"),
         ("auth-body-缺password", '{"username": "admin"}'),
     ]
+    # ── POST /api/feedback（模块 D，**全站唯一匿名可写接口**）──
+    # 为什么它最该被 fuzz：其余写接口要么挂鉴权（/review /execute）、要么有参数下沉兜底（/refund
+    # 的金额由后端查库得出）。这个接口**不用登录**就能往库里写数据，且入参直接进主键、白名单比对和落库。
+    # 用固定 trace_id（16 位 hex，与生成规则同形），收尾统一清理，不碰真实数据。
+    FUZZ_TID = "ffffffffffffffff"
+    feedback_body_shapes = [
+        ("feedback-body-非对象", "[]"),
+        ("feedback-body-null", "null"),
+        ("feedback-body-字符串", '"str"'),
+        ("feedback-body-数字", "123"),
+        ("feedback-body-空对象", "{}"),
+        ("feedback-body-rating布尔", f'{{"trace_id": "{FUZZ_TID}", "rating": true}}'),
+        ("feedback-body-rating字符串", f'{{"trace_id": "{FUZZ_TID}", "rating": "1"}}'),
+        ("feedback-body-rating越界", f'{{"trace_id": "{FUZZ_TID}", "rating": 99}}'),
+        ("feedback-body-traceid注入", '{"trace_id": "\' OR 1=1 --", "rating": -1, "reason": "其他"}'),
+        ("feedback-body-traceid超长", f'{{"trace_id": "{FUZZ_TID}x", "rating": 1}}'),
+        ("feedback-body-traceid大写", f'{{"trace_id": "{FUZZ_TID.upper()}", "rating": 1}}'),
+        ("feedback-body-差评缺reason", f'{{"trace_id": "{FUZZ_TID}", "rating": -1}}'),
+        ("feedback-body-reason非枚举", f'{{"trace_id": "{FUZZ_TID}", "rating": -1, "reason": "随便写的"}}'),
+        ("feedback-body-comment超长", f'{{"trace_id": "{FUZZ_TID}", "rating": -1, "reason": "其他", "comment": "{"长" * 2000}"}}'),
+        # 孤立代理：本项目已知的「三连炸」bug 类别（走 utf-8 编码的每一层都可能 500）。
+        # 这里是**匿名入口的第一层**，它扛住才有后面的事。
+        ("feedback-body-孤立代理", f'{{"trace_id": "{FUZZ_TID}", "rating": -1, "reason": "其他", "comment": "\\ud800"}}'),
+        ("feedback-body-多余字段", f'{{"trace_id": "{FUZZ_TID}", "rating": 1, "x": "<script>alert(1)</script>"}}'),
+    ]
 
     total = (
         len(payloads) * len(get_targets)
         + len(payloads) * 2  # refund + auth 每载荷一个
         + len(payloads) * len(admin_targets)  # admin 靶点
         + len(refund_body_shapes) + len(auth_body_shapes)
+        + len(feedback_body_shapes)  # feedback body 形态
     )
     i = 0
 
@@ -427,6 +483,26 @@ def main():
         else:
             passed += 1
             print(f"   ✅ status={status}")
+
+    # ── POST /api/feedback（body 形态）──
+    # 断言口径同 refund/auth：4xx 是校验层正确拦截（通过），5xx 才是 bug。
+    # 每请求前清桶——feedback 桶 20/10s，脏输入连发会撞 429，被 429 挡掉就测不到校验层。
+    for label, raw in feedback_body_shapes:
+        _clear_ratelimit("feedback")
+        i += 1
+        print(f"📍 [{i}/{total}] POST /api/feedback — body形态[{label}]")
+        send_ok, status, exc, body, ctype = _send_raw("POST", f"{BACKEND_URL}/api/feedback", raw)
+        issues = _assert_ok(send_ok, status, exc, body, None, label, "api/feedback", "POST", check_echo=False)
+        if issues:
+            failed += 1
+            _record(failures, label, raw, "api/feedback", "POST", issues, status, exc, body)
+            print(f"   ❌ {issues} (status={status} exc={exc})")
+        else:
+            passed += 1
+            print(f"   ✅ status={status}")
+
+    # feedback 靶点收尾：清掉本脚本固定 trace_id 造的测试行（**只删自己造的**）
+    _cleanup_fuzz_feedback(FUZZ_TID)
 
     # ── 收尾：orders 表完整性断言 ──
     print("📍 [收尾] 复核 orders 表完整性...")

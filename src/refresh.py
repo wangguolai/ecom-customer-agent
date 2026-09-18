@@ -52,10 +52,63 @@ def _validate_product_ids():
         raise ValueError(f"md title ↔ seed name 漂移：{drift}")
 
 
+def _validate_orders():
+    """校验订单数据与商品库一致（演示数据自相矛盾的护栏）。
+
+    三条都是真实缺陷换来的：
+      ① **订单商品名必须存在于商品库** —— 否则用户查订单时顺带问「这个还有货吗」会查无此物，
+         演示当场暴露数据不一致。此前**没有任何自动化守卫**。
+      ② **订单金额必须 ∈ 商品价格集合** —— `tests/judge.py` 把回答里所有 `¥数字` 与
+         商品价格白名单精确比对；订单金额若不在集合里，退款流程把金额原样返回、
+         agent 正确转述，**反而被判「编造价格」（faithfulness=0）**。
+      ③ **订单号必须满足 `20\\d{9}`** —— 否则 `intent_router` 的正则命中不了，
+         用户查单会掉进 LLM ReAct（慢且不确定）。
+    """
+    import re as _re
+    from src.backend.seed import _SEED_PRODUCTS, _SEED_PRODUCTS_RAW, _SEED_ORDERS, _QTY_OVERRIDE
+
+    names = {sp[1] for sp in _SEED_PRODUCTS}
+    prices = {sp[2] for sp in _SEED_PRODUCTS}
+    price_by_name = {sp[1]: sp[2] for sp in _SEED_PRODUCTS}
+
+    # 库存覆盖表的 id 存在性：打错一个字符（P009 → P090）不报错、不加警告，
+    # 库存会静默保持 100、缺货档消失——而唯一的活断言在 tests/test_redis_cache.py，
+    # 要跑到那一步才发现。这里零成本堵住。
+    unknown = set(_QTY_OVERRIDE) - {p[0] for p in _SEED_PRODUCTS_RAW}
+    if unknown:
+        raise ValueError(f"库存覆盖表引用了不存在的商品 id：{sorted(unknown)}")
+
+    bad_names = [o[3] for o in _SEED_ORDERS if o[3] not in names]
+    if bad_names:
+        raise ValueError(f"订单引用了商品库里不存在的商品：{bad_names}")
+
+    bad_amounts = []
+    for o in _SEED_ORDERS:
+        m = _re.fullmatch(r"¥(\d+)", o[4] or "")
+        if not m:
+            bad_amounts.append((o[0], o[4], "格式不是 ¥整数"))
+            continue
+        amt = int(m.group(1))
+        # 两级校验，缺一不可：
+        #   ① **必须等于该订单商品的 price** —— 价格只有 10 个值、每个重复 16+ 次，
+        #      只判「∈ 集合」的话，把洁齿骨（¥99）的单写成 ¥189 也能通过；
+        #      演示时「查订单 → 问这商品多少钱」两步一对就露馅。
+        #   ② 同时 ∈ 价格集合（tests/judge.py 的编造价格白名单就是这个语义，作兜底）。
+        if amt != price_by_name.get(o[3]) or amt not in prices:
+            bad_amounts.append((o[0], o[4], f"应为 ¥{price_by_name.get(o[3])}"))
+    if bad_amounts:
+        raise ValueError(f"订单金额与商品价格不符（会被判编造价格）：{bad_amounts}")
+
+    bad_ids = [o[0] for o in _SEED_ORDERS if not _re.fullmatch(r"20\d{9}", o[0])]
+    if bad_ids:
+        raise ValueError(f"订单号格式非法（intent_router 命中不了）：{bad_ids}")
+
+
 def refresh():
     """重建所有持久化派生数据"""
     print("📍 [0/3] 校验商品 ID 一致性（md ↔ seed 双向）...")
     _validate_product_ids()
+    _validate_orders()
     print("    ID 校验通过。")
 
     print("📍 [1/3] MySQL — 重建 seed 表（DROP + 灌种子）...")

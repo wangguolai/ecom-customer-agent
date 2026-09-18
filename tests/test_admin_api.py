@@ -95,6 +95,10 @@ ADMIN_ENDPOINTS = [
     "/api/admin/refunds",
     "/api/admin/users",
     "/api/admin/metrics",
+    # 模块 D 新增。详情用一条**格式合法但不存在**的 trace_id：
+    # 目的是证明它挂了鉴权（401 在 handler 之前），不依赖库里有这条记录。
+    "/api/admin/feedback",
+    "/api/admin/feedback/0000000000000000",
 ]
 
 
@@ -200,8 +204,10 @@ def test_business(admin_token):
     check("不存在的订单 → 404", code == 404, f"→ {code}")
 
     # 无物流的订单必须返回空数组而非 404。
-    # seed 里只有 20240818001 有物流轨迹，20240817002 是「订单存在但无轨迹」的现成样本——
-    # 这正是最该测的一类：把正常态渲染成 404 报错是简单列表页的通病。
+    # seed 里 20240817002 是**刻意保留**的「订单存在但无轨迹」样本（状态「待付款」，
+    # 未付款本就没物流）。2026-09-18 给另外 4 单补了轨迹（18001/16003/18004/18005），
+    # 唯独它没有——这不是遗漏，是给「暂无物流」空态留的活样本。
+    # 把正常态渲染成 404 报错是简单列表页的通病，所以这条必须测。
     code, d = call("GET", "/api/admin/orders/20240817002", token=admin_token)
     check("订单存在但无物流 → traces 为 []（正常态，不是错误）",
           code == 200 and isinstance(d, dict) and d.get("traces") == [],
@@ -218,10 +224,21 @@ def test_contract(admin_token):
         ("/api/admin/orders", ["total", "page", "size", "items"]),
         ("/api/admin/refunds", ["total", "page", "size", "items"]),
         ("/api/admin/users", ["total", "page", "size", "items"]),
+        # 反馈列表多一个 sample_source（R9 口径标注）：前端**消费**它来渲染
+        # 「仅统计 Web 链路」那句说明。丢了它前端不会报错，只会开始说谎——
+        # 正是那种「没有测试会红」的静默退化，所以必须钉进契约表。
+        ("/api/admin/feedback", ["total", "page", "size", "items", "sample_source"]),
     ]:
         code, d = call("GET", ep, token=admin_token)
         missing = [k for k in keys if not isinstance(d, dict) or k not in d] if code == 200 else keys
         check(f"{ep} 形状", code == 200 and not missing, f"→ {code} 缺 {missing}")
+
+    # 反馈详情的「trace 缺失是正常态」契约（R12）：必须是 200 + trace=null，
+    # 不能是 404 —— 404 会让调用方以为「整条反馈都不存在」。
+    # 用一条**格式合法但库里没有**的 trace_id 来构造这个场景，不依赖库里有数据。
+    code, d = call("GET", "/api/admin/feedback/0000000000000000", token=admin_token)
+    check("trace 缺失时详情 → 404（该评分不存在，与上面的 trace 缺失区分开）",
+          code == 404, f"→ {code}")
 
     code, d = call("GET", "/api/admin/metrics", token=admin_token)
     need = ["samples", "scope", "sample_source", "sample_since"]

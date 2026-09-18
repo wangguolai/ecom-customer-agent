@@ -5,6 +5,7 @@ import RequireAuth from './RequireAuth'
 import RefundsPage from './pages/RefundsPage'
 import OrdersPage from './pages/OrdersPage'
 import UsersPage from './pages/UsersPage'
+import FeedbackPage from './pages/FeedbackPage'
 import MetricsPage from './pages/MetricsPage'
 
 /**
@@ -36,6 +37,10 @@ export default function AdminApp() {
         <Route path="orders" element={<OrdersPage />} />
         <Route path="users" element={<UsersPage />} />
         <Route path="users/:uid" element={<UsersPage />} />
+        <Route path="feedback" element={<FeedbackPage />} />
+        {/* 详情用 trace_id 作参数：反馈的主键就是它（feedback_id == trace_id），
+            且「看某条反馈」永远等价于「看那一轮发生了什么」 */}
+        <Route path="feedback/:traceId" element={<FeedbackPage />} />
         <Route path="metrics" element={<MetricsPage />} />
         {/* 前端自己的 404：服务端对 /admin/* 一律返回 index.html（SPA fallback），
             真正区分「页面不存在」只能靠前端路由表 */}

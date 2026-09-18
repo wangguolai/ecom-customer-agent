@@ -112,8 +112,10 @@ function UserDetail({ uid }: { uid: string }) {
         extra={<button onClick={() => navigate('/admin/users')}>← 返回列表</button>}
       />
 
+      {/* ⚠️ 这里是 JSX 文本，不是 Markdown——写 `**加粗**` 会原样显示星号。
+          （既有问题，与 FeedbackPage 同一处写法一起改；要强调请用 <b>。） */}
       <div className="admin-note">
-        这个标识可能是登录用户的 uid，也可能是**未登录时的会话 id**（聊天页没有登录，
+        这个标识可能是登录用户的 uid，也可能是<b>未登录时的会话 id</b>（聊天页没有登录，
         user_id 会回落到 session_id，30 分钟过期或点「开新会话」后就会换一个）。
         多个相似标识通常意味着同一个人的多次会话。
       </div>

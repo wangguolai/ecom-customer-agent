@@ -65,10 +65,14 @@ def main():
     print("  ✅ 二次请求命中缓存返回一致")
 
     # 场景 2：qty=0 是真实缺货，缓存真值不是空标记
-    print("📍 场景 2：qty=0 真值（豆腐猫砂缺货）")
-    r = get("/products/P029")
-    assert r.status_code == 200 and r.json().get("qty") == 0, f"豆腐猫砂返回异常: {r.status_code} {r.text}"
-    hit, data = cache.get_json("ecom:product:P029")
+    # ⚠️ 样本 id 必须来自 seed 的 _QTY_OVERRIDE 缺货档（当前 P146「元气肉泥系列」，麦富迪零食）。
+    # 这里曾经写 P029「豆腐猫砂」——豆腐猫砂早已不在商品库、全库 qty 也全是 100，
+    # 导致这条断言长期是红的（且没人发现）。改 seed 库存表时记得同步这里。
+    print("📍 场景 2：qty=0 真值（真实缺货商品）")
+    _OOS = "P146"
+    r = get(f"/products/{_OOS}")
+    assert r.status_code == 200 and r.json().get("qty") == 0, f"缺货商品返回异常: {r.status_code} {r.text}"
+    hit, data = cache.get_json(f"ecom:product:{_OOS}")
     assert hit and data and data.get("qty") == 0, f"qty=0 被当空标记或未缓存: hit={hit} data={data}"
     print(f"  ✅ 缓存 {data}（qty=0 是真实数据，不是 __EMPTY__）")
 

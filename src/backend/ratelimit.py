@@ -34,7 +34,9 @@ from src.backend.cache import _redis as _redis_client
 def rate_limit(bucket: str, client: str, window: int, max_req: int) -> bool:
     """滑动窗口限流。返回 True=放行，False=超限（429）。
 
-    bucket: 桶名（"read" / "write"）
+    bucket: 桶名。现有：read / write / auth / memory / admin / feedback —— **按「被谁打、
+            打满的后果波及谁」分桶**，不是按接口分类（auth 挨爆破不能连带瘫痪 write，
+            feedback 匿名可写不能让灌评分把聊天打成 429）。
     client: 客户端标识（demo 固定，生产 per-IP；全局桶挡不住单客户端刷，防刷靠 per-IP 粒度）
     window: 窗口秒数
     max_req: 窗口内最大请求数

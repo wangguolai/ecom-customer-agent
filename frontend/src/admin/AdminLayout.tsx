@@ -5,6 +5,9 @@ const NAV = [
   { to: '/admin/refunds', label: '退款工单' },
   { to: '/admin/orders', label: '订单 / 物流' },
   { to: '/admin/users', label: '用户画像' },
+  // 排在「运行指标」之前：反馈是**可行动的数据**（点进去能看 trace 定位问题），
+  // 指标是**纯观测**。需要动手的排在只能看的上面。
+  { to: '/admin/feedback', label: '反馈评分' },
   { to: '/admin/metrics', label: '运行指标' },
 ]
 

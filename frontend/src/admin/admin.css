@@ -184,6 +184,28 @@
 }
 .admin-traces li:last-child { border-bottom: none; }
 
+/* 详情里的「字段名 : 值」列表（反馈详情 / trace 回溯用） */
+.admin-kv {
+  margin: 0; display: grid; grid-template-columns: 92px 1fr; gap: 8px 14px;
+  font-size: 13px;
+}
+.admin-kv dt { color: #6b7280; }
+.admin-kv dd { margin: 0; min-width: 0; }
+/* 回答是多行文本，保留换行；否则整段挤成一行没法读 */
+.admin-prewrap { white-space: pre-wrap; word-break: break-word; }
+.admin-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+/* 差评用红色，和好评在扫一眼时就能分开——列表页默认只看差评，颜色是第二重区分 */
+.admin-badge-bad { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
+
+/* 列表筛选按钮组 */
+.admin-filters { display: flex; gap: 6px; margin: 12px 0; }
+.admin-filters button {
+  padding: 5px 13px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  border: 1px solid #d1d5db; background: #fff; color: #374151;
+}
+.admin-filters button:hover { background: #f3f4f6; }
+.admin-filters button.admin-filter-on { background: #2563eb; border-color: #2563eb; color: #fff; }
+
 /* ── 指标卡 ── */
 .admin-tiles { display: flex; flex-wrap: wrap; gap: 12px; }
 .admin-tile {

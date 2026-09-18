@@ -255,7 +255,12 @@ async def search_orders(order_id: str) -> str:
     if resp.status_code == 404:
         return f"未查到订单号 {order_id}，请核对订单号。"
     if resp.status_code != 200:
-        return f"订单查询失败（状态码 {resp.status_code}），请稍后重试。"
+        # 不回显 HTTP 状态码：属于「系统内部机制」，SYSTEM_PROMPT 第 7 条明令不外泄。
+        # **这里是实测到的真实泄露源**：评测 baseline 的「工具参数非法拦截」case，
+        # 用户问「查订单abcdefg的物流」，后端对非法订单号返回 400，
+        # agent 原话就是「系统返回查询失败（状态码 400）」——这条 case 一次都没调 check_stock，
+        # 所以把收口只做在 check_stock 上是打偏了（曾因此漏堵这里）。
+        return "订单查询暂时失败，请稍后重试或转人工。"
     d = resp.json()
     # 输出校验（格式级）：字段类型/非空。枚举级（status 值）透传——业务枚举会扩展（如「已退款」），
     # 未知值如实告诉用户，不降级「数据异常」（降级会掩盖正常数据）。格式级异常（脏数据/缺字段）才拦。
@@ -278,7 +283,8 @@ async def search_logistics(order_id: str) -> str:
     if resp.status_code == 404:
         return f"未查到订单号 {order_id} 的物流信息。"
     if resp.status_code != 200:
-        return f"物流查询失败（状态码 {resp.status_code}），请稍后重试。"
+        # 同 /orders：状态码不外泄（这里是实测泄露源之一）
+        return "物流查询暂时失败，请稍后重试或转人工。"
     d = resp.json()
     # 输出校验（格式级）：traces 必须是 list 且每项含 time/location/status 三字段。
     # 否则（如故障注入 empty 返回 {}）d["traces"] 会 KeyError，被 agent 误捕成「参数不匹配」而非「数据异常」。
@@ -300,12 +306,15 @@ async def check_stock(product_id: str) -> str:
             return "请求过于频繁，请稍后再试。"
         return "价格/库存查询服务暂不可用（后端未启动或超时），请稍后重试或转人工。"
     if resp.status_code == 404:
-        return f"未查到商品 {product_id}。"
+        # 不回显 product_id：它是内部字段，LLM 会原样转述给用户（实测发生过「英短专用粮（P016）」）。
+        # 「未查到」保留——它确实是空返回，会让 agent 打 is_empty 标记，这是**正确**的语义。
+        return "未查到该商品的库存信息。请确认商品名称，或换一个关键词重新查找。"
     if resp.status_code != 200:
-        return f"价格/库存查询失败（状态码 {resp.status_code}），请稍后重试。"
+        # 不回显 HTTP 状态码：属于「系统内部机制」，SYSTEM_PROMPT 第 7 条明令不外泄。
+        return "价格/库存查询暂时失败，请稍后重试或转人工。"
     d = resp.json()
     # 输出校验（格式级）：qty 是非负 int（排除 bool，bool 是 int 子类）、price 是非负数字。
-    # qty=0 是合法缺货（豆腐猫砂），不误伤；格式级异常（负数/非数字/脏数据）降级，不把脏数据回灌 LLM。
+    # qty=0 是合法缺货（如 P009/P058/P146/P153），不误伤；格式级异常（负数/非数字/脏数据）降级，不把脏数据回灌 LLM。
     qty = d.get("qty")
     price = d.get("price")
     if isinstance(qty, bool) or not isinstance(qty, int) or qty < 0:
@@ -330,6 +339,10 @@ def _get_return_policy_sync(query: str) -> str:
         print("⚠️ 政策块未入库，请先跑 python -m src.refresh")
         return RETURN_POLICY
     label, results = retriever.search(query, kb_type="policy")
+    # 政策检索此前**从不记录 chunk_id** —— 而政策问答（如「15 天无理由还能用吗」）
+    # 恰恰是最需要复现的一类：错答往往是「命中了错的块」而不是「没命中」，
+    # 不记 chunk_id 就永远看不出它命中了哪一块。同样放在 return 之前（双低也记）。
+    _record_retrievals(results)
     if label == "双低" or not results:
         return RETURN_POLICY
     parts = []
@@ -413,7 +426,8 @@ async def refund_order(order_id: str) -> str:
     if resp.status_code == 400:
         return f"退款请求被拒绝：{resp.json().get('detail', '参数非法')}"
     if resp.status_code != 200:
-        return f"退款失败（状态码 {resp.status_code}），请稍后重试。"
+        # 同其他工具：状态码不外泄（同类泄露，顺手收口）
+        return "退款失败，请稍后重试或转人工。"
     d = resp.json()
     # 输出校验（格式级）：refund_amount 必须是数字（排除 bool）；ticket_id / message_id 至少有一个。
     # 否则（如故障注入 empty 返回 {}）d["message_id"] 会 KeyError，被 agent 误捕成「参数不匹配」而非「数据异常」。
@@ -487,24 +501,72 @@ STRATEGY_HINTS = {
 _collected_images = []
 
 
+# 图注前缀，按**优先级**排列（「特点」比「类别」信息量大）
+_INTRO_PREFIXES = ("- 特点：", "- 类别：")
+
+
+def _extract_intro(text: str) -> str:
+    """从 chunk 文本里抽图注：优先「特点」，回退「类别」。
+
+    ⚠️ **必须先扫完所有行再择优，不能「命中第一行就 break」**：
+    products.md 的字段顺序恒为 `- ID：` → `- 类别：` → `- 特点：` → `- 图片：`，
+    「类别」永远排在「特点」前面。单层「找到就 break」会让「特点」分支**永远走不到**——
+    这条路径曾经真的成了死代码，162 个商品里 47 个有「特点」行却全取不到，
+    用户看到的是「狗粮」而不是「高能增肌益关节」。
+    （「按优先级排列的元组」只有在内层循环同时遍历前缀、且不提前退出时才有意义。）
+
+    切片一律用 `len(prefix)`、**绝不写死数字**：这里曾经写成 `line[4:]`，
+    而 `"- 特点："` 是 5 个字符（`-`/空格/`特`/`点`/全角`：`），偏移一位从全角冒号起切，
+    导致每条图注都变成 `"：猫粮"`（用户实测看到的就是这个）。
+    """
+    found = {}
+    for line in text.split("\n"):
+        for p in _INTRO_PREFIXES:
+            if p not in found and line.startswith(p):
+                found[p] = line[len(p):].strip()
+    return found.get("- 特点：") or found.get("- 类别：") or ""
+
+
+# 本轮检索命中的 chunk_id（含**没有图**的）——供 trace 落盘，用来复现失败
+_collected_retrievals = []
+
+
+def _record_retrievals(results):
+    """记录本轮检索命中的 chunk_id（去重、保序）。
+
+    **为什么另开一个收集器，而不是复用 `_record_images`**：后者只收「有图」的商品
+    （`if len(r) > 5 and r[5]`），而没图的一律拿不到——恰好包括最该复现的两类失败：
+    政策问答（chunk_id 形如 `policies:{标题}`，本来就没图）和双低拒答。
+    一个「用来复现失败」的字段，在最典型的失败上零覆盖，等于没有。
+
+    ⚠️ 已知限制：这是**模块级 list**，多请求并发时会互相串（同 `_collected_images`）。
+    对图片来说串了只是 UI 瑕疵，但 retrieved_ids 串了是**往排障表里写别人的数据**。
+    demo 单用户 + 前端 streaming 期间禁用输入，当前不触发；要支持并发得改成 per-request 传递。
+    """
+    for r in results:
+        cid = r[0] if r else None
+        if cid and cid not in _collected_retrievals:
+            _collected_retrievals.append(cid)
+
+
+def pop_collected_retrievals() -> list:
+    """读取并清空本轮检索命中的 chunk_id（agent 每轮结束后调用，供 trace 落盘）"""
+    global _collected_retrievals
+    ids = list(_collected_retrievals)
+    _collected_retrievals = []
+    return ids
+
+
 def _record_images(results):
     """从检索结果收集商品图（去重），供展示层渲染。results 是六元组 (cid, score, text, title, product_id, image)。
 
     图必须带「介绍」——光图没文字是废的，用户不知道这商品是什么/有什么特点。
-    从 chunk 文本里抽「特点」行（没有则抽「类别」）作为 intro，和图一起给前端，保证「商品↔图↔介绍」一一对应。
+    介绍由 `_extract_intro` 从 chunk 文本抽取（特点优先、类别兜底），
+    和图一起给前端，保证「商品↔图↔介绍」一一对应。
     """
     for r in results:
         if len(r) > 5 and r[5]:
-            intro = ""
-            for line in r[2].split("\n"):
-                if line.startswith("- 特点："):
-                    intro = line[4:].strip()  # 「特点：xxx」
-                    break
-            if not intro:
-                for line in r[2].split("\n"):
-                    if line.startswith("- 类别："):
-                        intro = line[4:].strip()  # 「类别：狗粮」
-                        break
+            intro = _extract_intro(r[2])
             item = {"product_id": r[4], "title": r[3], "image": r[5], "intro": intro}
             if item not in _collected_images:
                 _collected_images.append(item)
@@ -523,16 +585,37 @@ def _search_products_sync(query: str, top_k: int) -> str:
     category = detect_category(query)
     label, results = _get_hybrid_retriever().search(query, top_k=top_k, category=category, kb_type="product")
 
+    # 记录检索命中（chunk_id）放在**最前面**，双低也要记 ——
+    # 双低是「检索到了但被策略拒了」，正是最该复现的一类失败，放在 return 之后会整类漏掉。
+    _record_retrievals(results)
+
     if label == "双低":
         return "知识库检索无高置信度匹配。请如实告知用户暂未找到相关信息、可建议联系人工客服，不要编造商品信息。"
 
     _record_images(results)  # 商品图单独收集，供前端渲染（不进 LLM 文本）
     parts = []
     for i, (cid, score, text, title, product_id, image) in enumerate(results, 1):
-        parts.append(f"[{i}] {title}（product_id: {product_id}）\n{text}")
+        # 刻意**不重复 title**：紧跟其后的 `text` 首行就是 `## {title}`。
+        # 一篇结果里标题出现两次白花 ~20 字符 × 3 条 = 60 字符，
+        # 而 MAX_TOOL_RESULT_LEN=500 的余量实测只剩 10-14 字符（最坏组合理论值 526 会截断第 3 条尾部）。
+        parts.append(f"[{i}] product_id={product_id}（内部字段）\n{text}")
 
-    # 策略提示（系统生成的受信任指令）+ 检索结果（外部数据），分开标注，不混进「数据/指令分离」的防御里
-    return f"[检索策略：{label}]\n{STRATEGY_HINTS[label]}\n\n" + "\n\n".join(parts)
+    # 策略提示（系统生成的受信任指令）+ 检索结果（外部数据），分开标注，不混进「数据/指令分离」的防御里。
+    #
+    # 头部这三句说明，各自对应一个真实缺陷：
+    #   ① **规模**：LLM 曾把「检索到 3 条」当成「知识库总共只有 3 款」，对用户下了错误的全局断言
+    #      （用户实测踩到）。刻意**不假装知道总数**——语义检索里「总数」没有精确定义
+    #      （「皇家猫粮」算 12 款还是 54 款取决于粒度），编一个数字比承认「这是前 N 条」更危险。
+    #   ② **字段用途**：product_id 是给 check_stock 用的内部字段，曾经被 LLM 原样转述给用户
+    #      （「皇家成年期全价猫粮主食罐（P057）」）。这里**只在本行说明一次**，不逐条重复——
+    #      逐条写会顶到 MAX_TOOL_RESULT_LEN=500 的边界，导致第 3 条的尾部时有时无（偶发截断更难查）。
+    #   ③ **措辞**：刻意不含 EMPTY_SIGNALS（"未查到/不存在/无高置信度匹配"）里的任何词——
+    #      那些词会让 agent 把本次调用标记成「工具空返回」进 trace，污染可观测与评测。
+    return (
+        f"[检索策略：{label}]（本次返回前 {len(results)} 条，**仅为本次检索结果，不代表库里只有这些**；"
+        f"用户要更多时换关键词再查；回答里不要出现 product_id 这类内部字段）\n"
+        f"{STRATEGY_HINTS[label]}\n\n" + "\n\n".join(parts)
+    )
 
 
 async def search_products(query: str, top_k: int = 3) -> str:

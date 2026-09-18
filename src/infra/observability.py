@@ -11,12 +11,17 @@ MetricsStore：聚合多次 Trace，算技术成功率、P99 延迟、平均延�
 """
 
 import time
+import uuid
 
 
 class Trace:
     """一次对话的 trace"""
 
-    def __init__(self):
+    def __init__(self, trace_id: str = None):
+        # trace_id：贯穿「SSE 首帧 → 前端评分 → 落库 → 后台回溯」的那条线。
+        # 请求开始时由调用方（main.py）生成并传入，保证「SSE 首帧发给前端的 id」
+        # 与「落库的 id」是同一个；不传则自生成（CLI / 测试路径）。
+        self.trace_id = trace_id or uuid.uuid4().hex[:16]
         self.start = time.perf_counter()
         self.steps = []       # [(step, elapsed, tokens, prompt_tokens)] 每次 LLM 决策
         self.tool_calls = []  # [(name, elapsed, step, is_empty)] 每次工具调用
@@ -24,7 +29,10 @@ class Trace:
         self.cache_hit_tokens = 0   # DeepSeek 前缀缓存命中 token（按命中价计费，~1/30 输入价）
         self.cache_miss_tokens = 0  # 缓存未命中 token（按未命中价计费）
         self.route_source = "LLM"  # 路由来源：LLM（默认决策） / 规则（意图路由层命中，省一次决策调用）
-        self.end_reason = "未知"  # 正常 / 死循环 / 超步数 / 异常
+        self.end_reason = "未知"  # 正常 / 死循环 / 超步数 / 异常 / 断开
+        # 本轮检索命中的 chunk_id（含没图的）。落盘用——**不带它就无法复现「检索错了」**
+        # 这类失败：看不到当时命中了哪些块，只能看到最终答案。
+        self.retrieved_ids = []
 
     def add_llm(self, step: int, elapsed: float, tokens, prompt_tokens=None, cache_hit=0, cache_miss=0):
         self.steps.append((step, elapsed, tokens or 0, prompt_tokens or 0))
@@ -73,7 +81,9 @@ class Trace:
     def __repr__(self):
         s = self.summary()
         return (
-            f"<Trace 耗时={s['总耗时(秒)']}s LLM={s['LLM 调用次数']}次 "
+            # 带 trace_id 短前缀：排障时能从服务端日志直接拿 id 去 traces 表里查，
+            # 不用先按时间/会话反查（这是落盘带来的顺带收益）
+            f"<Trace {self.trace_id[:8]} 耗时={s['总耗时(秒)']}s LLM={s['LLM 调用次数']}次 "
             f"token={s['总 token 消耗']} 缓存命中率={s['缓存命中率']:.1%} "
             f"工具={s['工具调用次数']}次 空返回={s['召回端空返回次数']} 结束={s['结束原因']}>"
         )

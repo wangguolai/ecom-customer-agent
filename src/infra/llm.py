@@ -68,7 +68,16 @@ async def chat(messages: list[dict], tools: Optional[list[dict]] = None, model: 
 
 
 async def stream_events(messages: list[dict], tools: Optional[list[dict]] = None, model: Optional[str] = None, temperature: float = 0.0, max_tokens: Optional[int] = None):
-    """流式对话，产出事件序列：("text", delta) 逐 token 文本 + ("tool_calls", 完整累积列表)。
+    """流式对话，产出事件序列。
+
+    **出边界的 kind 有三种（契约，调用方必须显式列举，不能用 `else` 兜）**：
+      ("text",  str)   —— 逐 token 文本，边收边产出
+      ("tool_calls", list) —— 完整累积的工具调用（流式结束一次性产出，**总是在 usage 之前**）
+      ("usage", obj)   —— token/cache 统计（需 include_usage；挂在最后一个 chunk 上）
+
+    ⚠️ 第三种是后加的：早期只有 text / tool_calls，调用方普遍写成 `if text: ... else: tool_calls`。
+    新增 usage 后这种写法会**静默把 usage 对象当成 tool_calls**——决策轮覆盖列表、
+    答案轮（唯一的非 text 事件就是 usage）直接走错分支。本项目已把调用点改成显式三分支。
 
     为什么要同时产出 text 和 tool_calls：agent 的 ReAct 循环无法预知某一轮是「决策」（返回
     tool_calls）还是「最终答案」（返回 content），流式下必须边收 delta 边判断。text 逐 token
@@ -87,6 +96,11 @@ async def stream_events(messages: list[dict], tools: Optional[list[dict]] = None
         "messages": messages,
         "temperature": temperature,
         "stream": True,
+        # 让流式也拿得到 token/cache 统计（此前流式路径的 token 只能记 0）。
+        # **实测确认（2026-09-18）**：DeepSeek 支持该参数，usage 挂在**最后一个 chunk** 上
+        # （`choices` 长度 = 1，**不是** OpenAI 标准的空数组）——两篇资料对此说法互相矛盾，
+        # 以实测为准。含 prompt_cache_hit_tokens / prompt_cache_miss_tokens。
+        "stream_options": {"include_usage": True},
     }
     if tools:
         params["tools"] = tools
@@ -94,7 +108,13 @@ async def stream_events(messages: list[dict], tools: Optional[list[dict]] = None
         params["max_tokens"] = max_tokens
     stream = await get_client().chat.completions.create(**params)
     tool_calls = {}  # index -> {"id", "name", "arguments"}
+    final_usage = None
     async for chunk in stream:
+        # ⚠️ 必须在 `if not chunk.choices: continue` **之前**捕获 usage：
+        # DeepSeek 当前把它挂在最后一个**内容块**上（choices 非空），但若某天供应商改成
+        # OpenAI 标准的「空 choices 块」，先 continue 就会把统计整条漏掉。
+        if getattr(chunk, "usage", None):
+            final_usage = chunk.usage
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -113,3 +133,7 @@ async def stream_events(messages: list[dict], tools: Optional[list[dict]] = None
     if tool_calls:
         ordered = [tool_calls[i] for i in sorted(tool_calls)]
         yield ("tool_calls", ordered)
+    # usage 刻意排在 tool_calls **之后**：调用方靠「有没有 tool_calls」区分决策轮/答案轮，
+    # 顺序颠倒会让它把 usage 对象当成 tool_calls 列表（曾经会直接 TypeError）。
+    if final_usage is not None:
+        yield ("usage", final_usage)
