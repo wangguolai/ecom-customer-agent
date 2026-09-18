@@ -1,0 +1,89 @@
+/* 样式与原版 web/index.html 保持一致；唯一差别：flex 布局容器从 body 移到 #root（React 挂载点） */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f5f6f7;
+}
+
+#root {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+}
+
+.header {
+    background: linear-gradient(135deg, #2b5876, #4e4376); color: #fff;
+    padding: 14px 20px; font-size: 1.1em; font-weight: 600; flex-shrink: 0;
+}
+.header small { font-weight: 400; opacity: .8; margin-left: 10px; }
+
+.chat {
+    flex: 1; overflow-y: auto; padding: 16px; max-width: 860px; width: 100%; margin: 0 auto;
+}
+
+.msg { margin-bottom: 16px; display: flex; gap: 10px; }
+.msg.user { justify-content: flex-end; }
+
+.bubble {
+    max-width: 78%; padding: 10px 14px; border-radius: 12px; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-word; font-size: .95em;
+}
+.msg.user .bubble { background: #4e4376; color: #fff; border-bottom-right-radius: 3px; }
+.msg.assistant .bubble { background: #fff; color: #333; border: 1px solid #e5e6e8; border-bottom-left-radius: 3px; }
+
+.avatar {
+    width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; font-size: 1.1em;
+}
+.msg.user .avatar { background: #dfe4ea; }
+.msg.assistant .avatar { background: #e8f0fe; }
+
+.images { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.images figure { width: 140px; text-align: center; }
+.images img {
+    width: 140px; height: 140px; object-fit: cover; border-radius: 10px;
+    border: 1px solid #e5e6e8; cursor: zoom-in; background: #fff;
+}
+.images figcaption { font-size: .72em; color: #888; margin-top: 4px; line-height: 1.4; }
+.product-intro { display: block; color: #4e4376; margin-top: 2px; font-size: .95em; }
+
+/* 伪菜单：三级漏斗第一级的产品化——把口语意图翻译成规则层能命中的规范表达 */
+.menu {
+    flex-shrink: 0; padding: 10px 16px 0; background: #fff; border-top: 1px solid #e5e6e8;
+    max-width: 860px; width: 100%; margin: 0 auto;
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+}
+.menu .menu-label { font-size: .78em; color: #999; margin-right: 2px; }
+.menu button {
+    padding: 5px 13px; background: #f2f0f8; color: #4e4376; border: 1px solid #ded8ee;
+    border-radius: 999px; font-size: .82em; cursor: pointer; transition: all .15s;
+    font-family: inherit;
+}
+.menu button:hover { background: #4e4376; color: #fff; border-color: #4e4376; }
+.menu button:disabled { opacity: .45; cursor: default; }
+/* 「新会话」是操作不是快捷意图：靠右、弱化配色，别和 6 个意图按钮混成一排 */
+.menu button.menu-reset { margin-left: auto; background: #fff; border-color: #e5e6e8; color: #999; }
+.menu button.menu-reset:hover { background: #999; color: #fff; border-color: #999; }
+
+.input-area {
+    flex-shrink: 0; padding: 10px 16px 12px; background: #fff;
+    display: flex; gap: 10px; max-width: 860px; width: 100%; margin: 0 auto;
+}
+.input-area input {
+    flex: 1; padding: 10px 14px; border: 1px solid #d0d3d8; border-radius: 8px; font-size: .95em; outline: none;
+}
+.input-area input:focus { border-color: #4e4376; }
+.input-area button {
+    padding: 10px 22px; background: #4e4376; color: #fff; border: none; border-radius: 8px;
+    font-size: .95em; cursor: pointer; transition: background .2s;
+}
+.input-area button:hover { background: #3b3360; }
+.input-area button:disabled { background: #b0aec4; cursor: default; }
+
+/* 大图浮层 */
+.lightbox {
+    position: fixed; inset: 0; background: rgba(0,0,0,.8); display: none;
+    align-items: center; justify-content: center; z-index: 999;
+}
+.lightbox img { max-width: 90vw; max-height: 90vh; border-radius: 8px; }

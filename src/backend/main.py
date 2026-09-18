@@ -27,6 +27,7 @@ if _project_root not in sys.path:
 
 from src.backend.db import get_conn, close_conn
 from src.backend import cache
+from src.backend import session_store
 from src.backend import fault
 from src.backend import mq
 from src.backend import ratelimit
@@ -77,6 +78,20 @@ async def lifespan(app: FastAPI):
     _consumer_stop = threading.Event()
     _consumer_thread = threading.Thread(target=mq.consume_loop, args=(_consumer_stop,), daemon=True, name="refund-consumer")
     _consumer_thread.start()
+
+    # 模型预热（embedding + rerank）：政策/商品检索要走向量 + 精排，而模型是懒加载单例——
+    # 不预热的话 **第一次走检索的请求** 会现装模型（实测 +8s，用户视角就是「点一下卡住了」）。
+    # ⚠️ 必须在这个位置同步调用（主线程）：进事件循环后检索走 asyncio.to_thread，
+    #    torch 在 worker 线程首次初始化 CUDA 会死锁（不报错、直接挂起）——warmup.py 的文档写了这个坑。
+    # 容错（非致命）：后端容器只装 requirements-backend.txt（无 torch），agent 跑宿主机时后端用不到模型，
+    # 所以预热失败只告警、不阻断启动。
+    try:
+        from src.infra.warmup import warmup_models
+        warmup_models()
+        print("✅ 模型预热完成（embedding + rerank 已就绪）")
+    except Exception as e:  # noqa: BLE001 —— 预热失败绝不能挡住服务启动，任何异常都降级为告警
+        print(f"⚠️ 模型预热跳过（{type(e).__name__}: {e}）——不走向量检索的部署可忽略")
+
     yield
     _consumer_stop.set()
 
@@ -88,10 +103,23 @@ app = FastAPI(title="电商客服后端", lifespan=lifespan)
 app.mount("/product_images", StaticFiles(directory=os.path.join(_project_root, "data", "product_images")), name="product_images")
 
 
-# 前端对话页面（web/index.html）
+# 前端对话页面
+# 两代并存：优先 React 构建产物（frontend/dist，npm run build 生成），未构建时回落到原版单文件页
+# （web/index.html）。回落分支保证「clone 下来没装 node 也能跑」——前端构建不是启动后端的前置条件。
+_FRONTEND_DIST = os.path.join(_project_root, "frontend", "dist")
+_FRONTEND_ASSETS = os.path.join(_FRONTEND_DIST, "assets")
+_LEGACY_INDEX = os.path.join(_project_root, "web", "index.html")
+if os.path.isdir(_FRONTEND_ASSETS):
+    # vite 会把 js/css 打进 dist/assets/ 并带内容哈希，挂成静态目录
+    app.mount("/assets", StaticFiles(directory=_FRONTEND_ASSETS), name="assets")
+
+
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(os.path.join(_project_root, "web", "index.html"))
+    dist_index = os.path.join(_FRONTEND_DIST, "index.html")
+    if os.path.exists(dist_index):
+        return FileResponse(dist_index)
+    return FileResponse(_LEGACY_INDEX)
 
 
 # ── 限流依赖（模块 5）──
@@ -261,7 +289,10 @@ def check_online(_: None = Depends(_limit_read)):
         return {}  # 缺 online 字段 → tools 侧 .get("online") 为 None → 按不在线保守处理
     if _online_override is not None:
         return {"online": _online_override}
-    online = os.environ.get("CS_ONLINE", "true").strip().lower() == "true"
+    # 默认 false（诚实优先）：本地 demo 没有真人坐席，默认答「不在线/已记录工单」是**真实**的；
+    # 反过来默认 true 会让 agent 承诺「已为您转接人工客服」——本地根本没人接，是假承诺。
+    # 要演示「已转接」场景就显式设 CS_ONLINE=true（评测走 /debug/online 覆盖，不受此处默认值影响）。
+    online = os.environ.get("CS_ONLINE", "false").strip().lower() == "true"
     return {"online": online}
 
 
@@ -340,9 +371,17 @@ async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_
     # 边界清洗：孤立代理等非法码点在流式链路（LLM/SSE）里一样会炸，进系统第一件事先降级
     user_msg = user_msg.encode("utf-8", "replace").decode("utf-8")
 
-    session = AgentSession()
+    # 会话层：带 session_id 则恢复跨轮上下文（前端生成、localStorage 持久）。
+    # 缺 id / 非字符串 → 退回无状态单轮（兼容旧前端与直接 curl 调用，不报错）——
+    # 会话是增强不是依赖，拿不到就当新会话，不能让请求失败。
+    raw_sid = payload.get("session_id")
+    session_id = raw_sid.strip() if isinstance(raw_sid, str) and raw_sid.strip() else None
+    history = session_store.load(session_id)
+
+    session = AgentSession(history)
 
     async def event_gen():
+        answer = ""
         try:
             # 假流式（debug，零付费）：FAKE_STREAM=1 时用假内容 + sleep 模拟慢速流式，
             # 专门验证「断开检测」机制，不真调 LLM。和 ENABLE_DEBUG_FAULT 同性质的调试能力。
@@ -353,6 +392,7 @@ async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_
                 print("假流式跑完 500 段（客户端未断开）")
                 return
             async for delta in session.stream_chat(user_msg):
+                answer += delta  # 累积完整答案供会话层落历史（SSE 单向流，生成器外面拿不到最终文本）
                 yield f"data: {json.dumps({'delta': delta}, ensure_ascii=False)}\n\n"
             # 流式结束：把本轮检索命中的商品图作为单独事件发给前端渲染（图不进 LLM 文本）
             from src.tools import pop_collected_images
@@ -364,6 +404,9 @@ async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_
             # Starlette 1.6 内置 listen_for_disconnect 检测到断开会 cancel 本生成器，
             # 接住让请求体面结束；LLM 流已随 cancel 级联关闭，停止烧 token。
             print("客户端已断开，停止流式输出")
+        finally:
+            # 落历史：answer 为空（断开/异常）时 save 内部直接返回，不把半截回复写进上下文
+            session_store.save(session_id, history, user_msg, answer)
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 

@@ -40,8 +40,22 @@ body {
 }
 .images figcaption { font-size: .72em; color: #888; margin-top: 4px; line-height: 1.4; }
 .product-intro { display: block; color: #4e4376; margin-top: 2px; font-size: .95em; }
+/* 伪菜单：三级漏斗第一级的产品化——把口语意图翻译成规则层能命中的规范表达 */
+.menu {
+    flex-shrink: 0; padding: 10px 16px 0; background: #fff; border-top: 1px solid #e5e6e8;
+    max-width: 860px; width: 100%; margin: 0 auto;
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+}
+.menu .menu-label { font-size: .78em; color: #999; margin-right: 2px; }
+.menu button {
+    padding: 5px 13px; background: #f2f0f8; color: #4e4376; border: 1px solid #ded8ee;
+    border-radius: 999px; font-size: .82em; cursor: pointer; transition: all .15s;
+    font-family: inherit;
+}
+.menu button:hover { background: #4e4376; color: #fff; border-color: #4e4376; }
+.menu button:disabled { opacity: .45; cursor: default; }
 .input-area {
-    flex-shrink: 0; padding: 12px 16px; background: #fff; border-top: 1px solid #e5e6e8;
+    flex-shrink: 0; padding: 10px 16px 12px; background: #fff;
     display: flex; gap: 10px; max-width: 860px; width: 100%; margin: 0 auto;
 }
 .input-area input {
@@ -63,8 +77,9 @@ body {
 </style>
 </head>
 <body>
-<div class="header">🐾 宠物电商客服 Agent <small>真实商品库 · 162 个商品 · 混合检索 + Rerank</small></div>
+<div class="header">🐾 宠物电商客服 Agent <small>真实商品库 · 162 款在售商品</small></div>
 <div class="chat" id="chat"></div>
+<div class="menu" id="menu"><span class="menu-label">快捷：</span></div>
 <div class="input-area">
     <input id="msg" placeholder="问点什么：幼犬吃什么粮？有肠胃敏感的猫粮吗？" onkeydown="if(event.key==='Enter')send()">
     <button id="send-btn" onclick="send()">发送</button>
@@ -118,12 +133,50 @@ function renderImages(images, container) {
     chatEl.scrollTop = chatEl.scrollHeight;
 }
 
+// ── 伪菜单（三级漏斗第一级的产品化）──
+// text：点击后填进输入框的「规范化意图句」——规则层能命中的表达。
+// arg ：是否需要用户补参数。
+//       true  = 只填入并聚焦，光标停在末尾等用户补（订单号/商品名），回车才发。
+//       false = 本身就是完整意图，填入后立即发送，直达规则路由（零 LLM 决策）。
+// 为什么不用「点了就发、缺参数让 agent 反问」：反问补参要求跨轮记住「刚才点的是查订单」，
+// 而 /chat/stream 每次请求都新建 AgentSession、前端也不传历史 —— 无状态链路上反问接不住。
+// 改成前端补参数，参数不跨轮传递，规则路由 100% 命中。
+const DEFAULT_PLACEHOLDER = msgEl.placeholder;
+const MENU_ITEMS = [
+    { label: '📦 查订单', text: '查订单 ', arg: true, tip: '补上订单号，例如：查订单 20240818001' },
+    { label: '🚚 查物流', text: '查物流 ', arg: true, tip: '补上订单号，例如：查物流 20240818001' },
+    { label: '🏷️ 查库存', text: '查库存 ', arg: true, tip: '补上商品名，例如：查库存 皇家幼犬粮' },
+    { label: '📋 退货政策', text: '退货政策', arg: false },
+    { label: '🐾 商品咨询', text: '', arg: true, tip: '说说你想了解什么，例如：幼犬吃什么粮？' },
+    { label: '🙋 转人工', text: '我要转人工，我的问题是：', arg: true, tip: '接在后面描述一下问题' },
+];
+
+const menuEl = document.getElementById('menu');
+const menuBtns = [];
+for (const item of MENU_ITEMS) {
+    const btn = document.createElement('button');
+    btn.textContent = item.label;
+    btn.onclick = () => pickMenu(item);
+    menuEl.appendChild(btn);
+    menuBtns.push(btn);
+}
+
+function pickMenu(item) {
+    msgEl.placeholder = item.tip || DEFAULT_PLACEHOLDER;
+    msgEl.value = item.text || '';
+    msgEl.focus();
+    const end = msgEl.value.length;
+    msgEl.setSelectionRange(end, end);   // 光标停末尾，用户直接续写参数
+    if (!item.arg) send();               // 无参意图：点了就发
+}
+
 async function send() {
     const msg = msgEl.value.trim();
     if (!msg) return;
     addMsg('user').textContent = msg;
     msgEl.value = '';
     sendBtn.disabled = true;
+    menuBtns.forEach(b => b.disabled = true);
     const bubble = addMsg('assistant');
 
     try {
@@ -166,6 +219,7 @@ async function send() {
         bubble.textContent = '连接异常：' + e.message;
     } finally {
         sendBtn.disabled = false;
+        menuBtns.forEach(b => b.disabled = false);
     }
 }
 </script>

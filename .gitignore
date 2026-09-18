@@ -48,3 +48,9 @@ docs/project-roadmap.md
 scripts/jd_cookies.json
 scripts/seed_snippet.txt
 scripts/smzdm_products.json
+
+# 前端（React + TS，frontend/）：依赖与构建产物不入库
+# dist 不入库是有意的——后端 `/` 路由优先读 frontend/dist、读不到回落到 web/index.html，
+# 所以「clone 下来没装 node 也能跑」这条不被破坏；要用 React 版就跑一次 npm run build。
+frontend/node_modules/
+frontend/dist/
