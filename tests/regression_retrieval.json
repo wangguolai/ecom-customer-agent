@@ -4,53 +4,236 @@
     {
       "query": "我家猫毛色越来越差，摸起来糙糙的",
       "expected": [
-        "成猫美毛粮（渴望牌）"
+        "美毛呵护成猫全价粮（皇家牌）"
       ],
-      "fail_type": "top1错",
-      "first_actual": "猫咪化毛膏",
-      "added_at": "2026-08-26",
       "expect_type": "fix",
-      "note": "",
-      "status": "open"
-    },
-    {
-      "query": "手机壳",
-      "expected": [
-        "宠物航空箱"
-      ],
-      "fail_type": "软推",
-      "first_actual": "宠物航空箱",
+      "fail_type": "top1错",
+      "first_actual": "",
+      "note": "2026-09-18 重标：旧 expected「成猫美毛粮（渴望牌）」随 41 假商品库下线，新库等价物是皇家美毛呵护成猫粮。first_actual 待重跑写回（不人工编造）",
       "added_at": "2026-08-26",
-      "expect_type": "lock",
-      "note": "超知识库 query，软推相关商品是「召回优先」的正确行为（语义相似≠业务相关），锁住防误修成拒答",
       "status": "open"
     },
     {
       "query": "狗凉",
       "expected": [
-        "幼犬成长粮（皇家牌）",
-        "成犬均衡粮（皇家牌）",
-        "肠胃敏感狗粮（皇家牌）",
-        "老年犬配方粮（皇家牌）",
-        "幼犬奶糕粮（冠能牌）",
-        "大型犬高钙粮（冠能牌）",
-        "小型犬专用粮（渴望牌）"
+        "小型犬成犬全价粮（皇家牌）",
+        "中型犬成犬全价粮（皇家牌）",
+        "大型犬成犬全价粮（皇家牌）"
       ],
-      "fail_type": "排序偏",
-      "first_actual": "狗窝（大号）",
-      "added_at": "2026-08-26",
       "expect_type": "fix",
-      "note": "「凉」→「粮」同音错别字，期望召回狗粮（标题含犬/狗的粮），却召回狗窝",
+      "fail_type": "排序偏",
+      "first_actual": "",
+      "note": "错别字「凉」→「粮」同音，期望纠错后召回狗粮。旧库会误召回「狗窝（大号）」，新库已无宠物用品、失败模式弱化，但保留作「错别字纠错后的召回方向」回归",
+      "added_at": "2026-08-26",
       "status": "open"
     },
     {
       "query": "小动物排尿痛频繁跑猫砂盆",
       "expected": [
-        "泌尿呵护猫粮（渴望牌）"
+        "成猫泌尿道全价处方粮（皇家牌）",
+        "泌尿呵护成猫全价粮（皇家牌）",
+        "成猫泌尿道全价处方粮（情绪舒缓）（皇家牌）"
+      ],
+      "expect_type": "fix",
+      "fail_type": "top1错",
+      "first_actual": "",
+      "note": "跨物种漂移：query 用「猫砂盆」暗示猫，别漂到狗泌尿道。2026-09-18 重标 expected 为新库猫泌尿道系列",
+      "added_at": "2026-08-27",
+      "status": "open"
+    },
+    {
+      "query": "洁齿骨",
+      "expected": [
+        "洁齿骨（麦富迪牌）"
+      ],
+      "fail_type": "空返回",
+      "first_actual": "",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "graduated"
+    },
+    {
+      "query": "优能猫粮",
+      "expected": [
+        "优能猫粮（麦富迪牌）"
       ],
       "fail_type": "top1错",
-      "first_actual": "豆腐猫砂",
-      "added_at": "2026-08-27",
+      "first_actual": "消化优选成猫全价粮（皇家牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "graduated"
+    },
+    {
+      "query": "麦富迪猫条",
+      "expected": [
+        "羊奶肉酱猫条（麦富迪牌）",
+        "猫/亲嘴鱼猫条20支装系列（麦富迪牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "室内长毛成猫全价粮（皇家牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "graduated"
+    },
+    {
+      "query": "我家狗老是挠痒痒，皮肤不太好",
+      "expected": [
+        "皮肤呵护小型犬成犬全价粮（皇家牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "皮毛管理全价成犬粮1.5kg/10kg（伯纳天纯牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "狗狗吃得太胖了要减肥",
+      "expected": [
+        "体重呵护小型犬成犬全价粮（皇家牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "鸡肉+燕麦·苹果中大型犬成犬粮6+（伯纳天纯牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "狗狗毛发干枯没光泽",
+      "expected": [
+        "美毛呵护小型犬成犬全价粮（皇家牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "皮毛管理全价成犬粮1.5kg/10kg（伯纳天纯牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "狗子肠胃敏感老拉肚子",
+      "expected": [
+        "肠胃管理全价全期犬粮2kg（伯纳天纯牌）",
+        "成犬肠道全价处方粮（皇家牌）",
+        "幼犬肠道全价处方粮（皇家牌）",
+        "成犬低脂易消化全价处方粮（皇家牌）",
+        "成犬胃肠道全价处方湿粮（皇家牌）",
+        "消化呵护小型犬成犬全价粮（皇家牌）"
+      ],
+      "fail_type": "多答案不全",
+      "first_actual": "肠胃管理全价全期犬粮2kg（伯纳天纯牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "小猫刚断奶吃什么好",
+      "expected": [
+        "离乳期幼猫全价奶糕（皇家牌）",
+        "幼猫全价粮（皇家牌）",
+        "离乳期幼猫慕斯奶糕罐头（皇家牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "羊奶肉酱猫条（麦富迪牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "英短吃得越来越多，越来越圆了",
+      "expected": [
+        "英国短毛猫成猫全价粮（皇家牌）",
+        "体重管理成猫全价粮（皇家牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "英国短毛猫幼猫全价粮（皇家牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "猫咪尿血了，老往猫砂盆跑",
+      "expected": [
+        "成猫泌尿道全价处方粮（皇家牌）",
+        "成猫泌尿道全价处方粮（情绪舒缓）（皇家牌）",
+        "泌尿呵护成猫全价粮（皇家牌）"
+      ],
+      "fail_type": "多答案不全",
+      "first_actual": "泌尿呵护成猫全价粮（皇家牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "大型犬吃得多，想买大包装的",
+      "expected": [
+        "大型犬成犬全价粮（皇家牌）",
+        "中/大型犬成犬粮15kg（伯纳天纯牌）",
+        "大型犬成犬粮15kg（伯纳天纯牌）"
+      ],
+      "fail_type": "多答案不全",
+      "first_actual": "大型犬成犬粮15kg（伯纳天纯牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "最近天热了我家猫掉毛掉得厉害，但它一洗澡就吐，有什么能帮它顺顺毛的",
+      "expected": [
+        "去毛球成猫全价粮（皇家牌）",
+        "成年期去毛球全价猫粮湿粮（浓汤肉块）（皇家牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "皮毛管理全价成犬粮1.5kg/10kg（伯纳天纯牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "我家狗最近总是抓耳朵挠身上，毛都秃了一小块，是不是吃的东西有问题",
+      "expected": [
+        "皮肤呵护小型犬成犬全价粮（皇家牌）",
+        "中大型成犬特应性皮炎全价处方粮（皇家牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "皮毛管理全价成犬粮1.5kg/10kg（伯纳天纯牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "小猫才两个月，刚离开猫妈妈，我该给它准备什么样的吃的",
+      "expected": [
+        "幼猫全价粮（皇家牌）",
+        "离乳期幼猫全价奶糕（皇家牌）",
+        "离乳期幼猫慕斯奶糕罐头（皇家牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "羊奶肉酱猫条（麦富迪牌）",
+      "added_at": "2026-09-18",
+      "expect_type": "fix",
+      "note": "",
+      "status": "open"
+    },
+    {
+      "query": "要肠胃敏感的粮，不要皇家牌",
+      "expected": [
+        "肠胃管理全价全期犬粮2kg（伯纳天纯牌）"
+      ],
+      "fail_type": "top1错",
+      "first_actual": "成犬胃肠道全价处方湿粮（皇家牌）",
+      "added_at": "2026-09-18",
       "expect_type": "fix",
       "note": "",
       "status": "open"

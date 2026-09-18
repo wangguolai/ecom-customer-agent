@@ -33,7 +33,7 @@ from cases import RETRIEVAL_CASES as EVAL_SET
 def _build_title_map(store):
     """chunk_id -> title 映射（title 从 Qdrant payload 拿，不切片）"""
     title_map = {}
-    for cid, text, title, _, _, _ in store.scroll_all():
+    for cid, text, title, _, _, _, _ in store.scroll_all():  # 七元组 (chunk_id, text, title, category, product_id, image, kb_type)
         title_map[cid] = title
     return title_map
 
@@ -58,9 +58,10 @@ def run_eval():
     _validate_expected(set(title_map.values()))
 
     methods = ["纯向量", "纯BM25", "混合+预过滤+Rerank"]
-    agg = {m: {"recall": [], "mrr": []} for m in methods}
+    agg = {m: {"recall": [], "recall_cap": [], "mrr": []} for m in methods}
     failures = []  # 混合检索 top1 错的 case（数据飞轮：自动回流进池）
-    neg_total = neg_pass = 0  # 负样本（expected 空）：期望空召回，统计空返回率
+    neg_total = neg_pass = 0  # 负样本（expected 空）：观测空返回率，不判通过/失败
+    neg_detail = []  # 负样本观测明细：(query, top1, rerank/融合分)
 
     for query, expected in EVAL_SET:
         # 1. 纯向量
@@ -88,14 +89,23 @@ def run_eval():
         # 3. 混合 + 预过滤 + Rerank（完整链路）
         category = detect_category(query)
         _, hybrid_results = retriever.search(query, top_k=3, category=category, kb_type="product")
-        hybrid_titles = [title for _, _, _, title, _ in hybrid_results]
+        # ⚠️ 六元组 (chunk_id, score, text, title, product_id, image)：09-18 加 image 字段时，
+        # src/ 的三个消费方（rag_pipeline / tools / hybrid_retriever）都同步改了，只漏了本文件，
+        # 导致评测脚本一跑就 ValueError 崩。教训：改数据结构必须 grep 全仓消费方，别只改主链路。
+        hybrid_titles = [title for _, _, _, title, _, _ in hybrid_results]
 
-        # 负样本（expected 空）：期望空召回，正确 = 混合检索返回空（双低拒答）。
-        # 不计 Recall/MRR（空 expected 除零无意义），单独统计空返回率；暂不回流（回归逻辑对负样本待单独设计）
+        # 负样本（expected 空）：按「召回优先、拒答兜底」策略，**软推相似商品是正确行为**，
+        # 「返回空」只发生在召回层判双低时。故不判通过/失败，只**观测**空返回率 + top1 及其分数，
+        # 供人工判断「软推得离谱不离谱」。
+        # 不入池的根本原因：池的 fix 型毕业判据是 `recalled >= min(len(expected),3)`，
+        # expected 为空时 = `0 >= 0` **恒真** → 一进池就假阳性毕业（2026-09-18 实测确认）。
         if not expected:
             neg_total += 1
             if not hybrid_titles:
                 neg_pass += 1
+                neg_detail.append((query, "", 0.0))
+            else:
+                neg_detail.append((query, hybrid_titles[0], hybrid_results[0][1]))
             continue
 
         # 失败判定：混合检索召回不足（top1 错 或 多答案召回不全）→ 记失败（自动回流进池）
@@ -119,27 +129,38 @@ def run_eval():
             })
 
         for method, titles in zip(methods, [vec_titles, bm25_titles, hybrid_titles]):
-            recall = len(set(expected) & set(titles)) / len(expected)
+            hit = len(set(expected) & set(titles))
+            # 双口径并排（不预设哪个对，交给使用者选）：
+            # ① ÷len(expected)：Recall 的标准定义，但 top_k=3 上限只能召回 3 条，
+            #    expected 写全后（如 6 条）该值天然封顶 0.5，系统性低估。
+            # ② ÷min(len(expected),3)：与「失败闸门」同口径（`recalled < min(len,3)` 才判失败）——
+            #    口径统一才不会出现「闸门说通过、指标说很差」的自相矛盾。
+            agg[method]["recall"].append(hit / len(expected))
+            agg[method]["recall_cap"].append(hit / min(len(expected), 3))
             mrr = 0.0
             for i, t in enumerate(titles, 1):
                 if t in expected:
                     mrr = 1.0 / i
                     break
-            agg[method]["recall"].append(recall)
             agg[method]["mrr"].append(mrr)
 
     # 分母用「正样本数」（expected 非空），负样本已 continue 不进 agg，混入 len(EVAL_SET) 会低估 Recall
     pos_total = len(EVAL_SET) - neg_total
     print("=" * 70)
-    print(f"{'方法':<22} {'Recall@3':<12} {'MRR':<10}")
+    print(f"{'方法':<22} {'Recall(÷期望数)':<18} {'Recall(÷min(期望,3))':<22} {'MRR':<10}")
     print("-" * 70)
     for m in methods:
         recall = sum(agg[m]["recall"]) / pos_total if pos_total else 0
+        recall_c = sum(agg[m]["recall_cap"]) / pos_total if pos_total else 0
         mrr = sum(agg[m]["mrr"]) / pos_total if pos_total else 0
-        print(f"{m:<22} {recall:<12.4f} {mrr:<10.4f}")
+        print(f"{m:<22} {recall:<18.4f} {recall_c:<22.4f} {mrr:<10.4f}")
     print("=" * 70)
     if neg_total:
-        print(f"负样本空返回率 = {neg_pass}/{neg_total} = {neg_pass/neg_total:.2%}（期望空召回，正确=混合检索返回空）")
+        print(f"负样本空返回率 = {neg_pass}/{neg_total}（**观测值，非通过判据**）")
+        print("  按「召回优先、拒答兜底」策略，软推相似商品是正确行为，返回空只发生在召回层判双低时。")
+        print("  下列明细供人工判断「软推得离谱不离谱」，不入池、不回流：")
+        for q, top1, score in neg_detail:
+            print(f"    {q:<26} -> top1={top1 or '（空返回）'}  score={score:.4f}")
         print("=" * 70)
 
     # 数据飞轮：失败回流 + 池回归 + fix 型毕业
@@ -168,10 +189,20 @@ def _run_regression(retriever, failures):
         expected = set(exp) if isinstance(exp, (list, tuple)) else {exp}
         category = detect_category(query)
         _, hybrid_results = retriever.search(query, top_k=3, category=category, kb_type="product")
-        hybrid_titles = [title for _, _, _, title, _ in hybrid_results]
+        # ⚠️ 六元组 (chunk_id, score, text, title, product_id, image)：09-18 加 image 字段时，
+        # src/ 的三个消费方（rag_pipeline / tools / hybrid_retriever）都同步改了，只漏了本文件，
+        # 导致评测脚本一跑就 ValueError 崩。教训：改数据结构必须 grep 全仓消费方，别只改主链路。
+        hybrid_titles = [title for _, _, _, title, _, _ in hybrid_results]
         top1 = hybrid_titles[0] if hybrid_titles else ""
         recalled = len(expected & set(hybrid_titles))
         recall_cap = min(len(expected), 3)
+
+        # 负样本（expected 空）不能进池：recall_cap = min(0,3) = 0、recalled = 0 → `0 >= 0` **恒真**，
+        # fix 型会**假阳性毕业**（不是「判不了」，是「恒判通过」——2026-09-18 实测确认）。
+        # 显式拦截：只观测，绝不进 passed。
+        if not expected:
+            print(f"  📊 [负样本观测] {query}：top1={top1 or '（空返回）'}（软推为正确行为，不判通过/失败）")
+            continue
 
         if c.get("expect_type") == "lock":
             # 行为锁定：锁「该软推的对象」——top1 还是 first_actual 才算保持
@@ -275,7 +306,7 @@ def run_rrf_sweep():
             # 完整链路：RRF → rerank，看 k 被 rerank 稀释后还剩多少作用
             _, full = base.search(query, top_k=3, category=category, kb_type="product", use_rerank=True)
             for method, results in (("纯RRF", pure), ("RRF+Rerank", full)):
-                titles = [title for _, _, _, title, _ in results]
+                titles = [title for _, _, _, title, _, _ in results]  # 六元组，见 run_eval 的注释
                 recall = len(set(expected) & set(titles)) / len(expected)
                 mrr = 0.0
                 for i, t in enumerate(titles, 1):

@@ -56,13 +56,25 @@ def _structural_faithfulness(turns, answer: str) -> dict:
     answer_prices = {int(p) for p in re.findall(r"¥\s*(\d+)", answer)}
     fake_prices = sorted(answer_prices - FACTS["prices"])
 
-    # 品牌校验：抓 answer 里的「XX牌」（2 字），不在白名单的判编造。
-    # 排除三类误抓：① 功能词前缀（什么/这个/哪个…）②「X品牌/X牌子」普通词（提取词以「品/子」结尾）③ 已知品牌前缀。
-    known_brand_prefixes = {b[:-1] for b in FACTS["brands"]}  # 皇家/冠能/渴望
-    answer_brand_tokens = set(re.findall(r"([一-龥]{2})牌", answer))
+    # 品牌校验：先按白名单整词扣除，再从残余里抓「XX牌」形态判编造。
+    # 排除三类误抓：① 功能词前缀（什么/这个/哪个…）②「X品牌/X牌子」普通词（提取词以「品/子」结尾）③ 白名单品牌（已扣除）。
+    #
+    # ⚠️ 2026-09-18 修：原实现是「固定 2 字正则 ([一-龥]{2})牌 + 2 字前缀白名单」。
+    #   旧品牌（皇家/冠能/渴望）恰好全 2 字，这个隐含假设一直没暴露；换 162 真实商品库后出现
+    #   3-4 字品牌（麦富迪/伯纳天纯/疯狂小狗），「麦富迪牌」被正则截成「富迪牌」→ 不在白名单 →
+    #   判成编造品牌 → 任何推荐这三个品牌的回答 faithfulness 结构性崩（实测三例全 fake）。
+    #   为什么不直接把正则改成 {2,4}：会吞掉上下文——「不知道什么牌的好」从「知」起贪婪取 4 字
+    #   命中「知道什么」+牌，捕出一个带上下文的假前缀（对抗测试实测踩到）。多长度扫描同理：
+    #   「牌」前 3 字「道什么」也成候选，仍误报。
+    #   故改为「先按白名单整词扣除、正则仍是固定 2 字」：白名单里 2/3/4 字品牌都被扣干净后，
+    #   残余里出现的「XX牌」必是编造，此时按**紧邻 2 字**取最准（长候选只会多吞上下文）。
+    residue = answer
+    for _b in sorted((b for b in FACTS["brands"] if b in answer), key=len, reverse=True):
+        residue = residue.replace(_b, "")
+    answer_brand_tokens = set(re.findall(r"([一-龥]{2})牌", residue))
     fake_brands = sorted(
         f"{p}牌" for p in answer_brand_tokens
-        if p not in known_brand_prefixes and p not in _BRAND_STOP_PREFIXES and not p.endswith(("品", "子"))
+        if p not in _BRAND_STOP_PREFIXES and not p.endswith(("品", "子"))
     )
 
     # 物流地点编造：抓「XX中心」形态，和 FACTS["logistics_locations"] 精确比对。
@@ -110,27 +122,8 @@ def _usage_dict(usage) -> dict:
 
 
 # 裁判（语义层）：判 accuracy + relevance + faithfulness
-JUDGE_SYSTEM = """你是电商客服 Agent 回答质量的评测裁判。根据「知识库事实」「用户问题」「客服回答」「参考答案」判三个维度：
-
-1. accuracy（准确率，0/1）：客服回答是否正确回应了用户问题、是否与参考答案一致（答对了该答的）。
-2. relevance（相关性，0-5 连续分）：客服回答和用户问题的相关程度。5=完全切题且信息有用，3=部分相关或回答笼统，0=完全答非所问或无意义。
-3. faithfulness（忠实度，0/1）：客服回答是否编造了知识库里不存在的「商品名 / 物流轨迹 / 政策条款」这类语义内容。
-
-重要：faithfulness 只判「语义编造」（凭空捏造知识库里不存在的商品名、物流轨迹、政策条款），不要判以下硬事实——订单号、价格数值、品牌名、物流地点这些由外部规则层精确比对，你不判。
-
-faithfulness 判的是「编造」不是「答错」。以下都是 accuracy 问题（faithfulness 应判 1），不要误判成编造：
-- 答非所问、漏答关键信息、没有纠正用户的错误说法
-- 推荐了「不相关但知识库里确实存在」的商品
-- 该反问时没反问、直接推荐了知识库里的商品
-
-评分规则：
-- accuracy=1：回答正确回应了用户问题、与参考答案一致；accuracy=0：答非所问、答错、漏答关键信息。
-- relevance：5=完全切题，4=切题有小瑕疵，3=大致相关但笼统，2=大部分答偏，1=基本不相关，0=完全答非所问。
-- faithfulness=1：没有编造知识库不存在的商品名/物流轨迹/政策条款；faithfulness=0：编造了上述语义内容。
-
-只输出一个 JSON 对象，不要 markdown 代码块、不要任何多余文字，格式：
-{"accuracy": 0或1, "relevance": 0到5的整数, "faithfulness": 0或1, "reason": "一句话理由"}
-"""
+# 裁判提示词已移到 src/config/prompts.py（提示词统一处），此处只引用
+from src.config.prompts import JUDGE_SYSTEM
 
 
 async def _judge(query: str, answer: str, expected: str) -> dict:
