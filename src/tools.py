@@ -30,6 +30,9 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from src.circuit_breaker import CircuitBreaker
 from src.infra.egress import validate_backend_url
+from src.config.prompts import RETURN_POLICY
+from src.config.rules import WRITE_TOOLS
+from src.config.settings import REQUEST_TIMEOUT
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -155,7 +158,6 @@ TOOL_SCHEMAS = [
 # 出网限制（架构级注入防御）：BACKEND_URL 来自环境变量，import 时就校验主机白名单。
 # 不校验的话，改掉这个变量就能把 agent 的全部工具请求（含用户订单数据）导向攻击者服务器。
 BACKEND_URL = validate_backend_url(os.environ.get("BACKEND_URL", "http://localhost:8000"))
-REQUEST_TIMEOUT = 2.0  # 秒
 
 
 def _sanitize(s) -> str:
@@ -233,13 +235,7 @@ async def _http_request(method, url, json=None):
     _breaker.record_success()
     return resp, None
 
-RETURN_POLICY = (
-    "退换货政策：\n"
-    "1. 7 天无理由退货（商品未拆封、不影响二次销售）；\n"
-    "2. 质量问题 15 天内可退换；\n"
-    "3. 食品类（粮/零食）拆封后不支持无理由退换；\n"
-    "4. 退货需提供订单号，退款 1-3 个工作日到账。"
-)
+# RETURN_POLICY（政策兜底文本）已移到 src/config/prompts.py —— 它是对用户说的话，属提示词层。
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -382,13 +378,14 @@ async def transfer_to_human(problem: str) -> str:
         online = bool(resp.json().get("online"))
     if online:
         return f"已为您转接人工客服，工单 {ticket_id}，人工将尽快联系您。问题：{problem}"
-    # 不在线（或在线状态查询失败）→ 生成工单（记录问题）+ 安抚，不声称已转接
-    return f"已记录您的问题（工单 {ticket_id}），当前人工客服不在线，工作时间（9:00-18:00）将尽快处理。问题：{problem}"
+    # 不在线（或在线状态查询失败）→ 生成工单（记录问题），**既不声称已转接、也不承诺跟进**。
+    # ⚠️ 2026-09-18 修：原话术带「（工作时间）将尽快处理」——本地 demo 没有真人坐席，这句兑现不了，
+    # 属「说了没发生的事」；而且 LLM 会把工具返回原文照搬进回答，改这里才拦得住。
+    # 改为只陈述现状：工单已记录、当前无人接待、转接没成。要演示「已转接」就设 CS_ONLINE=true。
+    return f"已记录您的问题，工单号 {ticket_id}。当前没有人工客服在线（工作时间 9:00-18:00），暂时无法为您转接。问题：{problem}"
 
 
-# 写工具集合（代码级标记：写操作要过权限门槛，读工具随便调）
-# Prompt Injection 防线之一：读/写分离，写工具的行为在代码层被约束，不随 LLM 意图走
-WRITE_TOOLS = {"refund_order", "transfer_to_human"}
+# 写工具集合 WRITE_TOOLS 已移到 src/config/rules.py（那里标了「安全关键，改动需过 code review」）。
 
 
 async def refund_order(order_id: str) -> str:

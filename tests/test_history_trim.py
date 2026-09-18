@@ -1,8 +1,17 @@
 # -*- coding: utf-8 -*-
-"""上下文压缩单元测试 —— 摘要压缩 + 丢轮次对照基线（mock 摘要，不调真实 LLM）"""
+"""上下文压缩单元测试 —— 摘要压缩 + 丢轮次对照基线（mock 摘要，不调真实 LLM）
+
+⚠️ 2026-09-18 修：`_compress_history` / `_summarize` 早已改成 `async def`（asyncio 改造），
+但本文件一直按同步函数调用——协程没被 await，于是**三个用例全部静默失效**：
+  - 「旧轮被摘要替代」：断言失败（其实什么都没跑）
+  - 「只剩一轮不压」「未超预算不触发」：`call_count == 0` 恒真 → **假阳性**，
+    永远"通过"但根本没测到东西（这类假阳性比失败更危险，它让人以为有覆盖）
+修法：mock 换成 async 版本，调用统一走 asyncio.run。
+"""
 
 import sys
 import os
+import asyncio
 from unittest import mock
 
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -18,8 +27,12 @@ def _mk(role, content):
     return {"role": role, "content": content}
 
 
-def _fake_summarize(history_messages):
-    """mock 摘要：返回固定摘要（含订单号）+ fake usage + 耗时 0，不调真实 LLM"""
+async def _fake_summarize(history_messages):
+    """mock 摘要：返回固定摘要（含订单号）+ fake usage + 耗时 0，不调真实 LLM。
+
+    必须是 async —— 真实 _summarize 是协程，被 _compress_history `await` 调用；
+    同步 mock 会让 await 直接抛 TypeError（而不是静默跳过）。
+    """
     fake_usage = mock.Mock(prompt_tokens=100, completion_tokens=20)
     return "用户查了订单 20240818001", fake_usage, 0.0
 
@@ -32,8 +45,8 @@ def test_摘要压缩_旧轮被摘要替代():
         _mk("user", "问题2"), _mk("assistant", "答案2"),                      # 第二轮（最近完成轮）
         _mk("user", "问题3"),                                                 # 第三轮（当前轮）
     ]
-    with mock.patch.object(agent, "_summarize", side_effect=_fake_summarize):
-        agent._compress_history(messages, max_tokens=200)
+    with mock.patch.object(agent, "_summarize", new=_fake_summarize):
+        asyncio.run(agent._compress_history(messages, max_tokens=200))
     contents = [m.get("content", "") for m in messages]
     assert messages[0]["role"] == "system", "system 应保留"
     assert any(c.startswith(agent.SUMMARY_PREFIX) for c in contents), "应有摘要消息"
@@ -49,8 +62,8 @@ def test_摘要压缩_只剩一轮不压():
         _mk("system", "你是客服"),
         _mk("user", "当前问题" * 200),
     ]
-    with mock.patch.object(agent, "_summarize", side_effect=_fake_summarize) as m:
-        agent._compress_history(messages, max_tokens=50)
+    with mock.patch.object(agent, "_summarize", new_callable=mock.AsyncMock) as m:
+        asyncio.run(agent._compress_history(messages, max_tokens=50))
     assert m.call_count == 0, "只剩当前一轮不应调摘要"
     assert len(messages) == 2, "system + 当前 user 都应保留"
     print("✅ 只剩一轮不压缩：单轮爆兜底生效")
@@ -63,14 +76,14 @@ def test_摘要压缩_未超预算不触发():
         _mk("user", "问题1"), _mk("assistant", "答案1"),
         _mk("user", "问题2"),
     ]
-    with mock.patch.object(agent, "_summarize", side_effect=_fake_summarize) as m:
-        agent._compress_history(messages, max_tokens=10000)
+    with mock.patch.object(agent, "_summarize", new_callable=mock.AsyncMock) as m:
+        asyncio.run(agent._compress_history(messages, max_tokens=10000))
     assert m.call_count == 0, "未超预算不应调摘要"
     print("✅ 未超预算不触发摘要")
 
 
 def test_丢轮次_对照基线():
-    """_trim_history 仍是无差别丢轮次（保留作「丢轮次」对照，评测用它对比）"""
+    """_trim_history 仍是无差别丢轮次（保留作「丢轮次」对照，评测用它对比）—— 它是同步函数，直接调"""
     messages = [
         _mk("system", "你是客服"),
         _mk("user", "问题1"), _mk("assistant", "答案1" * 100),
@@ -89,4 +102,4 @@ if __name__ == "__main__":
     test_摘要压缩_只剩一轮不压()
     test_摘要压缩_未超预算不触发()
     test_丢轮次_对照基线()
-    print("\n✅ 上下文压缩全部通过")
+    print("\n全部通过")

@@ -33,28 +33,20 @@ import redis
 from src.backend import db
 from src.backend.cache import _redis as _redis_client  # 复用缓存进程级单例连接
 
-# MQ 键用独立前缀 mq:，不放 ecom:——cache.flush() 只清 ecom:*（业务缓存），
-# MQ 队列和幂等标记是「在途数据」不是「缓存」，被 flush 清掉会导致在途消息静默丢失、
-# 已受理的退款工单永不到账。独立前缀避开 flush 的 scan_iter("ecom:*")。
-QUEUE_KEY = "mq:refund_queue"
-DONE_PREFIX = "mq:refund:done:"
-DONE_TTL = 604800  # 幂等标记 7 天：控制 key 增长（脱离 ecom: 后无 flush 兜底清理），过期由业务级唯一约束兜底
-
-# 退款工单状态机（模块 5）：pending → approved → refunded（终态）；pending → rejected（终态）。
-# 状态流转由代码层/人工驱动（审批接口），不由 LLM 驱动。状态常量放 mq.py（退款域），
-# 不放 db.py（连接池基础设施，不是业务域）。
-STATUS_PENDING = "待人工审批"
-STATUS_APPROVED = "已批准"
-STATUS_REFUNDED = "已退款"
-STATUS_REJECTED = "已拒绝"
-
-# 合法流转表：action → {当前状态: 新状态}。只有匹配的当前状态才允许该 action。
-# 终态（refunded/rejected）不在任何 {当前状态} 里 → 任何 action 都非法（终态不可再流转）。
-TRANSITIONS = {
-    "approve": {STATUS_PENDING: STATUS_APPROVED},
-    "execute": {STATUS_APPROVED: STATUS_REFUNDED},
-    "reject": {STATUS_PENDING: STATUS_REJECTED},
-}
+# MQ 键 / 退款状态机常量集中在 src/config/（settings 存键与 TTL、rules 存状态机与流转表）。
+# 用 as 别名保住本文件原有的引用名，避免重构时大面积改引用点。
+from src.config.settings import (
+    MQ_QUEUE_KEY as QUEUE_KEY,
+    MQ_DONE_PREFIX as DONE_PREFIX,
+    MQ_DONE_TTL as DONE_TTL,
+)
+from src.config.rules import (
+    REFUND_STATUS_PENDING as STATUS_PENDING,
+    REFUND_STATUS_APPROVED as STATUS_APPROVED,
+    REFUND_STATUS_REFUNDED as STATUS_REFUNDED,
+    REFUND_STATUS_REJECTED as STATUS_REJECTED,
+    REFUND_TRANSITIONS as TRANSITIONS,
+)
 
 
 def _validate_refund(order_id):

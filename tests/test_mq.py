@@ -65,10 +65,15 @@ def main():
 
     print("📍 [1/2] 正常路径：异步受理 → 消费者落库生成工单")
     order_id = "20240818001"
+    # ⚠️ 金额不写死：订单数据会随商品库迁移变（¥89 → ¥99，2026-09-18 换真实商品时变过），
+    # 写死数字会让测试在数据变更后误报「金额下沉坏了」。本测试要验的语义是
+    # 「退款金额来自后端权威值（订单金额），不是 LLM 传的」，所以从后端动态取期望值。
+    order_resp = httpx.get(f"{BACKEND_URL}/orders/{order_id}", timeout=5).json()
+    expect_amount = float(str(order_resp["amount"]).lstrip("¥"))
     status, body = _post_refund(order_id)
     assert status == 200, f"期望 200，实际 {status}：{body}"
     assert body["status"] == "已受理", body
-    assert body["refund_amount"] == 89, f"金额下沉后 refund_amount 应为订单金额 89，实际 {body.get('refund_amount')}"
+    assert body["refund_amount"] == expect_amount, f"金额下沉后 refund_amount 应为订单金额 {expect_amount}，实际 {body.get('refund_amount')}"
     assert body["ticket_id"] is None, f"异步路径 ticket_id 应为 None（工单异步生成），实际 {body['ticket_id']}"
     print(f"  POST /refund → 已受理，message_id={body['message_id']}")
     time.sleep(2)  # 等消费者线程消费（BRPOP 阻塞拉取 + 落库，毫秒级，2s 足够）

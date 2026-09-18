@@ -22,6 +22,23 @@ import re
 
 from src.derived.categories import build_category_keywords
 
+# 词表 / 正则统一在 src/config/rules.py —— 加意图词只改那一个文件。
+# 这里用 `as` 别名保住本文件的引用名（带下划线是本模块的历史命名），
+# 避免重构时大面积改引用点引入笔误。想改词表请去 config/rules.py，不要在这里加。
+from src.config.rules import (
+    ORDER_ID_RE as _ORDER_ID_RE,
+    ORDER_ID_FULL_RE as _ORDER_ID_FULL_RE,
+    HUMAN_WORDS as _HUMAN_WORDS,
+    NEGATE_WORDS as _NEGATE_WORDS,
+    LOGISTICS_WORDS as _LOGISTICS_WORDS,
+    ORDER_WORDS as _ORDER_WORDS,
+    WRITE_INTENT_WORDS as _WRITE_INTENT_WORDS,
+    POLICY_WORDS as _POLICY_WORDS,
+    AFTERSALE_WORDS as _AFTERSALE_WORDS,
+    SUMMARIZE_WORDS as _SUMMARIZE_WORDS,
+    BROWSE_WORDS as _BROWSE_WORDS,
+)
+
 # 订单号模式：11 位、20 开头（demo 种子数据 20240818001 这种）。
 # 锚定 20 开头 + 前后不能是数字，防 11 位手机号（13x/15x/18x 开头）和「嵌在更长数字里」误匹配。
 #
@@ -29,49 +46,10 @@ from src.derived.categories import build_category_keywords
 # 所以「订单20240818001什么状态」中「单」和「2」之间**没有**词边界 → \b 匹配不到，
 # 规则路由静默失效、白白回落 LLM。而用户不打空格是常态。
 # 换成「前后非数字」的断言：中文紧贴能识别，防手机号/长数字嵌套的效果不变。
-_ORDER_ID_RE = re.compile(r"(?<!\d)20\d{9}(?!\d)")
-# 数字碎片清洗用的订单号格式（fullmatch 锚定首尾，无需前后断言）：11 位、20 开头。
-# 「202￥408$$$180/01」这种被打散的订单号，findall 捞数字碎片拼接后用它 fullmatch 校验。
-_ORDER_ID_FULL_RE = re.compile(r"20\d{9}")
-
-# 转人工硬触发词（投诉/人工求助）
-_HUMAN_WORDS = ("投诉", "转人工", "人工客服", "找人工")
-# 否定词：用户「拒绝转人工」不该被反向触发写工具（方向性错误，如「不用转人工」「别转人工」）
-_NEGATE_WORDS = ("不用", "不要", "别", "不想", "能不", "无需")
-
-# 物流轨迹词（区分 logistics vs orders）
-_LOGISTICS_WORDS = ("到哪", "物流", "快递", "包裹", "轨迹")
-# 订单状态词
-_ORDER_WORDS = ("状态", "订单", "发货")
-
-# 写操作意图词（退款）——命中直接交 LLM，规则层不碰写操作。
-# 为什么需要这道排除：本模块文档写明「refund_order（写操作）走 LLM」，但此前代码没实现，
-# 而 _ORDER_WORDS 里的「订单」是个泛词 —— 「我要退款订单 X」会先命中订单号 + 「订单」，
-# 被路由成 search_orders，退款意图被静默吞掉（用户要退款，agent 回一段订单状态）。
-# 词表含「退款/退钱/退货款」+ 口语执行词「退掉/退了」——「帮我退掉」「退了它」也是退款执行，
-# 漏了会被「订单」泛词劫持成 search_orders（退款意图被吞）。刻意不含「退货」：避免误伤
-# 下面 _POLICY_WORDS 的「退货政策」路由。
-_WRITE_INTENT_WORDS = ("退款", "退钱", "退货款", "退掉", "退了")
-
-# 退货政策词（明确政策词；「能退吗/我要退货」这类模糊的走 LLM，避免和退款意图混淆）
-_POLICY_WORDS = ("退货政策", "退换货政策", "七天无理由", "无理由退货", "退货流程", "退货条件", "退货运费")
-
-# 售后意图词（退货/换货流程）——命中交 LLM，规则层不碰。
-# 坑④（2026-09-01）：「我要退货」单句掉 ReAct 合理（LLM 兜底），但「我要退货，随便看看」
-# 会被 _BROWSE_WORDS 的「随便看看」劫持——退货没词、浏览有词 → 路由成「列分类概览」，
-# 这是「做错方向」（和「写意图被订单泛词劫持」同类），不只是答得差。
-# 刻意放在 _POLICY_WORDS 判断**之后**：「退货政策/退货运费」等完整政策词先走
-# get_return_policy，不会被「退货」子串误伤（「退货」是「退货政策」的子串）。
-_AFTERSALE_WORDS = ("退货", "换货", "退换")
-
-# 总结意图词（想对比多款 → 反问澄清）；只收高置信词
-_SUMMARIZE_WORDS = ("哪个好", "哪款好", "哪种好", "对比", "区别", "差别", "比较", "优缺点", "哪个更好", "哪款适合")
-
-# 浏览意图词（无明确目标 → 列分类概览）；只收高置信词，不含「看看」「有什么」这类会误判检索的
-_BROWSE_WORDS = ("随便看看", "随便逛逛", "逛逛", "有什么推荐", "推荐一下", "买点啥", "买啥", "买什么")
-
 # 类别触发词（类别 → 触发词列表），用于「浏览 vs 检索」边界判断：
 # 「有什么推荐的猫粮」含类别词「猫粮」→ 是检索该类别，不是浏览；「随便看看」无类别词 → 真浏览。
+# ⚠️ 它刻意不在 config/rules.py 里：这是从 data/category_synonyms.md **生成**的派生数据
+# （src/derived/categories.py），属于 SSOT 三层里的派生层，不是人工维护的规则表。
 _CATEGORY_WORDS = build_category_keywords()
 
 

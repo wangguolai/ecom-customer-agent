@@ -19,11 +19,14 @@ from urllib.parse import urlparse
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-# 允许的 host 白名单：本机 + compose 服务名。
+# 允许的 host 白名单：本机 + compose 服务名。白名单本体在 src/config/rules.py，
+# 那里标了「安全关键，改动需过 code review」。
 # EGRESS_EXTRA_HOSTS 逗号分隔，给真实部署（如内网网关域名）显式追加——
 # 追加是「显式动作」，和「默认放行任意 host」是两回事。
-_DEFAULT_HOSTS = {"localhost", "127.0.0.1", "::1", "backend"}
-_ALLOWED_SCHEMES = {"http", "https"}
+from src.config.rules import (
+    EGRESS_DEFAULT_HOSTS as _DEFAULT_HOSTS,
+    EGRESS_ALLOWED_SCHEMES as _ALLOWED_SCHEMES,
+)
 
 
 def allowed_hosts() -> set:

@@ -23,13 +23,32 @@ from src.infra.vector_store import QdrantStore
 from src.infra import reranker
 from src.derived.categories import build_jieba_words
 
-RRF_K = 60
-DEFAULT_TOP_K = 3
-RERANK_CANDIDATE_N = 10  # RRF 融合后先取这么多候选交给 Rerank 精排。
-# 实测 Recall@3：N=5→0.7667、N=10→0.9333、N=15→0.9667、N=20→0.9667。
-# 选 N=10 是成本收益权衡（不是 Recall 最大化）：0.9333 对电商客服够用，省一半 rerank 推理；
-# 为 0.033 升到 N=15 多花 50% 成本不值（正确性投入匹配错误成本）。N 跟数据规模+业务容忍度走，不拍脑袋。
-VEC_SCORE_LOW = 0.4  # 召回层双低拒答：向量 top1 分数 < 此值且 BM25 无召回 → 判超知识库，拒答
+import re
+
+# ═══════════════════════════════════════════════════════════════
+# BM25 索引文本清洗（只影响 BM25，不动向量检索 / 不动展示）
+# ═══════════════════════════════════════════════════════════════
+# 为什么要清（2026-09-18 换 162 真实商品后实测 BM25 Recall@3 掉到 0.4472）：
+#   ① 结构化元数据行（ID / 类别 / 图片路径）**每个文档都有** → IDF 趋近 0，纯噪声占位；
+#   ② 规格数字（1.5kg/10kg、200g/2kg/12kg/17kg…）在绝大多数标题里出现 → 同样拉平 IDF。
+#   BM25 靠「稀有词区分度」工作，这两类公共 token 把区分度稀释了；新库标题高度雷同
+#   （101 个皇家商品命名模式相近），这个问题被放大。
+# 为什么只清 BM25 不清向量：embedding 走语义，规格/ID 这类 token 影响很小；
+#   而 BM25 是词袋精确匹配，噪声直接进分数。分开处理各取所长。
+# 展示不受影响：_chunk_texts 原样保留，清洗只发生在建索引这一步。
+_DROP_LINE_PREFIXES = ("- ID：", "- 类别：", "- 图片：")
+# 规格形态：单个「数字+单位」或斜杠连接的多个（2kg/12kg、1.5kg/10kg、250g/2kg/12kg/17kg）
+_SPEC_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:kg|g|ml|L)(?:\s*/\s*\d+(?:\.\d+)?\s*(?:kg|g|ml|L))*")
+
+
+def _clean_for_bm25(text: str) -> str:
+    """清洗 BM25 索引文本：剔结构化元数据行 + 剥离规格数字。"""
+    kept = [ln for ln in text.split("\n") if not ln.strip().startswith(_DROP_LINE_PREFIXES)]
+    return _SPEC_RE.sub("", "\n".join(kept))
+
+# 检索参数（RRF_K / DEFAULT_TOP_K / RERANK_CANDIDATE_N / VEC_SCORE_LOW）集中在
+# src/config/settings.py —— 它们和 Recall 强耦合，改前务必重跑 eval_retrieval.py。
+from src.config.settings import RRF_K, DEFAULT_TOP_K, RERANK_CANDIDATE_N, VEC_SCORE_LOW
 
 # jieba 词典从派生层生成：品牌名（自动，从 products.md）+ 特征词（人维护，映射表 category_synonyms.md）。
 # 特征词依据「我想买{词}」语境实测会碎才加（切成合理多词的如「训练饼干」不补）。
@@ -66,8 +85,10 @@ class HybridRetriever:
         if not self._chunk_texts:
             self._bm25 = None  # 知识库为空，跳过 BM25（search 里退化为纯向量）
             return
-        # jieba 分词建 BM25 索引（建索引和查询用同一 jieba 配置）
-        self._tokenized = [jieba.lcut(t) for t in self._chunk_texts]
+        # jieba 分词建 BM25 索引（建索引和查询用同一 jieba 配置）。
+        # 只对**索引侧**做清洗（剔元数据行 + 剥规格），查询侧不清——用户输入本来就短、
+        # 不含结构化行；规格剥离也只对文档有意义（用户不会搜「1.5kg/10kg」）。
+        self._tokenized = [jieba.lcut(_clean_for_bm25(t)) for t in self._chunk_texts]
         self._bm25 = BM25Okapi(self._tokenized)
 
     def search(self, query: str, top_k: int = DEFAULT_TOP_K, category: str = None, kb_type: str = None,

@@ -33,12 +33,14 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from fastapi import Header, HTTPException
 
-ALG = "HS256"
-TOKEN_TTL = 3600  # 秒。短 TTL 是 JWT「无法主动失效」的主要缓解手段之一
-PBKDF2_ROUNDS = 200_000
-# 编排注入的 demo 密钥。代码不给默认值（fail-closed），但要能认出这个值并告警——
-# 「有默认密钥」等于「没有密钥」，签名可被任何拿到源码的人伪造。
-DEV_SECRET = "dev-only-secret-change-me"
+# 认证参数集中在 src/config/settings.py（那里标了「安全关键，改动需过 code review」）。
+# 用别名保持 `auth.TOKEN_TTL` 这类模块属性访问继续可用（main.py 的 /auth/token 就是这么读的）。
+from src.config.settings import (
+    JWT_ALG as ALG,
+    JWT_TOKEN_TTL as TOKEN_TTL,
+    PBKDF2_ROUNDS,
+    DEV_SECRET,
+)
 
 
 class AuthError(Exception):

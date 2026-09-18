@@ -31,12 +31,9 @@ import redis
 
 load_dotenv(os.path.join(_project_root, ".env"))
 
-# 空值哨兵（区分「不存在」和「真实数据」；qty=0 是真实数据，正常缓存 {"qty": 0}）
-EMPTY = "__EMPTY__"
-
-# 雪崩防护：TTL 随机抖动幅度（秒）。让同类/热点 key 的过期时间散开，
-# 避免同一时刻集体失效 → 流量瞬间全部回源 DB（缓存雪崩）。
-JITTER_SECONDS = 5
+# 空值哨兵 EMPTY 与抖动幅度 JITTER_SECONDS 已移到 src/config/settings.py
+# （CACHE_EMPTY / CACHE_JITTER_SECONDS，含各自的防穿透/防雪崩说明）。
+from src.config.settings import CACHE_EMPTY as EMPTY, CACHE_JITTER_SECONDS as JITTER_SECONDS
 
 
 def _jittered_ttl(ttl: int) -> int:
@@ -122,10 +119,12 @@ def set_empty(key: str, ttl: int):
 # （uvicorn 多 worker / 多容器）进程内锁互不可见，击穿防护失效——必须用 Redis 做跨进程
 # 分布式锁，这是「分布式锁」的动机。锁 value 存 token，释放时校验 value 才 DEL（Lua 原子），
 # 防「持锁线程 A 超时被抢锁线程 B 顶替，A 又回来 DEL 掉 B 的锁」。
-LOCK_PREFIX = "ecom:lock:"
-LOCK_TTL = 5          # 重建锁超时：持锁线程崩溃，锁最多卡 5s 自动释放，不永久阻塞
-LOCK_WAIT = 0.05      # 没抢到锁的线程重试读缓存间隔
-LOCK_RETRY = 40       # 最多重试 40 次（约 2s），仍 miss 则回源兜底（正确性优先）
+from src.config.settings import (
+    LOCK_PREFIX,
+    LOCK_TTL,
+    LOCK_WAIT,
+    LOCK_RETRY,
+)
 # 重试窗口 2s < 锁 TTL 5s 的权衡：持锁线程回源超过 2s（慢 SQL）时，等待线程会提前放弃、
 # 回源兜底 → 多线程并发回源，击穿防护退化。demo 回源是毫秒级本地 MySQL 查询，2s 绰绰有余；
 # 生产慢回源要么调大 LOCK_RETRY 对齐 LOCK_TTL，要么给回源加超时/熔断。这是「分布式锁
