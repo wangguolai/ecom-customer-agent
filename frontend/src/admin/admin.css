@@ -1,0 +1,238 @@
+/*
+ * 管理后台样式。
+ *
+ * ⚠️ 全部类名带 `admin-` 前缀：styles.css 是**全局引入**的（main.tsx）且含
+ * `.header` / `.menu` / `.chat` 这类通用类名，不隔离就会和聊天页互相污染。
+ * 这里也不复用 styles.css 的样式——它里面没有 :root/var() 定义，没有变量可复用。
+ */
+
+.admin-shell {
+  display: flex;
+  min-height: 100vh;
+  font-size: 14px;
+  color: #1f2328;
+  background: #f6f7f9;
+}
+
+/* ── 侧边栏 ── */
+.admin-side {
+  width: 200px;
+  flex: 0 0 200px;
+  background: #1f2937;
+  color: #d1d5db;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 0;
+}
+.admin-brand {
+  padding: 0 18px 16px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #fff;
+  border-bottom: 1px solid #374151;
+  margin-bottom: 10px;
+}
+.admin-side nav { display: flex; flex-direction: column; }
+.admin-side nav a {
+  padding: 10px 18px;
+  color: #d1d5db;
+  text-decoration: none;
+  border-left: 3px solid transparent;
+}
+.admin-side nav a:hover { background: #374151; color: #fff; }
+.admin-side nav a.admin-nav-active {
+  background: #374151;
+  color: #fff;
+  border-left-color: #3b82f6;
+}
+.admin-side-back {
+  margin-top: auto;
+  padding: 10px 18px;
+  color: #9ca3af;
+  text-decoration: none;
+  font-size: 13px;
+}
+.admin-side-back:hover { color: #fff; }
+
+/* ── 主区 ── */
+.admin-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.admin-top {
+  height: 52px;
+  background: #fff;
+  border-bottom: 1px solid #e5e7eb;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+}
+.admin-top-title { font-weight: 600; }
+.admin-logout {
+  padding: 5px 12px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.admin-logout:hover { background: #f3f4f6; }
+.admin-content { padding: 20px; flex: 1; min-width: 0; }
+
+/* ── 页头 ── */
+.admin-pagehead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.admin-pagehead h2 { margin: 0 0 4px; font-size: 18px; }
+.admin-desc { margin: 0; color: #6b7280; font-size: 13px; }
+.admin-head-extra { display: flex; gap: 8px; align-items: center; }
+.admin-sub { font-size: 14px; margin: 18px 0 8px; color: #374151; }
+
+/* ── 表格 ── */
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.admin-table th, .admin-table td {
+  padding: 9px 12px;
+  text-align: left;
+  border-bottom: 1px solid #eef0f2;
+  vertical-align: middle;
+}
+.admin-table th { background: #f9fafb; font-weight: 600; color: #4b5563; font-size: 13px; }
+.admin-table tr:last-child td { border-bottom: none; }
+.admin-table tbody tr:hover { background: #fafbfc; }
+
+.admin-mono { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+.admin-muted { color: #9ca3af; font-size: 12.5px; }
+.admin-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #eef2ff;
+  color: #4338ca;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* ── 控件 ── */
+.admin-table button, .admin-head-extra button, .admin-error button, .admin-pager button {
+  padding: 4px 10px;
+  margin-right: 4px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.admin-table button:hover:not(:disabled) { background: #f3f4f6; }
+.admin-table button:disabled { opacity: .5; cursor: not-allowed; }
+.admin-btn-primary { background: #2563eb !important; color: #fff; border-color: #2563eb !important; }
+.admin-btn-primary:hover:not(:disabled) { background: #1d4ed8 !important; }
+
+.admin-head-extra select, .admin-search input {
+  padding: 5px 9px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.admin-search { display: flex; gap: 6px; }
+.admin-search input { min-width: 190px; }
+
+/* ── 状态块 ── */
+.admin-empty, .admin-error, .admin-warn, .admin-note {
+  padding: 14px 16px;
+  border-radius: 6px;
+  margin: 10px 0;
+}
+.admin-empty { background: #fff; border: 1px dashed #d1d5db; color: #6b7280; text-align: center; }
+.admin-error { background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; }
+.admin-warn  { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; }
+.admin-note  { background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; font-size: 13px; line-height: 1.6; }
+
+/* ── 分页 ── */
+.admin-pager {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  color: #6b7280;
+  font-size: 13px;
+}
+
+/* ── 详情 ── */
+.admin-detail {
+  margin-top: 14px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 14px 16px;
+}
+.admin-detail h3 { margin: 0 0 10px; font-size: 14px; }
+.admin-traces { list-style: none; margin: 0; padding: 0; }
+.admin-traces li {
+  display: flex;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid #f3f4f6;
+}
+.admin-traces li:last-child { border-bottom: none; }
+
+/* ── 指标卡 ── */
+.admin-tiles { display: flex; flex-wrap: wrap; gap: 12px; }
+.admin-tile {
+  flex: 1 1 160px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 14px 16px;
+}
+.admin-tile-label { color: #6b7280; font-size: 12.5px; margin-bottom: 6px; }
+.admin-tile-value { font-size: 22px; font-weight: 600; }
+.admin-tile-hint { color: #9ca3af; font-size: 12px; margin-top: 5px; }
+
+/* ── 登录页 ── */
+.admin-login-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f6f7f9;
+}
+.admin-login-card {
+  width: 340px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 26px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.admin-login-card h1 { font-size: 17px; margin: 0; }
+.admin-login-hint { margin: 0; color: #6b7280; font-size: 12.5px; }
+.admin-login-card label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: #374151; }
+.admin-login-card input {
+  padding: 8px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  font-size: 14px;
+}
+.admin-login-card button[type="submit"] {
+  margin-top: 4px;
+  padding: 9px;
+  background: #2563eb;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.admin-login-card button[type="submit"]:disabled { opacity: .6; cursor: not-allowed; }
+.admin-login-back { color: #6b7280; font-size: 12.5px; text-align: center; }

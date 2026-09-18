@@ -80,14 +80,28 @@ class Trace:
 
 
 class MetricsStore:
-    """聚合多次对话的指标：技术成功率、P99/平均延迟、平均 token"""
+    """聚合多次对话的指标：技术成功率、P50/P95/P99 延迟、平均 token、缓存命中率
+
+    ⚠️ 三条使用边界（`/admin/metrics` 必须在返回体里标注，否则是误导）：
+      1. **进程内单例**（src/agent.py:487）—— 多 worker 各自持一份，**不聚合**
+      2. **只统计 Web 链路** —— 只有 `/chat/stream` 路径会调 `record()`；
+         CLI demo / 评测脚本跑的对话**不计入**
+      3. **重启清零** —— records 是内存 list，没有落盘
+    """
 
     def __init__(self):
-        self.records = []  # [(total_time, total_tokens, end_reason)]
+        # (耗时, 总token, 结束原因, 路由来源, 缓存命中token, 缓存未命中token)
+        self.records = []
+        self.since = None   # 首个样本时间，给前端标注「统计起点」
 
     def record(self, trace: Trace):
         s = trace.summary()
-        self.records.append((s["总耗时(秒)"], s["总 token 消耗"], s["结束原因"], s["路由来源"]))
+        if self.since is None:
+            self.since = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.records.append((
+            s["总耗时(秒)"], s["总 token 消耗"], s["结束原因"], s["路由来源"],
+            s["缓存命中 token"], s["缓存未命中 token"],
+        ))
 
     def _percentile(self, values: list, p: int) -> float:
         """最近秩近似 P 分位"""
@@ -105,14 +119,53 @@ class MetricsStore:
         # 技术成功率：结束原因 == 正常（没死循环/没超步数/没异常）。答案对不对归评测体系，不归这里。
         success = sum(1 for r in self.records if r[2] == "正常")
         route_rule = sum(1 for r in self.records if r[3] == "规则")
+        # 缓存命中率＝**总命中 / 总 token**，不是「各次命中率的平均」：
+        # 后者在样本量差异大时会有偏（一次 1000 token 全命中和一次 10 token 全未命中，
+        # 平均各次比率会得到 50%，而真实命中率是 99%）。聚合率永远用总量算。
+        cache_hit = sum(r[4] for r in self.records)
+        cache_total = cache_hit + sum(r[5] for r in self.records)
         return {
             "样本数": len(self.records),
             "技术成功率": round(success / len(self.records), 4),
             "规则路由占比": round(route_rule / len(self.records), 4),
             "平均延迟(秒)": round(sum(times) / len(times), 3),
+            "P50延迟(秒)": round(self._percentile(times, 50), 3),
+            "P95延迟(秒)": round(self._percentile(times, 95), 3),
             "P99延迟(秒)": round(self._percentile(times, 99), 3),
             "平均token": round(sum(tokens) / len(tokens), 1),
+            "缓存命中率": round(cache_hit / cache_total, 4) if cache_total else None,
         }
+
+    def snapshot(self) -> dict:
+        """给 `/admin/metrics` 的快照：**英文字段名当 API 契约** + 口径标注。
+
+        为什么不直接用中文键：中文键是给人看的（CLI / __repr__），
+        当成 API 契约会让前端依赖中文 key，易碎且别扭。这里做一层显式映射。
+
+        `cache_hit_rate` 无数据时返回 **None 而不是 0**——两者语义不同：
+        「没有缓存数据」和「命中率为零」是两回事，前端据此显示 `—` 而不是误导性的 `0%`。
+        """
+        s = self.summary()
+        n = s.get("样本数", 0)
+        base = {
+            "samples": n,
+            "scope": "single-process",   # 进程内单例，多 worker 不聚合
+            "sample_source": "web",      # 只有 /chat/stream 写入，CLI/评测不计入
+            "sample_since": self.since,
+        }
+        if not n:
+            return base
+        base.update({
+            "tech_success_rate": s["技术成功率"],
+            "rule_route_rate": s["规则路由占比"],
+            "latency_avg": s["平均延迟(秒)"],
+            "latency_p50": s["P50延迟(秒)"],
+            "latency_p95": s["P95延迟(秒)"],
+            "latency_p99": s["P99延迟(秒)"],
+            "tokens_avg": s["平均token"],
+            "cache_hit_rate": s["缓存命中率"],   # None = 无缓存数据
+        })
+        return base
 
     def __repr__(self):
         s = self.summary()

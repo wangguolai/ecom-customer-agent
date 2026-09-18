@@ -136,10 +136,12 @@ python -m src.agent                         # 跑 agent demo
 ```
 src/
 ├── agent.py            # ReAct 循环 + 意图路由 + 多轮会话
+├── memory.py           # 长期记忆（用户画像：抽取 / 检索 / 注入）
 ├── rag_pipeline.py     # RAG 生成链路
 ├── intent_router.py    # 规则优先、LLM 兜底的路由层
 ├── tools.py            # 8 个 Function Calling 工具
 ├── refresh.py          # 统一数据重建入口（SSOT → 派生）
+├── refresh_memory.py   # 画像派生层重建 + 真源↔派生对账
 ├── index_products.py   # 向量库全量/增量索引
 ├── infra/              # 基础设施（embedding/rerank/向量库/LLM/可观测）
 ├── domain/             # 实体层（products/policies schema）

@@ -19,7 +19,7 @@ import jieba
 from rank_bm25 import BM25Okapi
 
 from src.infra.embedding import get_embedding_model
-from src.infra.vector_store import QdrantStore
+from src.infra.vector_store import QdrantStore, get_qdrant_store
 from src.infra import reranker
 from src.derived.categories import build_jieba_words
 
@@ -68,7 +68,9 @@ class HybridRetriever:
         # store/model 可注入：k 扫描要在同一份数据上换 k 重跑，每个实例都新建 QdrantStore 会
         # 触发本地文件锁冲突（AlreadyLocked）。注入共享实例，让「换 k」不碰「数据/模型」。
         self._rrf_k = rrf_k
-        self._store = store if store is not None else QdrantStore()
+        # 走进程级单例（不是 QdrantStore()）：画像模块（src/memory.py）也要用同一个 store，
+        # 两边各自 new 会撞 Qdrant 本地文件锁。详见 vector_store.get_qdrant_store 的说明。
+        self._store = store if store is not None else get_qdrant_store()
         self._model = model if model is not None else get_embedding_model()
         self._build_bm25()
 

@@ -97,7 +97,13 @@ def _create_refund_ticket(order_id, amount):
         cur = conn.cursor()
         ticket_id = f"RF{uuid.uuid4().hex[:8].upper()}"
         try:
-            cur.execute("INSERT INTO refunds VALUES (%s,%s,%s,%s)", (ticket_id, order_id, amount, STATUS_PENDING))
+            # 显式列名（不用 `INSERT INTO refunds VALUES (...)`）：后者对表的列数/顺序敏感，
+            # 表加一列（如 created_at）就会静默错位或直接报错。列名写死的成本是零，鲁棒性差一档。
+            cur.execute(
+                "INSERT INTO refunds (ticket_id, order_id, amount, status, created_at) "
+                "VALUES (%s,%s,%s,%s,%s)",
+                (ticket_id, order_id, amount, STATUS_PENDING, time.strftime("%Y-%m-%d %H:%M:%S")),
+            )
         except pymysql.IntegrityError:
             # 撞 UNIQUE(order_id)：同订单已有工单（不管金额），查已有返回 duplicate
             cur.execute("SELECT ticket_id, status FROM refunds WHERE order_id=%s", (order_id,))

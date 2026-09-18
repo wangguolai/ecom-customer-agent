@@ -15,6 +15,7 @@ import sys
 import os
 import atexit
 import uuid
+import threading
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -31,6 +32,16 @@ COLLECTIONS = {
     "product_knowledge": {
         "description": "宠物商品知识库 RAG",
         "payload_schema": ["chunk_id", "text", "title", "category", "source_file", "chunk_index", "product_id", "image", "kb_type"],
+    },
+    # 用户画像语义检索。**独立 collection 不是洁癖**：
+    #   1. refresh / build_knowledge_base 会按源文件删 product_knowledge 的点 + 集合对账
+    #      （index_products.py:81-94），画像混进去会被算成「残留 chunk」；
+    #   2. 任何将来「重建整个 collection」的改动都会静默清空所有用户画像；
+    #   3. 独立 collection 由 ensure_collections 自动创建，成本为零。
+    # 它是**派生层**：真源在 MySQL user_memories，丢了可从真源重建（见 refresh_memory.py）。
+    "user_memory": {
+        "description": "用户画像语义检索（派生层，真源在 MySQL user_memories）",
+        "payload_schema": ["memory_id", "user_id", "content", "category", "confidence"],
     },
 }
 
@@ -210,6 +221,117 @@ class QdrantStore:
                 break
             offset = next_offset
         return results
+
+
+    # ── 用户画像（派生层，真源在 MySQL） ──────────────────────
+
+    def upsert_memory(self, payloads: list[dict], vectors: list[list[float]]):
+        """批量写入画像向量。point id 直接用 memory_id——
+        它由 `uuid5(user_id + ":" + 归一化content)` 生成（见 src/memory.py），
+        天然确定性幂等：同一条事实重复抽取 → 同一个 id → upsert 覆盖，不产生重复点。
+        """
+        from qdrant_client.models import PointStruct
+
+        points = [
+            PointStruct(id=p["memory_id"], vector=v, payload=p)
+            for p, v in zip(payloads, vectors)
+        ]
+        if points:
+            self._client.upsert(collection_name="user_memory", points=points)
+
+    def search_memory(
+        self,
+        query_vector: list[float],
+        user_id: str,
+        limit: int = 5,
+        score_threshold: Optional[float] = None,
+    ) -> list[SearchHit]:
+        """按语义检索该用户的画像。
+
+        **user_id 强制过滤**：这是「跨用户串号」（MINJA 那类投毒/越权读 PII）的落地点。
+        user_id 为空直接返回空——绝不做「不带过滤的全库检索」兜底（那等于把所有人的
+        画像混在一起喂给当前用户）。
+        """
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        if not user_id:
+            return []
+
+        kwargs = {}
+        if score_threshold is not None:
+            kwargs["score_threshold"] = score_threshold
+        results = self._client.query_points(
+            collection_name="user_memory",
+            query=query_vector,
+            query_filter=Filter(
+                must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+            ),
+            limit=limit,
+            **kwargs,
+        )
+        return [SearchHit(score=r.score, payload=r.payload) for r in results.points]
+
+    def delete_by_memory_ids(self, memory_ids: list[str]):
+        """按 memory_id 删除画像点（缓冲淘汰 / 用户删除单条用）"""
+        from qdrant_client.models import PointIdsList
+        ids = [m for m in memory_ids if m]
+        if ids:
+            self._client.delete(
+                collection_name="user_memory",
+                points_selector=PointIdsList(points=ids),
+            )
+
+    def count_memory_points(self, user_id: str = None) -> int:
+        """数画像点数（重建时的真源↔派生对账用）。带 user_id 则只数该用户。"""
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        query_filter = None
+        if user_id:
+            query_filter = Filter(
+                must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+            )
+        result = self._client.count(
+            collection_name="user_memory", count_filter=query_filter, exact=True
+        )
+        return result.count
+
+
+# ═══════════════════════════════════════════════════════════════
+# 进程级单例
+# ═══════════════════════════════════════════════════════════════
+
+_store_singleton: Optional["QdrantStore"] = None
+_store_lock = threading.Lock()
+
+
+def get_qdrant_store() -> "QdrantStore":
+    """进程级 Qdrant store 单例 —— **所有在线路径必须走这里**。
+
+    为什么必须单例：Qdrant 本地文件模式用 portalocker 加文件锁，同一进程内新建第二个
+    QdrantClient 会抛 AlreadyLocked（hybrid_retriever.py 的注释已记录过这个坑）。
+    而画像（src/memory.py）和商品检索（src/infra/hybrid_retriever.py）是两个模块，
+    各自 new 一个 store 就会撞锁——且是在 Web 链路上「先搜商品再存画像」时才炸，
+    属于最难排查的时序型故障。
+
+    双检锁：多线程（asyncio.to_thread 的 worker）并发首次调用时只建一个实例。
+    这是项目第二次踩「懒加载单例无锁」——第一次是 asyncio 并发初始化 Qdrant 冲突。
+
+    例外：离线重建入口（refresh_memory.py / index_products.py）允许自建实例 +
+    显式 close()，因为它们要在服务停止时独占文件。
+    """
+    global _store_singleton
+    if _store_singleton is None:
+        with _store_lock:
+            if _store_singleton is None:  # 双检：拿到锁后再确认一次
+                _store_singleton = QdrantStore()
+                # 幂等建 collection（已存在直接 continue，成本为零）。
+                # **必须在这里兜底**：全仓 grep 过，ensure_collections 只在 index_products /
+                # refresh_memory 这些**离线建库入口**里被调用，没有任何在线路径调它。
+                # 不建的话，全新 clone 且没跑过建库时，user_memory 不存在 →
+                # 画像写入抛「collection 不存在」被降级吞掉、检索永远返回 [] →
+                # 用户视角是「记忆功能不工作」却**没有任何显式报错**（最坏的一类失败）。
+                _store_singleton.ensure_collections()
+    return _store_singleton
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -8,10 +8,13 @@
   4. 跑完后 orders 表行数不变、表仍在（证明 SQL 注入没打穿）
 
 靶点：GET /orders/{id}、GET /logistics/{id}、GET /products/{id}、
+      GET /api/admin/{orders,refunds}（带 admin token）、
       POST /refund、POST /auth/token（body 也塞脏数据）。
 
-依赖：后端已在跑（http://localhost:8000）；容器 MySQL 映射宿主机 3307
-（用 VERIFY_MYSQL_PORT 覆盖；密码从 .env 的 MYSQL_PASSWORD 读）。
+依赖：后端已在跑（http://localhost:8000）；密码从 .env 的 MYSQL_PASSWORD 读；
+      MySQL 端口默认跟随 .env 的 MYSQL_PORT（本机 3306），用 VERIFY_MYSQL_PORT 覆盖。
+      （原默认写死 3307 = 容器映射端口，从 Docker 切回本机后就连不上了——
+        改成跟随 .env，两个环境都不用改代码。）
 
 用法：python tests/fuzz_backend.py
 """
@@ -42,7 +45,7 @@ REPORT_PATH = os.path.join(RESULTS_DIR, "fuzz_report.json")
 
 # MySQL 必须连容器实例（宿主机 3307），不能连宿主机 3306——那是另一个同名 ecommerce 库，
 # 连错了照样查得通、断言照样「通过」，是最危险的一类静默错误（对齐 test_auth.py 的 _find_ticket 规范）。
-MYSQL_PORT = int(os.environ.get("VERIFY_MYSQL_PORT", "3307"))
+MYSQL_PORT = int(os.environ.get("VERIFY_MYSQL_PORT", os.environ.get("MYSQL_PORT", "3306")))
 MYSQL_USER = os.environ.get("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
 MYSQL_DB = os.environ.get("MYSQL_DB", "ecommerce")
@@ -188,11 +191,35 @@ def _write_report(failures, passed, failed, count_before, count_after):
 # 单请求：发送 + 断言
 # ═══════════════════════════════════════════════════════════════
 
-def _send(method, url, json_body):
-    """发请求。返回 (ok, status, exception, body_text, content_type)。
-    ok=False 且 exception 非 None = 客户端异常（超时/连接失败/URL 非法）"""
+def _admin_token():
+    """登录拿 admin token。
+
+    为什么 admin 靶点必须带 token：不带的话脏输入全部停在 401，
+    根本打不到「订单号格式校验 / 分页参数校验 / LIKE 转义」这些真正要 fuzz 的逻辑，
+    等于白跑一遍。拿不到就返回 None 并告警——覆盖降级可以接受，静默降级不可以。
+    """
     try:
-        resp = requests.request(method, url, json=json_body, timeout=REQUEST_TIMEOUT)
+        resp = requests.post(
+            f"{BACKEND_URL}/auth/token",
+            json={"username": os.environ.get("ADMIN_USER", "admin"),
+                  "password": os.environ.get("ADMIN_PASSWORD", "")},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("access_token")
+    except requests.RequestException:
+        pass
+    return None
+
+
+def _send(method, url, json_body, headers=None):
+    """发请求。返回 (ok, status, exception, body_text, content_type)。
+    ok=False 且 exception 非 None = 客户端异常（超时/连接失败/URL 非法）
+
+    headers：鉴权靶点（/api/admin/*）传 Authorization，其余为 None。
+    """
+    try:
+        resp = requests.request(method, url, json=json_body, timeout=REQUEST_TIMEOUT, headers=headers)
         return True, resp.status_code, None, resp.text, resp.headers.get("content-type", "")
     except requests.exceptions.Timeout:
         return False, None, "Timeout", "", ""
@@ -265,6 +292,17 @@ def main():
         ("logistics", "/logistics/{payload}"),
         ("products", "/products/{payload}"),
     ]
+    # 管理后台靶点（2026-09-18 新增）：脏输入塞进 q / status / order_id。
+    # 必须带 token——否则全部停在 401，打不到分页校验、LIKE 转义、状态枚举这些真正的逻辑。
+    admin_token = _admin_token()
+    if not admin_token:
+        print("⚠️ 未取到 admin token（.env 缺 ADMIN_USER/ADMIN_PASSWORD？）——admin 靶点降级为 401 覆盖")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"} if admin_token else None
+    admin_targets = [
+        ("api-admin-orders-搜索", "/api/admin/orders?q={payload}"),
+        ("api-admin-orders-详情", "/api/admin/orders/{payload}"),
+        ("api-admin-refunds-筛选", "/api/admin/refunds?status={payload}"),
+    ]
     # 额外 body 形态（非对象/缺字段/多余字段），验证 body 校验不 5xx
     refund_body_shapes = [
         ("refund-body-非对象", "[]"),
@@ -286,6 +324,7 @@ def main():
     total = (
         len(payloads) * len(get_targets)
         + len(payloads) * 2  # refund + auth 每载荷一个
+        + len(payloads) * len(admin_targets)  # admin 靶点
         + len(refund_body_shapes) + len(auth_body_shapes)
     )
     i = 0
@@ -298,6 +337,25 @@ def main():
             url = BACKEND_URL + template.replace("{payload}", _url_component(payload))
             print(f"📍 [{i}/{total}] GET /{target}/{{id}} — 载荷[{label}]")
             send_ok, status, exc, body, ctype = _send("GET", url, None)
+            issues = _assert_ok(send_ok, status, exc, body, payload, label, target, "GET", content_type=ctype)
+            if issues:
+                failed += 1
+                _record(failures, label, payload, target, "GET", issues, status, exc, body)
+                print(f"   ❌ {issues} (status={status} exc={exc})")
+            else:
+                passed += 1
+                print(f"   ✅ status={status}")
+
+    # ── GET /api/admin/*（带 token）──
+    # 断言口径与上面一致：4xx 是校验层正确拦截（通过），5xx 才是 bug。
+    # 另外这些接口都有 `_limit_admin`（10s/100），每请求前清桶保证脏输入真打到业务逻辑。
+    for target, template in admin_targets:
+        _clear_ratelimit("admin")
+        for label, payload in payloads:
+            i += 1
+            url = BACKEND_URL + template.replace("{payload}", _url_component(payload))
+            print(f"📍 [{i}/{total}] GET {template.split('?')[0]} — 载荷[{label}]")
+            send_ok, status, exc, body, ctype = _send("GET", url, None, headers=admin_headers)
             issues = _assert_ok(send_ok, status, exc, body, payload, label, target, "GET", content_type=ctype)
             if issues:
                 failed += 1
