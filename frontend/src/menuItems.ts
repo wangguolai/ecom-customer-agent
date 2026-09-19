@@ -13,10 +13,10 @@ export const DEFAULT_PLACEHOLDER = '问点什么：幼犬吃什么粮？有肠�
  * 不用「填入引导文本」的原因：用户实测反馈「还要再点一遍发送，太没必要」。
  */
 export const MENU_ITEMS: MenuItem[] = [
-  { label: '📦 查订单', text: '查订单' },
-  { label: '🚚 查物流', text: '查物流' },
-  { label: '🏷️ 查库存', text: '查库存' },
-  { label: '📋 退货政策', text: '退货政策' },
-  { label: '🐾 商品咨询', text: '我想咨询一下商品' },
-  { label: '🙋 转人工', text: '我要转人工' },
+  { label: '📦 查订单', text: '查订单', intent: 'orders' },
+  { label: '🚚 查物流', text: '查物流', intent: 'logistics' },
+  { label: '🏷️ 查库存', text: '查库存', intent: 'stock' },
+  { label: '📋 退货政策', text: '退货政策', intent: 'policy' },
+  { label: '🐾 商品咨询', text: '我想咨询一下商品', intent: 'products' },
+  { label: '🙋 转人工', text: '我要转人工', intent: 'human' },
 ]

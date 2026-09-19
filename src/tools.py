@@ -30,7 +30,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from src.circuit_breaker import CircuitBreaker
 from src.infra.egress import validate_backend_url
-from src.config.prompts import RETURN_POLICY
+from src.config.prompts import RETURN_POLICY, INTERNAL_MSG_PREFIXES
 from src.config.rules import WRITE_TOOLS
 from src.config.settings import REQUEST_TIMEOUT
 
@@ -464,27 +464,71 @@ def _get_hybrid_retriever():
 
 
 # 类别触发词表（意图识别 → category 映射）从派生层生成（读映射表 category_synonyms.md）
-from src.derived.categories import build_category_keywords
+from src.derived.categories import build_category_keywords, build_generic_keywords
 CATEGORY_KEYWORDS = build_category_keywords()
+# 泛义词（猫/狗/猫猫/狗狗）：**独立一张表**，只在具体词全落空时兜底。
+# 合进 CATEGORY_KEYWORDS 会跟具体词抢分 —— 理由见 detect_category 的 docstring。
+GENERIC_KEYWORDS = build_generic_keywords()
 
 
-def detect_category(query: str):
-    """从 query 提取明确类别；多类别并列或识别不出返回 None（不过滤，保召回）"""
+def find_recent_category(messages: list):
+    """从消息列表里找**最近提到**的类别（从后往前扫）。用于**跨轮补参**。
+
+    场景（2026-09-20 实测 bug）：用户第一轮说「我想知道猫猫吃什么」，第二轮只说
+    「有没有别的品牌的」——第二句里**一个类别词都没有**，`detect_category` 返回 None
+    → 不锁类别 → 全库检索 → **狗粮混进了猫粮的推荐里**。
+    根因与「伪菜单掉 LLM」同源：规则/工具层只看当前这一句，看不到会话上下文。
+
+    ⚠️ 也扫 assistant：用户从没说过类别（「有什么推荐」）时，助手回复里的类别是唯一线索。
+    代价是「助手某一轮答偏了会把偏的类别带下去」——但取**最近**一条，用户的下一句话会覆盖它。
+
+    ⚠️ **必须跳过内部注入块**：它们也是 `role="user"`（画像 / 路由引导 / 工具回填），
+    但**不是用户说的话**。不跳的话实测会出两类静默错误：
+      · 画像块里有「宠物：猫」→ 之后所有无类别追问都被锁成猫粮（用户压根没提过猫）；
+      · 工具回填里有商品名（「中大型成犬…处方粮」）→ **查过一次订单就决定了下一轮锁狗粮**。
+    登记表复用 `prompts.INTERNAL_MSG_PREFIXES`——`session_history()` 排除的是同一批，
+    **同一份 messages 不能有两个出口两套语义**。
+    """
+    for m in reversed(messages):
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            continue
+        content = str(m.get("content", ""))
+        if any(content.startswith(p) for p in INTERNAL_MSG_PREFIXES):
+            continue
+        cat = detect_category(content)
+        if cat:
+            return cat
+    return None
+
+
+def _score_categories(table: dict, query: str):
+    """命中词数最多者胜；**并列或全 0 → None**（不明确，不过滤，保召回）"""
     best_cat = None
     best_count = 0
     tie = False
-    for cat, words in CATEGORY_KEYWORDS.items():
+    for cat, words in table.items():
         count = sum(1 for w in words if w in query)
         if count > best_count:
-            best_cat = cat
-            best_count = count
-            tie = False
+            best_cat, best_count, tie = cat, count, False
         elif count == best_count and count > 0:
             tie = True
-    # 并列（多个类别同样命中数）或没命中 → 不明确，不过滤
-    if tie or best_count == 0:
-        return None
-    return best_cat
+    return None if (tie or best_count == 0) else best_cat
+
+
+def detect_category(query: str):
+    """从 query 提取明确类别。**两轮打分：具体词优先，泛义词兜底**（顺序不可换）。
+
+    ⚠️ 为什么必须分两轮（2026-09-20 实测回归）：泛义词（猫/狗/猫猫/狗狗）加进主表后
+    会跟具体词**抢分**——
+      · 「洁齿骨，能让**狗狗**当饭吃吗」→ 零食(洁齿骨)=1 vs 狗粮(狗+狗狗)=2 → **狗粮赢**，
+        而洁齿骨是零食类商品 → 预过滤把正确答案整个滤掉；
+      · 「有没有**猫咪**吃的洁齿骨」→ 各 1 分 → **打平 → 不锁类别** → 退回全库检索。
+    分两轮后：「泛义词只在具体词一个都没命中时才生效」，压不过具体词。
+    """
+    cat = _score_categories(CATEGORY_KEYWORDS, query)
+    if cat:
+        return cat
+    return _score_categories(GENERIC_KEYWORDS, query)
 
 
 # 策略映射层（硬编码规则）：四维置信度 label → 给 LLM 的话术提示
@@ -580,9 +624,13 @@ def pop_collected_images():
     return imgs
 
 
-def _search_products_sync(query: str, top_k: int) -> str:
-    """search_products 的同步实现。embedding + rerank 是 CPU/GPU 密集，丢线程池跑（to_thread），不阻塞事件循环。"""
-    category = detect_category(query)
+def _search_products_sync(query: str, top_k: int, category: str = None) -> str:
+    """search_products 的同步实现。embedding + rerank 是 CPU/GPU 密集，丢线程池跑（to_thread），不阻塞事件循环。
+
+    `category` 显式给定时**优先**（跨轮补参：本句没写类别，但上一轮说了「猫猫」）；
+    没给才从 query 现算——两条来源都拿不到就不过滤（保召回，与 `detect_category` 同口径）。
+    """
+    category = category or detect_category(query)
     label, results = _get_hybrid_retriever().search(query, top_k=top_k, category=category, kb_type="product")
 
     # 记录检索命中（chunk_id）放在**最前面**，双低也要记 ——
@@ -618,13 +666,18 @@ def _search_products_sync(query: str, top_k: int) -> str:
     )
 
 
-async def search_products(query: str, top_k: int = 3) -> str:
-    """商品知识库检索（RAG）——混合检索 + category 预过滤 + 四维置信度策略映射"""
+async def search_products(query: str, top_k: int = 3, category: str = None) -> str:
+    """商品知识库检索（RAG）——混合检索 + category 预过滤 + 四维置信度策略映射
+
+    ⚠️ `category` **刻意不进 `TOOL_SCHEMAS`**——不让 LLM 填，由 `agent.py` 从会话上下文注入
+    （「类别下沉」，与「金额下沉」同一哲学：能从上下文结构化拿到的参数，不由 LLM 填）。
+    LLM 只负责 `query`（表达），类别是**判断**，判断交代码。
+    """
     query = _sanitize(query)
     # 空 query 防御：LLM 偶发传空串/纯空白时，不进 embedding（避免空字符串向量化异常 + 省一次无效推理）
     if not query.strip():
         return "请描述一下您想了解的商品（如适用对象、成分、规格等）。"
-    return await asyncio.to_thread(_search_products_sync, query, top_k)
+    return await asyncio.to_thread(_search_products_sync, query, top_k, category)
 
 
 # 工具名白名单映射（幻觉工具校验 + 派发执行）

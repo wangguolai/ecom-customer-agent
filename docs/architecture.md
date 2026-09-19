@@ -171,7 +171,8 @@
 
 > 横切线之三：埋点分「单次」和「聚合」两层。详见 `src/infra/observability.py`。
 
-- **Trace（单次）**：`trace_id` + LLM 耗时/token（含 DeepSeek 前缀缓存命中量）+ 工具耗时/step/空返回 + 检索命中的 chunk_id + 结束原因（正常/异常/死循环/超步数/超工具数/**断开**）。
+- **Trace（单次）**：`trace_id` + LLM 耗时/token（含 DeepSeek 前缀缓存命中量 + **推理 token**）+ 工具耗时/step/空返回 + 检索命中的 chunk_id + 结束原因（正常/异常/死循环/超步数/超工具数/**断开**/**泄漏**）。
+  - **推理 token 必须单列**：`deepseek-v4-pro` 是推理模型，`completion_tokens` 里混着「用户看到的答案」和「用户看不到的思维链」——实测极端例 `completion=1929` 中 `reasoning=1908`（**99%**）。不单列的话，「20 秒只产出两行字」这类现象看 `total_tokens` 永远解释不了。口径：**主循环 + 摘要调用求和**，占比分母用 `completion`（不是 `total`——`total` 大头是 prompt，会把 99% 稀释成个位数）。
   - **token 统计走流式 usage 事件**：`stream_events` 产出 `("usage", obj)`（需 `stream_options.include_usage`，DeepSeek 把 usage 绑在最后一个内容块上）。此前流式路径的 token 恒记 0。
 - **trace 落盘**（`src/backend/trace_store.py`）：Trace 是内存对象、请求结束即丢；落盘后「一次对话到底发生了什么」才可回溯——这是**反馈评分能成立的前提**（没有它，一个差评只是个孤立数字，无法复现失败）。落盘内容含 prompt 版本（自动 hash）与知识库版本（源文件 hash），否则复现时对不上。`traces` 表 **不参与 `_init_db` 的 DROP 重建**（运行时数据）。
 - **执行步骤可视化**：`stream_chat` 产出 `("text"|"step", payload)` 二元组 → `main.py` 翻成 SSE 帧（`delta` / `step`）→ 前端左侧栏实时展示「第几步、在做什么」。步骤文案用**中文动作**（「查询订单」）而非工具名，且 `check_online` / `transfer_to_human` 统一显示「正在处理」——展示「查询客服在线状态」等于把「转人工前先探活、不在线不承诺」这套机制摆到用户面前。

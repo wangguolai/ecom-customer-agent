@@ -64,6 +64,7 @@ from src.config.settings import (
     MEMORY_MAX_CHARS,
     MEMORY_MAX_TOKENS,
     MEMORY_EXTRACT_MAX_TOKENS,
+    REASONING_EFFORT_MECHANICAL,
     REQUEST_TIMEOUT,
 )
 from src.infra.egress import validate_backend_url
@@ -222,6 +223,11 @@ async def extract(user_msg: str, answer: str) -> list[dict]:
             messages,
             temperature=0.0,                        # 对齐 agent._summarize：抽取要确定性
             max_tokens=MEMORY_EXTRACT_MAX_TOKENS,
+            # ⚠️ 必须关掉思考。`MEMORY_EXTRACT_MAX_TOKENS=400` 是给「输出一个 JSON 数组」设的，
+            # 而推理 token 计入 `completion_tokens`、max_tokens 封顶的正是它 —— 实测
+            # `completion=400, reasoning=400, content=''`，**抽取恒返回空、画像从未被写入过**。
+            # 关掉后 completion=68、JSON 正常；顺带让 temperature=0.0 真正生效（本意就是确定性）。
+            reasoning_effort=REASONING_EFFORT_MECHANICAL,
         )
     except Exception as e:                          # 网络/超时/额度，全部吞掉
         print(f"⚠️ 画像抽取调用失败：{type(e).__name__}: {e}", file=sys.stderr)

@@ -9,6 +9,8 @@
   - 三级漏斗（产品视角）：菜单/规则（常用命令，零成本）→ 假人工/agent（长尾，LLM 兜底）
     → 真人（明确转人工才出，且要 check_online 查在线）。
   - 只路由「自包含、高置信」的意图；多轮指代、模糊意图、语义检索、写操作（退款）走 LLM。
+  - ⚠️ **例外：菜单路径（`route_by_menu`）故意破上一条**——它会从会话历史补参数。
+    理由与边界见该函数的 docstring；手打输入仍严格守上一条。
 
 能规则路由的（自包含、参数可精确提取）：
   search_orders / search_logistics（订单号强模式 + 关键词区分）
@@ -37,6 +39,8 @@ from src.config.rules import (
     AFTERSALE_WORDS as _AFTERSALE_WORDS,
     SUMMARIZE_WORDS as _SUMMARIZE_WORDS,
     BROWSE_WORDS as _BROWSE_WORDS,
+    MENU_INTENTS,
+    MENU_ASK_TEXT,
 )
 
 # 订单号模式：11 位、20 开头（demo 种子数据 20240818001 这种）。
@@ -72,6 +76,71 @@ def _extract_order_id(text: str):
     digits = "".join(re.findall(r"\d+", text))
     m = _ORDER_ID_FULL_RE.fullmatch(digits)
     return m.group(0) if m else None
+
+
+def _find_recent_order_id(messages: list):
+    """从消息列表里找**最近提到**的订单号（从后往前扫）。
+
+    扫 user 与 assistant 两类：用户自己报过号，助手回复里也常带（「订单 20240818001 已发货」）。
+    只要「最近提到的那个」——刻意不做「挑一个最像的」这种判断，那又是把概率问题塞回规则层。
+    """
+    for m in reversed(messages):
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            continue
+        oid = _extract_order_id(str(m.get("content", "")))
+        if oid:
+            return oid
+    return None
+
+
+def route_by_menu(menu_intent, user_msg: str, messages: list):
+    """菜单意图路由（**确定性入口**，与 route_by_rule 的概率性输入分开）。
+
+    返回与 `route_by_rule` 同构的三元组：
+      `("tool", name, args)` —— 参数齐了，执行工具（调用方**复用规则路由的工具执行路径**）
+      `("ask",  None, 文案)`  —— 缺参数，**固定反问**（零 LLM）
+      `None`                 —— 不是白名单 id / 被否定守卫拦下 → 调用方落回 `route_by_rule`
+
+    ⚠️ **本函数是模块契约的显式例外**（见文件头第 3 条）。菜单是用户**点出来的**确定性入口，
+    不存在「猜意图」；而「从会话历史补参数」正是为了修「点一下菜单要等 6.5 秒做一次 LLM 决策」
+    （实测：`查订单` 2 次 LLM 往返、工具一次没调）。例外**仅限菜单路径**——手打的裸意图词
+    仍走 LLM，放宽会重演 2026-09-20 刚修的「裸词误伤」。
+
+    ⚠️ **路由只由白名单 id 决定；`user_msg` 只当参数来源，不参与判断意图。**
+    否则客户端可以发 `menu_intent=human` + `message="不用转人工"`，单方面覆写规则层的
+    否定守卫——那是「客户端篡改安全判定」，不是配置错误。
+    """
+    entry = MENU_INTENTS.get(menu_intent) if isinstance(menu_intent, str) else None
+    if entry is None:
+        return None                      # 白名单外：不报错、不猜，落回规则层
+
+    tool_name, param = entry
+
+    # ⚠️ 否定守卫必须在**去空白副本**上判，不能拿原始串——`route_by_rule` 用的就是副本
+    # （`re.sub(r"\s+", "", user_msg)`，见文件下方），而菜单分支是**优先且早退**的。
+    # 用原始串的话，「不 用转人工」「不　用转人工」（半角/全角空格打断）会绕过守卫，
+    # 拿到的正是「客户端单方面覆写规则层安全判定」——本函数 docstring 明令要防的事。
+    compact = re.sub(r"\s+", "", user_msg or "")
+    if any(w in compact for w in _NEGATE_WORDS):
+        return None
+
+    if param == "order":
+        oid = _extract_order_id(compact) or _find_recent_order_id(messages)
+        if oid:
+            return ("tool", tool_name, {"order_id": oid})
+        return ("ask", None, MENU_ASK_TEXT["order"])
+
+    if param == "product":
+        # 拿不到内部 product_id（明令不外露 + 工具结果不进会话历史）→ 只能反问商品名。
+        # 刻意**不猜商品**：用户答了名字之后走正常检索链路，那条路本来就是对的。
+        return ("ask", None, MENU_ASK_TEXT["product"])
+
+    # 无必需参数：args 从本轮消息组装（与 route_by_rule 同款）
+    if tool_name == "get_return_policy":
+        return ("tool", tool_name, {"query": user_msg})
+    if tool_name == "transfer_to_human":
+        return ("tool", tool_name, {"problem": user_msg})
+    return None
 
 
 def route_by_rule(user_msg: str):

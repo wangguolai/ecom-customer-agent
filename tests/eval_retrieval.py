@@ -26,6 +26,8 @@ from src.tools import detect_category
 
 import regression
 from cases import RETRIEVAL_CASES as EVAL_SET
+from cases import RETRIEVAL_MULTITURN_CASES as MT_CASES
+from src.tools import find_recent_category
 
 # 检索评测集已集中到 cases.py（RETRIEVAL_CASES），此处 import 别名 EVAL_SET 保持脚本内逻辑不变。
 
@@ -165,6 +167,119 @@ def run_eval():
 
     # 数据飞轮：失败回流 + 池回归 + fix 型毕业
     _run_regression(retriever, failures)
+
+    # 第二组判据：类别锁定（多轮 + 泛指词）
+    _run_multiturn_eval(retriever)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 类别锁定评测（2026-09-20 新增）
+# ═══════════════════════════════════════════════════════════════
+def _resolve_category(query: str, history: list):
+    """类别决策 —— **直接调用生产函数，不复制逻辑**。
+
+    ⚠️ 早先版本在这里自己写了一遍「本句优先 → 历史兜底」，被 code-review 指出是**复制品**：
+    生产的优先级其实由两处共同保证（`agent._with_context_category` 的提前 return +
+    `tools._search_products_sync` 的 `category or detect_category(query)`），
+    复制品今天「碰巧等价」，但**任何一处改动都会让它静默失真，而评测仍然全绿**。
+    改成就地调用生产函数，单一事实源——评测走的必须是线上那条路。
+    """
+    from src.agent import _with_context_category
+    args = _with_context_category("search_products", {"query": query}, history)
+    return args.get("category") or detect_category(query)
+
+
+def _run_multiturn_eval(retriever):
+    """类别锁定：单轮泛指词 + 跨轮继承。判据 = **类别纯净度**（见 cases.py 的说明）。"""
+    from src.domain.products import parse_products
+    title2cat = {p.title: p.category for p in parse_products()}
+
+    print()
+    print("=" * 70)
+    print("类别锁定评测（单轮泛指词 / 跨轮继承）——判据：top-K 里不得出现非期望类别")
+    print("-" * 70)
+    failures = []
+    passed = 0
+    for case in MT_CASES:
+        turns = case["turns"]
+        # 历史造得**贴近生产**：user + assistant 交替（`find_recent_category` 也扫 assistant），
+        # 只放 user 轮的话「也扫 assistant」那条设计在评测里零覆盖。
+        history = []
+        for i, t in enumerate(turns[:-1]):
+            history.append({"role": "user", "content": t})
+            history.append({"role": "assistant", "content": f"（第 {i+1} 轮的回复）"})
+        query = turns[-1]
+        category = _resolve_category(query, history)
+        label, results = retriever.search(query, top_k=3, category=category, kb_type="product")
+        titles = [t for _, _, _, t, _, _ in results]
+        cats = {title2cat.get(t, "（未知）") for t in titles}
+        want = case["expect_category"]
+        # ⚠️ **两条判据必须分开报**，不能合成一个 bool：
+        #   · 纯净度（cats ⊆ {want}）：出现别的类别 = 类别污染 ← 本判据要抓的那个 bug
+        #   · 非空（bool(cats)）：空返回 = 召回层判了双低（锁对类别但没召回）
+        # 合成的话「拒答」会被误标成「类别未锁定」，排查时找错方向。
+        pure = cats <= {want} if cats else False
+        nonempty = bool(cats)
+        ok = pure and nonempty
+        flag = "✅" if ok else "❌"
+        extra = "" if nonempty else f"（空返回，label={label}——是召回策略不是类别问题）"
+        print(f"{flag} {case['name']}：期望类别={want} → 实际 {sorted(cats) or '（空）'}{extra}")
+        if ok:
+            passed += 1
+        else:
+            failures.append({
+                "query": " ⇒ ".join(turns),      # 池的唯一键：拼全程，避免和单轮 case 撞
+                "turns": turns,                  # 复测要用
+                "expected": [want],              # 只存类别值，别再包 "类别=" 一层
+                "fail_type": ("召回空返回" if not nonempty
+                              else ("跨轮类别污染" if len(turns) > 1 else "类别未锁定")),
+                "first_actual": "、".join(sorted(cats)) or "（空返回）",
+                "note": case.get("note", ""),
+                "added_at": time.strftime("%Y-%m-%d"),
+            })
+    total = len(MT_CASES)
+    print("-" * 70)
+    print(f"类别纯净率 = {passed}/{total} = {passed / total:.2%}")
+    print("=" * 70)
+
+    # 飞轮：**独立的池**（`retrieval_multiturn`）——它的复测要用 turns 重放，
+    # 和单轮池的「拿 query 再检索一次」不是同一套逻辑，合池会让复测逻辑分叉。
+    pool_cases = regression.open_cases("retrieval_multiturn")
+    added = regression.add_failures("retrieval_multiturn", failures)
+    print(f"\n数据飞轮（类别锁定线）：本次回流 +{added} 条 → 池 open {len(pool_cases)} 条（不含本次）")
+    if not pool_cases:
+        print("📊 回归池：空（无待回归 case）")
+        return
+    passed_q = set()
+    known_cats = set(title2cat.values())
+    for c in pool_cases:
+        exp = c.get("expected") or []
+        want = str(exp[0]) if exp else ""
+        # ⚠️ 池可能被手改 / 将来并池，出现本写入方不认识的期望值。不校验的话
+        # `cats <= {"?"}` **恒假** → 永久 ❌「fix 仍坏」且永不毕业，污染池健康度。
+        # 拿已知类别校验一次，不认识就跳过并告警（不报 ❌）。
+        if want not in known_cats:
+            print(f"  ⚠️ [跳过] {c['query'][:32]}：期望值 {want!r} 不在已知类别里（池被手改过？）")
+            continue
+        turns = c.get("turns") or [c.get("query", "")]
+        history = []
+        for i, t in enumerate(turns[:-1]):
+            history.append({"role": "user", "content": t})
+            history.append({"role": "assistant", "content": f"（第 {i+1} 轮的回复）"})
+        query = turns[-1]
+        category = _resolve_category(query, history)
+        label, results = retriever.search(query, top_k=3, category=category, kb_type="product")
+        cats = {title2cat.get(t, "（未知）") for _, _, _, t, _, _ in results}
+        if cats and cats <= {want}:
+            passed_q.add(c["query"])
+            print(f"  ✅ [fix 修复] {c['query'][:32]}：类别纯净（{want}）")
+        else:
+            why = "空返回（召回策略）" if not cats else "类别污染"
+            print(f"  ❌ [fix 仍坏] {c['query'][:32]}：期望 {want}，"
+                  f"实际 {sorted(cats) or '（空）'}（{why}）")
+    graduated = regression.graduate("retrieval_multiturn", passed_q)
+    if graduated:
+        print(f"🎓 毕业 {len(graduated)} 条")
 
 
 def _run_regression(retriever, failures):

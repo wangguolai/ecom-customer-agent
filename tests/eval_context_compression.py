@@ -60,6 +60,23 @@ def _entity_kept(messages, entities):
     return {e: (e in text) for e in entities}
 
 
+PASS, FAIL = 0, 0
+
+
+def check(name, cond, detail=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  ✅ {name}")
+    else:
+        FAIL += 1
+        print(f"  ❌ {name}  {detail}")
+
+
+def _has_summary(messages) -> bool:
+    return any(str(m.get("content", "")).startswith(agent.SUMMARY_PREFIX) for m in messages)
+
+
 async def run_eval(real=False):
     summarize = agent._summarize if real else _mock_summarize
 
@@ -88,9 +105,35 @@ async def run_eval(real=False):
             kept_str = " ".join(("✅" if kept[e] else "❌") + e for e in scene["entities"])
             print(f"{scene['name']:<14} {strategy:<8} {before:>7} {after:>7} {ratio:>7.2%}  {kept_str}")
 
+            if strategy != "摘要压缩":
+                continue
+            # ── 断言（此前本脚本**只打印不断言**，是典型的"假覆盖"：摘要失效跑过它却全绿）──
+            check(f"[{scene['name']}] 确实压缩了（压缩率 < 100%）", ratio < 1.0, f"ratio={ratio:.2%}")
+            check(f"[{scene['name']}] 产出摘要消息（压缩真的生效，不是空转）",
+                  _has_summary(messages),
+                  "没有 SUMMARY_PREFIX 消息 → 压缩没做（历史上的失败形态：摘要为空被守卫拦下）")
+            check(f"[{scene['name']}] 关键实体全保留",
+                  bool(kept) and all(kept.values()),
+                  f"丢了 {[e for e, k in kept.items() if not k]}")
+
+        # 判据有效性：对照组（丢轮次）**必须真的丢东西**，否则这个 case 没有区分度，
+        # 「摘要比丢轮次好在哪」就无从谈起。这条守的是**测试数据**而不是产品代码，
+        # 但同样是静默失效的温床（case 退化成送分题没人会发现）。
+        base2 = _build_messages(scene["turns"])
+        agent._trim_history(base2, EVAL_MAX_TOKENS)
+        dropped = _entity_kept(base2, scene["entities"])
+        check(f"[{scene['name']}] 对照组有区分度（丢轮次确实丢了实体）",
+              not all(dropped.values()),
+              "丢轮次也全保留 → 这条 case 测不出摘要的价值了，需要换更长的对话")
+
     print("=" * 76)
-    print("结论：丢轮次=无差别丢最早轮，订单号随轮次一起丢；摘要压缩=旧轮压成摘要，关键实体保留。")
+    print(f"结论：丢轮次=无差别丢最早轮，订单号随轮次一起丢；摘要压缩=旧轮压成摘要，关键实体保留。")
+    print(f"通过 {PASS} / 失败 {FAIL}")
+    if FAIL:
+        print("⚠️ 压缩链路有断言没过——注意：**摘要为空是最阴的失败形态**，"
+              "它会被 `_compress_history` 的守卫静默降级成「丢轮次」。")
+    return FAIL
 
 
 if __name__ == "__main__":
-    asyncio.run(run_eval(real="--real" in sys.argv))
+    sys.exit(1 if asyncio.run(run_eval(real="--real" in sys.argv)) else 0)

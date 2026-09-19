@@ -100,7 +100,10 @@ async def test_stream_events_tool_calls():
     check("stream_events tool_calls 分片累积拼接", events == expected, str(events))
 
 
-async def _gen_answer(messages=None, tools=None, max_tokens=None):
+async def _gen_answer(messages=None, tools=None, max_tokens=None, **kwargs):
+    # ⚠️ `**kwargs` 是刻意的：`stream_events` 的签名会随功能增加参数
+    # （2026-09-20 加了 `model=` 选档），写死签名的 mock 会直接 TypeError
+    # 而不是报出真正的失败——mock 要跟着**接口形态**走，不跟着**某次调用的参数列表**走。
     yield ("text", "订")
     yield ("text", "单状态正常")
 
@@ -117,7 +120,10 @@ async def test_react_loop_stream_answer():
     check("答案轮 trace 正常结束", trace.end_reason == "正常", trace.end_reason)
 
 
-async def _gen_tool_call(messages=None, tools=None, max_tokens=None):
+async def _gen_tool_call(messages=None, tools=None, max_tokens=None, **kwargs):
+    # ⚠️ `**kwargs` 是刻意的：`stream_events` 的签名会随功能增加参数
+    # （2026-09-20 加了 `model=` 选档），写死签名的 mock 会直接 TypeError
+    # 而不是报出真正的失败——mock 要跟着**接口形态**走，不跟着**某次调用的参数列表**走。
     yield ("tool_calls", [{"id": "call_1", "name": "search_orders", "arguments": '{"order_id":"20240818001"}'}])
 
 
@@ -173,7 +179,10 @@ async def test_stream_events_usage():
     check("usage 排在 tool_calls 之后", kinds == ["tool_calls", "usage"], str(kinds))
 
 
-async def _gen_answer_with_usage(messages=None, tools=None, max_tokens=None):
+async def _gen_answer_with_usage(messages=None, tools=None, max_tokens=None, **kwargs):
+    # ⚠️ `**kwargs` 是刻意的：`stream_events` 的签名会随功能增加参数
+    # （2026-09-20 加了 `model=` 选档），写死签名的 mock 会直接 TypeError
+    # 而不是报出真正的失败——mock 要跟着**接口形态**走，不跟着**某次调用的参数列表**走。
     yield ("text", "订")
     yield ("text", "单状态正常")
     yield ("usage", SimpleNamespace(total_tokens=10, prompt_tokens=9,

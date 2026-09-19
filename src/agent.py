@@ -8,6 +8,7 @@
 
 import sys
 import os
+import re
 import json
 import time
 import asyncio
@@ -18,16 +19,39 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+# ⚠️ **stderr 也要**：`reconfigure` 只作用于单个流，而本项目大量用 `print(..., file=sys.stderr)`
+# 打警告（空摘要/工具异常/泄漏降级…）。不改的话那些中文警告在 Windows GBK 终端里全是乱码——
+# 而警告正是「静默失败」唯一的可见信号，乱码等于没有。
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from src.infra.llm import chat_with_usage, stream_events
+# 工具调用文本泄漏的**检测窗口**（字符）。必须跨多段 delta：JSON 形态的泄漏
+# （`{"name": "search_products"`）里空格/引号/冒号不参与扣留、会被立即发出，
+# 只看当前扣留缓冲就漏检了。200 足够覆盖任何工具调用片段。
+_LEAK_DETECT_WINDOW = 200
+
+from src.infra.llm import chat_with_usage, stream_events, reasoning_tokens_of, get_model
 from src.infra.observability import Trace, MetricsStore
-from src.tools import TOOL_SCHEMAS, TOOL_MAP, CATEGORY_KEYWORDS, WRITE_TOOLS
-from src.intent_router import route_by_rule
-from src.config.prompts import SYSTEM_PROMPT, SUMMARY_INSTRUCTION, SUMMARY_PREFIX, MEMORY_INJECT_PREFIX
+from src.tools import (
+    TOOL_SCHEMAS, TOOL_MAP, CATEGORY_KEYWORDS, WRITE_TOOLS,
+    find_recent_category, detect_category,
+)
+from src.intent_router import route_by_rule, route_by_menu
+from src.config.prompts import (
+    SYSTEM_PROMPT,
+    SUMMARY_INSTRUCTION,
+    SUMMARY_PREFIX,
+    MEMORY_INJECT_PREFIX,
+    NO_TOOL_SYNTAX_HINT,
+    GUIDE_PREFIX,
+    ROUTED_TOOL_PREFIX,
+    INTERNAL_MSG_PREFIXES,
+)
 from src.config.rules import (
     EMPTY_SIGNALS as _EMPTY_SIGNALS,
     TOOL_ACTION_TEXT as _TOOL_ACTION_TEXT,
     TOOL_ACTION_FALLBACK as _TOOL_ACTION_FALLBACK,
+    looks_like_tool_call_leak,
+    strip_tool_call_leak,
 )
 from src.config.settings import (
     MAX_STEPS,
@@ -36,10 +60,46 @@ from src.config.settings import (
     MAX_HISTORY_TOKENS,
     MAX_OUTPUT_TOKENS,
     SUMMARY_MAX_TOKENS,
+    LEAK_FLUSH_CHARS,
+    REASONING_EFFORT_MECHANICAL,
+    MODEL_TIER_DECISION,
 )
 
 # 提示词 / 词表 / 阈值统一在 src/config/（prompts / rules / settings），本文件只做引用：
 # 改提示词不用进 agent.py，调步数上限不用翻 ReAct 逻辑。原地的定义已全部搬走。
+
+
+def _with_context_category(name: str, args, messages: list):
+    """给 `search_products` 补上**会话级类别**（「类别下沉」）。
+
+    只在「工具是 search_products」且「调用方没给 category」时补：本句没写类别
+    （如「有没有别的品牌的」）时，从会话历史找**最近提到**的类别。找不到就不补
+    （保持原有「不过滤，保召回」的行为）。
+
+    为什么由代码补、不让 LLM 填：类别是**判断**，且从上下文能结构化拿到——
+    与「金额下沉」（LLM 无权填金额，后端查权威值）同一哲学。
+    也刻意**不进 `TOOL_SCHEMAS`**：LLM 看见它就会开始乱填。
+    """
+    if name != "search_products" or not isinstance(args, dict):
+        return args
+    # ⚠️ 调用方（生产里唯一来源就是 LLM 的 JSON args）给的 category **必须过白名单**。
+    # `category` 刻意不在 TOOL_SCHEMAS 里，但 LLM 完全可能幻觉一个出来；不校验的话
+    # 未知值会一路进 Qdrant 的 `MatchValue` → 0 命中 → 双低 → **静默拒答**（不报错）。
+    explicit = args.get("category")
+    if explicit is not None and explicit not in CATEGORY_KEYWORDS:
+        args = {k: v for k, v in args.items() if k != "category"}
+        explicit = None
+    if explicit:
+        return args          # 合法且已给的，尊重调用方
+    # ⚠️ **本句自带类别时，本句优先**，不能被历史的覆盖。
+    # 不判这一条的话：用户先问猫粮、后改口「狗狗吃什么好」→ 会拿历史的「猫粮」覆盖本句的「狗粮」，
+    # 检索出猫粮来——**比不补参更糟**（不补至少不会答反）。
+    # 这条是设计多轮评测 case 时才发现的，单看实现「只在没类别时补」觉得很自然。
+    q = args.get("query")
+    if isinstance(q, str) and detect_category(q):
+        return args
+    cat = find_recent_category(messages)
+    return {**args, "category": cat} if cat else args
 
 
 def truncate(text: str, max_len: int = MAX_TOOL_RESULT_LEN) -> str:
@@ -68,7 +128,15 @@ def _trim_history(messages: list, max_tokens: int) -> list:
     保留作「丢轮次」对照基线：无差别丢最早轮，会丢关键实体（订单号），是「摘要压缩」要解决的问题。
     """
     while _messages_tokens(messages) > max_tokens:
-        turn_starts = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"]
+        # ⚠️ **摘要消息必须排除在「轮次起点」之外**：它也 role=user 且紧跟在 system 之后，
+        # 所以它是 `turn_starts[0]`，每次丢轮次**第一个被删的就是摘要**。
+        # 今天摘要是内存态、丢了下一轮重算；但压缩结果落回会话层之后，它是跨轮**唯一**的
+        # 压缩产物，删掉即永久丢失（`_compress_history` 找真实轮次时也是这么排除的）。
+        turn_starts = [
+            i for i, m in enumerate(messages)
+            if isinstance(m, dict) and m.get("role") == "user"
+            and not str(m.get("content", "")).startswith(SUMMARY_PREFIX)
+        ]
         if len(turn_starts) <= 1:
             break  # 只剩当前一轮，丢不动了（单轮爆由截断 + 步数兜底）
         del messages[turn_starts[0]:turn_starts[1]]
@@ -76,10 +144,31 @@ def _trim_history(messages: list, max_tokens: int) -> list:
 
 
 async def _summarize(history_messages: list):
-    """把旧轮次压成 LLM 摘要。返回 (summary_text, usage, elapsed)"""
+    """把旧轮次压成 LLM 摘要。返回 (summary_text, usage, elapsed)
+
+    ⚠️ 签名**必须保持单参数** `(history_messages)`——`tests/test_history_trim.py` 与
+    `tests/eval_context_compression.py` 都用单参 mock 替换它，扩签名会直接 TypeError。
+
+    两个刻意的形态选择（都有实测支撑，见 docs/routing-leak-fix-plan.md §1）：
+      ① **指令尾置**（作为最后一条 user 消息，不再放 system）——摘要任务的标准形态。
+         留在 system 时，关掉思考后模型会把「system 指令 + 历史」当成一段**待续写的对话**，
+         直接回答最后一条用户消息（实测输出「订单 20240818001 的物流显示已签收。」）。
+      ② **关闭思考**——`max_tokens=SUMMARY_MAX_TOKENS(300)` 会被推理 token 整段吃光
+         （推理计入 `completion_tokens`，而 max_tokens 封顶的正是它）。实测
+         `completion=300, reasoning=300, content=''`；关掉后 `completion=60`、正文正常，
+         且 `temperature=0.0` 真正开始生效（思考模式下它是空操作）。
+
+    ⚠️ 历史可能**退化成只剩一条 user 消息**：`_compress_history` 过滤掉 `tool` 回填与
+    `assistant(tool_calls)`，而 ReAct 在死循环/超工具数/超步数/异常等路径下**不 append
+    最终 assistant**，过滤后可能只剩一条 user。尾置会形成连续两条 user 消息。
+    实测该形态同样产出正确摘要，可用；但要有单测钉住两种尾角色（assistant / user）。
+    """
     t0 = time.perf_counter()
-    msgs = [{"role": "system", "content": SUMMARY_INSTRUCTION}] + history_messages
-    resp, usage = await chat_with_usage(msgs, temperature=0.0, max_tokens=SUMMARY_MAX_TOKENS)
+    msgs = list(history_messages) + [{"role": "user", "content": SUMMARY_INSTRUCTION}]
+    resp, usage = await chat_with_usage(
+        msgs, temperature=0.0, max_tokens=SUMMARY_MAX_TOKENS,
+        reasoning_effort=REASONING_EFFORT_MECHANICAL,
+    )
     elapsed = time.perf_counter() - t0
     return (resp.content or ""), usage, elapsed
 
@@ -116,12 +205,20 @@ async def _compress_history(messages: list, max_tokens: int, trace: Trace = None
 
     summary_text, usage, elapsed = await _summarize(to_compress)
     if not summary_text or not summary_text.strip():
-        print("⚠️ 摘要为空，跳过压缩（保留原历史），避免静默丢关键信息。")
-        return messages
+        # ⚠️ 这条分支曾经是**静默失败**：只打一行 stderr，然后原样返回不压缩的历史。
+        # 2026-09-20 实测确认它被真实触发过——`max_tokens` 被推理 token 整段吃光，
+        # 摘要恒为空 → **压缩从未生效、历史无限膨胀**（正是五类生产坑里的「Token 爆炸」）。
+        # 根因（思考模式）已在 `_summarize` 修掉；但若 extra_body 这条管道哪天在服务端
+        # 不被支持，守卫会**再次静默触发**、直接回到原症状。所以这里降级到 `_trim_history`：
+        # 丢最早轮次会丢关键实体，但**有界**——「有损但有界」远好于「无损但永不生效」。
+        print("⚠️ 摘要为空，降级为「丢最早轮次」（有损但有界，避免历史无限膨胀）", file=sys.stderr)
+        return _trim_history(messages, max_tokens)
     if trace:
         pt = getattr(usage, "prompt_tokens", 0) if usage else 0
         ct = getattr(usage, "completion_tokens", 0) if usage else 0
-        trace.add_summary(elapsed, pt, ct)
+        # 摘要调用的推理 token 也要记：`reasoning_ratio` 的分母若只含主循环，
+        # **摘要这条推理黑洞（每次压缩 300 reasoning token）永远不会出现在那一列**。
+        trace.add_summary(elapsed, pt, ct, reasoning_tokens_of(usage) if usage else 0)
 
     summary_msg = {
         "role": "user",
@@ -159,7 +256,7 @@ async def _run_routed(messages: list, routed, trace: Trace = None) -> str:
     # 用受信任的 user 消息注入工具结果（和 _run_browse/_run_summarize 的 guide 同类），
     # 不伪造 assistant(tool_calls) 往返——不带 tools 的请求里 assistant 带 tool_calls 会被
     # DeepSeek 判 400 BadRequestError（引用不存在的工具调用）。坑：规则路由纯生成路径此前全挂。
-    messages.append({"role": "user", "content": f"【规则路由已执行工具 {tool_name}，结果如下，请据此回答用户：】\n{tool_result}"})
+    messages.append({"role": "user", "content": f"{ROUTED_TOOL_PREFIX} {tool_name}，结果如下，请据此回答用户：】\n{tool_result}"})
     t1 = time.perf_counter()
     try:
         resp, usage = await chat_with_usage(messages, max_tokens=MAX_OUTPUT_TOKENS)
@@ -174,10 +271,22 @@ async def _run_routed(messages: list, routed, trace: Trace = None) -> str:
     cache_hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
     cache_miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
     if trace:
-        trace.add_llm(1, elapsed2, tokens, prompt_tokens, cache_hit, cache_miss)
+        trace.add_llm(1, elapsed2, tokens, prompt_tokens, cache_hit, cache_miss,
+                      reasoning_tokens_of(usage))
         trace.end_reason = "正常"
+    content = resp.content or ""
+    if looks_like_tool_call_leak(content):
+        # 工具**已执行过** → 不重跑（重跑会重新决策，`transfer_to_human` 产出两个不同工单号）。
+        # ⚠️ 这里与流式版**刻意不对齐**：流式版走 `"regenerate"`（再发一次请求重生成话术），
+        # 而非流式版只按行剔除——因为本路径只服务 CLI / 单测 / 评测，为它多花一次 LLM 调用
+        # 不划算。已知代价：评测跑的是这条路径，**测不到 `"regenerate"` 那一层**。
+        content, _stripped = strip_tool_call_leak(content)
+        print("⚠️ 规则工具路径出现工具调用文本泄漏 → 已按行剔除（非流式路径不做重生成）",
+              file=sys.stderr)
+        if trace:
+            trace.end_reason = "泄漏"
     messages.append(resp.model_dump(exclude_none=True))
-    return resp.content or "（空回复）"
+    return content or "（空回复）"
 
 
 async def _pure_generate(messages: list, guide: str, trace: Trace = None) -> str:
@@ -202,10 +311,48 @@ async def _pure_generate(messages: list, guide: str, trace: Trace = None) -> str
     cache_miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
     if trace:
         trace.route_source = "规则"
-        trace.add_llm(1, elapsed, tokens, prompt_tokens, cache_hit, cache_miss)
+        trace.add_llm(1, elapsed, tokens, prompt_tokens, cache_hit, cache_miss,
+                      reasoning_tokens_of(usage))
         trace.end_reason = "正常"
+    content = resp.content or ""
+    if looks_like_tool_call_leak(content):
+        # 工具调用文本泄漏：模型想调工具，但这条路径刻意没带 tools（省一次决策调用）。
+        # 本路径**没有任何已执行的工具**，撤掉 guide 后降级重跑 ReAct 是安全的，
+        # 而且正是要的行为——模型想调工具就让它真调。
+        messages.pop()                          # 与本函数开头的 append(guide) 成对
+        if trace:
+            # 「规则降级」：本来靠规则路由省掉一次决策调用，泄漏后这个收益没成立，
+            # 标出来否则看板会把它算进「规则路由占比」。
+            trace.route_source = "规则降级"
+        print("⚠️ 规则路由纯生成出现工具调用文本泄漏 → 降级重跑 ReAct（带 tools）",
+              file=sys.stderr)
+        return await _react_loop(messages, trace)
     messages.append(resp.model_dump(exclude_none=True))
-    return resp.content or "（空回复）"
+    return content or "（空回复）"
+
+
+async def _run_menu_ask(messages: list, ask_text: str, trace: Trace = None):
+    """菜单缺参数的**固定反问**：零 LLM，直接产出（2026-09-20）。
+
+    为什么这里可以用模板而不违反「表达交模型」：菜单是**确定性入口**，缺参提示也是
+    确定性的。省下来的正好是实测那 6.5 秒里的大头（「查订单」2 次 LLM 往返、工具一次没调）。
+
+    ⚠️ **必须显式设 `route_source` / `end_reason`**：`Trace` 的默认值是 `"LLM"` / `"未知"`
+    （`observability.py`），不设的话这一轮会被算进「LLM 决策」**且被算成技术失败**，
+    把「规则路由占比」和「技术成功率」两个看板指标一起拉歪。
+    """
+    # ⚠️ 归因**必须写在第一个 yield 之前**：客户端断开时外层 `async for` 被 cancel，
+    # 生成器不会跑到后面的语句 → 该轮 `route_source` 保持默认 `"LLM"`，被计成「LLM 决策」。
+    # 归因与产出没有数据依赖，放最前没有代价。
+    if trace:
+        trace.route_source = "菜单"
+        trace.end_reason = "正常"
+    yield ("step", {"text": "确认所需信息"})
+    yield ("text", ask_text)
+    # 回填 assistant（等同流式版的手动重建）：不回填的话，下一轮用户补上订单号时
+    # 上下文是断的——而「反问补参能接住」正是会话层存在的意义。
+    # 这里 `content` 就是上面 yield 出去的那句，**不存在「用户所见 ≠ 存进去的」**问题。
+    messages.append({"role": "assistant", "content": ask_text})
 
 
 async def _run_browse(messages: list, trace: Trace = None) -> str:
@@ -216,7 +363,7 @@ async def _run_browse(messages: list, trace: Trace = None) -> str:
     categories = list(CATEGORY_KEYWORDS.keys())
     cat_str = "、".join(categories)
     guide = (
-        f"【路由引导：浏览】用户在逛、没有明确目标。请友好地介绍我们的商品分类（{cat_str}），"
+        f"{GUIDE_PREFIX}浏览】用户在逛、没有明确目标。请友好地介绍我们的商品分类（{cat_str}），"
         f"引导用户说出感兴趣的方向。不要直接推荐具体商品。"
     )
     return await _pure_generate(messages, guide, trace)
@@ -229,7 +376,7 @@ async def _run_summarize(messages: list, trace: Trace = None) -> str:
     改成反问用户想对比哪些商品，等明确后再查。
     """
     guide = (
-        "【路由引导：总结】用户想对比多款商品，但没说清具体对比哪几款。"
+        f"{GUIDE_PREFIX}总结】用户想对比多款商品，但没说清具体对比哪几款。"
         "请反问用户想对比哪些商品（或哪类商品），等用户明确后再检索对比。"
     )
     return await _pure_generate(messages, guide, trace)
@@ -239,7 +386,7 @@ async def _run_browse_stream(messages: list, trace: Trace = None):
     """`_run_browse` 的流式版（guide 文案与非流式版保持一致，改一处要改两处）"""
     categories = list(CATEGORY_KEYWORDS.keys())
     guide = (
-        f"【路由引导：浏览】用户在逛、没有明确目标。请友好地介绍我们的商品分类"
+        f"{GUIDE_PREFIX}浏览】用户在逛、没有明确目标。请友好地介绍我们的商品分类"
         f"（{'、'.join(categories)}），引导用户说出感兴趣的方向。不要直接推荐具体商品。"
     )
     yield ("step", {"text": "整理商品分类"})
@@ -250,7 +397,7 @@ async def _run_browse_stream(messages: list, trace: Trace = None):
 async def _run_summarize_stream(messages: list, trace: Trace = None):
     """`_run_summarize` 的流式版"""
     guide = (
-        "【路由引导：总结】用户想对比多款商品，但没说清具体对比哪几款。"
+        f"{GUIDE_PREFIX}总结】用户想对比多款商品，但没说清具体对比哪几款。"
         "请反问用户想对比哪些商品（或哪类商品），等用户明确后再检索对比。"
     )
     yield ("step", {"text": "准备商品对比"})
@@ -271,27 +418,85 @@ async def _run_summarize_stream(messages: list, trace: Trace = None):
 # ⚠️ 事件白名单**必须显式含 "usage"**：`stream_events` 现在每次都会产出 usage 事件，
 # 把它当「意外事件」告警的话，规则路由每一次请求都刷一条日志，告警很快没人看。
 
-async def _stream_generate(messages: list, trace: Trace = None):
+async def _stream_generate(messages: list, trace: Trace = None, guide: str = None,
+                           on_leak: str = None):
     """流式纯生成（不带 tools）—— `_pure_generate` 的流式版。
 
-    被 `_pure_generate_stream` 与 `_run_routed_stream` 共用：它们的差别只在
-    「往 messages 里追加什么引导消息」，生成部分完全一样。
-    不抽出来的话，token 统计 / 空回复兜底 / 历史回填这些收尾逻辑要写两遍，必然漂移。
+    被 `_pure_generate_stream` 与 `_run_routed_stream` 共用：它们的差别在「追加什么引导消息」
+    与「泄漏了怎么处置」。不抽出来的话 token 统计 / 空回复兜底 / 历史回填要写两遍，必然漂移。
+
+    `guide`：要追加的引导消息。**通过参数传，而不是让调用方自己 append**——降级重跑前必须把它
+    pop 掉（引导语是「请反问用户想对比哪些商品」这类，留着与降级目的正相反，还会污染 session
+    历史与摘要）。由本函数自己管才能保证 append/pop 成对。
+
+    `on_leak`：检测到**工具调用文本泄漏**时的处置。**调用方必须显式指定，不能靠猜**——
+    本函数被两条路径共用、签名相同，函数内部**无从区分自己跑在哪条路径**；靠 `messages[-1]`
+    的前缀（`【路由引导：` vs `【规则路由已执行工具`）去猜是隐式耦合，改一处文案就静默失效。
+      · `"react"`      —— 降级重跑 ReAct（带 tools）。**只用于没有已执行工具的路径**
+                          （browse / summarize）：模型想调工具，就让它真调。
+      · `"regenerate"` —— 附一条「不要输出工具调用语法」的要求，重生成一次话术。
+                          用于**工具已执行**的路径：重跑会重复决策，`transfer_to_human` 虽不落库
+                          （只生成 `TK{uuid}` 字符串 + 一次 GET /online），但会产出**两个不同
+                          工单号 + 自相矛盾的话术**，对用户可见，没必要赌。
+      · `"strip"`      —— 只剔除泄漏行，不再重试（`regenerate` 的第二层防线，防再次泄漏）。
+      · `None`         —— 不检测。
+
+    ⚠️ **扣留缓冲（不是按行缓冲）**：逐 token 直接转发的话，`search_products(` 会被拆成
+    多个 delta，等正则能匹配上时「search_products」这半截**已经发给用户了**。
+    所以只扣留**尾部那段「可能正在形成的标识符」**（`[A-Za-z0-9_]+$`）——
+    工具调用泄漏的形态是 `名字(`，在看到 `(` 之前无法排除它；而中文/标点/空白不可能
+    参与泄漏，立即发出。
+
+    为什么不用「按 `\n` 切行」：那会让**无换行的短答案**要等整段生成完才见第一个字，
+    首字延迟反而退化（与「规则路由流式化」的目的相反），实测短回答常见无换行。
     """
+    if guide:
+        messages.append({"role": "user", "content": guide})
+
     t0 = time.perf_counter()
-    text_parts = []
+    text_parts = []      # 已确认安全、已发给用户的文本
+    pending = ""         # 扣留缓冲：只留「尾部可能正在形成标识符」的那几个字符
+    recent = ""          # 泄漏检测窗口（跨多段 delta，JSON 形态的泄漏必须靠它）
     usage_obj = None
+    leaked = False
     try:
         async for ev in stream_events(messages, max_tokens=MAX_OUTPUT_TOKENS):
             if ev[0] == "text":
-                text_parts.append(ev[1])
-                yield ("text", ev[1])
+                if leaked:
+                    # 已判定泄漏：不再发给用户，但**继续消费到底**——usage 挂在最后一个 chunk 上
+                    # （llm.py 有记录），提前 return 会把它丢掉，该轮 token 记成 0，
+                    # 而 token 正是排查这类问题的主要抓手。
+                    continue
+                pending += ev[1]
+                # 泄漏检测窗口**含刚发出的一小段尾部**：JSON 形态（`{"name": "search_products"`）
+                # 的空格/引号/冒号不参与扣留、会被立即发出，只看 `pending` 就漏检了。
+                recent = (recent + ev[1])[-_LEAK_DETECT_WINDOW:]
+                if on_leak and looks_like_tool_call_leak(recent):
+                    leaked = True
+                    continue
+                # 只扣留**尾部那段「可能正在形成的标识符」**——工具调用泄漏的形态是 `名字(`，
+                # 没看到 `(` 之前无法排除它；中文/标点/空白不可能参与泄漏，立即发出。
+                # 这样「无换行的短答案」不会像按行缓冲那样要等整段生成完才见第一个字。
+                hold_at = len(pending)
+                m = re.search(r"[A-Za-z0-9_]+$", pending)
+                if m:
+                    hold_at = m.start()
+                safe, pending = pending[:hold_at], pending[hold_at:]
+                if safe:
+                    text_parts.append(safe)
+                    yield ("text", safe)
+                # 兜底：尾部真跟了一长串标识符字符（不可能是工具名）时别一直扣着
+                if len(pending) > LEAK_FLUSH_CHARS:
+                    text_parts.append(pending)
+                    yield ("text", pending)
+                    pending = ""
             elif ev[0] == "usage":
                 usage_obj = ev[1]
             elif ev[0] == "tool_calls":
-                # 纯生成不带 tools，理论上不该有 tool_calls。真出现要看得见——
-                # 静默忽略正是这类协议问题最难查的形态。
-                print(f"⚠️ 纯生成路径收到意外的 tool_calls（已忽略）：{ev[1]!r}", file=sys.stderr)
+                # 不传 tools 时理论上不该有 tool_calls；真出现说明协议漂移，要看得见。
+                # ⚠️ 但**别把它当泄漏信号**——泄漏是「写成了文本」，这里是模型真的产出了结构化调用，
+                # 两种情况的处置不同，混在一起会掩盖问题。
+                print(f"⚠️ 纯生成路径收到结构化的 tool_calls（已忽略）：{ev[1]!r}", file=sys.stderr)
             else:
                 print(f"⚠️ stream_events 未知事件类型 {ev[0]!r}（已忽略）", file=sys.stderr)
     except Exception as e:
@@ -303,18 +508,55 @@ async def _stream_generate(messages: list, trace: Trace = None):
         yield ("text", "抱歉，系统暂时无法处理，请稍后重试或转人工。")
         return
 
-    elapsed = time.perf_counter() - t0
+    # ⚠️ **流结束必须 flush 残留缓冲**——这条不能漏：回答多半**不以换行结尾**，
+    # 漏了它就会静默截掉最后一段（常常是整段答案的收尾），而且截尾后 content 不为空，
+    # 下面 `if not content` 的兜底也判不到 → 静默截尾、零告警。
+    if not leaked and pending:
+        if on_leak and looks_like_tool_call_leak(pending):
+            leaked = True
+        else:
+            text_parts.append(pending)
+            yield ("text", pending)
+            pending = ""
+
     content = "".join(text_parts)
+    elapsed = time.perf_counter() - t0
     if trace:
-        trace.route_source = "规则"
+        # 「规则降级」= 这条路径本来靠规则路由省掉一次决策调用，但因为泄漏又跑了一次 ReAct，
+        # 省调用这件事没成立。标出来，否则看板会把它算进「规则路由占比」。
+        trace.route_source = "规则降级" if (leaked and on_leak == "react") else "规则"
         trace.add_llm(
             1, elapsed,
             getattr(usage_obj, "total_tokens", 0) or 0,
             getattr(usage_obj, "prompt_tokens", 0) or 0,
             getattr(usage_obj, "prompt_cache_hit_tokens", 0) or 0,
             getattr(usage_obj, "prompt_cache_miss_tokens", 0) or 0,
+            reasoning_tokens_of(usage_obj),
         )
         trace.end_reason = "正常"
+
+    # ── 工具调用文本泄漏的分层处置 ──
+    if leaked and on_leak:
+        if guide:
+            messages.pop()          # 撤掉引导消息（与本函数开头的 append 成对）
+        if on_leak == "react":
+            print("⚠️ 规则路由纯生成出现工具调用文本泄漏 → 降级重跑 ReAct（带 tools）",
+                  file=sys.stderr)
+            # 刻意**不回填**泄漏那次的 assistant：它是有毒输出，进历史会污染后续轮次
+            async for ev in _react_loop_stream(messages, trace):
+                yield ev
+            return
+        if on_leak == "regenerate":
+            print("⚠️ 规则工具路径出现工具调用文本泄漏 → 重生成一次话术", file=sys.stderr)
+            messages.append({"role": "user", "content": NO_TOOL_SYNTAX_HINT})
+            async for ev in _stream_generate(messages, trace, on_leak="strip"):
+                yield ev
+            return
+        # "strip"：重生成后仍命中，只剔除不再重试。泄漏行已在上面被拦掉，
+        # 这里只需留痕（trace.end_reason），别让用户拿到半截工具调用。
+        print("⚠️ 工具调用文本泄漏（重生成后仍命中，已按行剔除）", file=sys.stderr)
+        if trace:
+            trace.end_reason = "泄漏"
 
     # ⚠️ 流式后没有 `resp` 对象了，这两件事必须手动重建（不可省略）：
     #   ① **空回复兜底要发给用户**：只写进 messages 的话用户看到空气泡，
@@ -329,9 +571,12 @@ async def _stream_generate(messages: list, trace: Trace = None):
 
 
 async def _pure_generate_stream(messages: list, guide: str, trace: Trace = None):
-    """`_pure_generate` 的流式版：注入引导消息 + 流式纯生成（浏览/总结共用）"""
-    messages.append({"role": "user", "content": guide})
-    async for ev in _stream_generate(messages, trace):
+    """`_pure_generate` 的流式版：注入引导消息 + 流式纯生成（浏览/总结共用）
+
+    泄漏处置用 `"react"`：这条路径**没有任何已执行的工具**，降级重跑 ReAct 安全，
+    而且正是我们要的——模型想调工具就让它真调（根因第 4 环就是「想调却没给 tools」）。
+    """
+    async for ev in _stream_generate(messages, trace, guide=guide, on_leak="react"):
         yield ev
 
 
@@ -370,9 +615,11 @@ async def _run_routed_stream(messages: list, routed, trace: Trace = None):
     # 会被 DeepSeek 判 400。
     messages.append({
         "role": "user",
-        "content": f"【规则路由已执行工具 {tool_name}，结果如下，请据此回答用户：】\n{tool_result}",
+        "content": f"{ROUTED_TOOL_PREFIX} {tool_name}，结果如下，请据此回答用户：】\n{tool_result}",
     })
-    async for ev in _stream_generate(messages, trace):
+    # 泄漏处置用 `"regenerate"`（**不能**用 "react"）：这条路径**工具已经执行过了**，
+    # 重跑 ReAct 会重新决策 → `transfer_to_human` 产出两个不同工单号、话术自相矛盾。
+    async for ev in _stream_generate(messages, trace, on_leak="regenerate"):
         yield ev
 
 
@@ -388,10 +635,13 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
     called_write = set()
 
     for step in range(MAX_STEPS):
+        # 模型分层：**决策轮固定走 deep 档**（理由与实测数据见 settings.MODEL_TIER_DECISION）。
+        # 刻意不在循环中间换档——实测「按步数闪切」步数反而更多（7 步 vs 4 步）。
         print(f"📍 [step {step+1}] LLM 决策中...")
         t0 = time.perf_counter()
         try:
-            resp, usage = await chat_with_usage(messages, tools=TOOL_SCHEMAS, max_tokens=MAX_OUTPUT_TOKENS)
+            resp, usage = await chat_with_usage(messages, tools=TOOL_SCHEMAS,
+                                                max_tokens=MAX_OUTPUT_TOKENS, model=get_model(MODEL_TIER_DECISION))
         except Exception as e:
             # API 超时/网络错误：标记异常结束，返回友好错误，不让异常穿透（trace 才有机会 summary）
             if trace:
@@ -404,7 +654,8 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
         cache_hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
         cache_miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
         if trace:
-            trace.add_llm(step + 1, elapsed, tokens, prompt_tokens, cache_hit, cache_miss)
+            trace.add_llm(step + 1, elapsed, tokens, prompt_tokens, cache_hit, cache_miss,
+                          reasoning_tokens_of(usage))
         # 显式回填最小字段，避免多余字段引发 DeepSeek 兼容层 400
         messages.append(resp.model_dump(exclude_none=True))
 
@@ -458,6 +709,8 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
         async def _exec(item):
             tc, args, blocked = item
             name = tc.function.name
+            # 类别下沉：本句没写类别时从会话上下文补（跨轮补参）
+            args = _with_context_category(name, args, messages)
             t0 = time.perf_counter()
             if args is None:
                 result = f"错误：参数不是合法 JSON：{tc.function.arguments}"
@@ -487,7 +740,10 @@ async def _react_loop(messages: list, trace: Trace = None) -> str:
             elapsed = time.perf_counter() - t0
             is_empty = any(sig in result for sig in _EMPTY_SIGNALS)
             if trace:
-                trace.add_tool(name, elapsed, step + 1, is_empty)
+                # 带上该次检索锁的类别（含「类别下沉」注入的）：跨轮混类排障时，
+                # 必须能看到当时**锁了什么**，而不只是「检索错了」
+                trace.add_tool(name, elapsed, step + 1, is_empty,
+                               args.get("category") if isinstance(args, dict) else None)
             return result
 
         results = await asyncio.gather(*[_exec(item) for item in parsed])
@@ -522,6 +778,7 @@ async def _react_loop_stream(messages: list, trace: Trace = None):
     called_write = set()
 
     for step in range(MAX_STEPS):
+        # 模型分层：与 `_react_loop` 逐项对齐（决策轮固定 deep，循环内不换档）
         print(f"📍 [step {step+1}] LLM 决策中（流式）...")
         # 步骤事件：**统一叫「思考中」、不区分决策轮/答案轮** —— 流式下只有收到第一个
         # delta 才知道这一轮是哪种，循环顶部无法预知（想区分就得等文本已经开始流了才发，
@@ -540,7 +797,8 @@ async def _react_loop_stream(messages: list, trace: Trace = None):
             #   · 答案轮（主路）：唯一的非 text 事件就是 usage → `if not tool_calls_list`
             #     对 pydantic 对象**判为假** → 走错分支 → 同样崩
             # 也就是「一开 include_usage，所有流式回答都炸」。这不是理论风险。
-            async for ev in stream_events(messages, tools=TOOL_SCHEMAS, max_tokens=MAX_OUTPUT_TOKENS):
+            async for ev in stream_events(messages, tools=TOOL_SCHEMAS,
+                                          max_tokens=MAX_OUTPUT_TOKENS, model=get_model(MODEL_TIER_DECISION)):
                 if ev[0] == "text":
                     text_parts.append(ev[1])
                     yield ("text", ev[1])  # 逐 token 流式输出
@@ -568,6 +826,7 @@ async def _react_loop_stream(messages: list, trace: Trace = None):
                 getattr(usage_obj, "prompt_tokens", 0) or 0,
                 getattr(usage_obj, "prompt_cache_hit_tokens", 0) or 0,
                 getattr(usage_obj, "prompt_cache_miss_tokens", 0) or 0,
+                reasoning_tokens_of(usage_obj),
             )
 
         content_text = "".join(text_parts)
@@ -625,6 +884,8 @@ async def _react_loop_stream(messages: list, trace: Trace = None):
         async def _exec(item):
             tc, args, blocked = item
             name = tc["name"]
+            # 类别下沉：与 `_react_loop` 逐项对齐（同一套补参逻辑，两条路径不能各调各的）
+            args = _with_context_category(name, args, messages)
             t0 = time.perf_counter()
             if args is None:
                 result = f"错误：参数不是合法 JSON：{tc['arguments']}"
@@ -646,7 +907,10 @@ async def _react_loop_stream(messages: list, trace: Trace = None):
             elapsed = time.perf_counter() - t0
             is_empty = any(sig in result for sig in _EMPTY_SIGNALS)
             if trace:
-                trace.add_tool(name, elapsed, step + 1, is_empty)
+                # 带上该次检索锁的类别（含「类别下沉」注入的）：跨轮混类排障时，
+                # 必须能看到当时**锁了什么**，而不只是「检索错了」
+                trace.add_tool(name, elapsed, step + 1, is_empty,
+                               args.get("category") if isinstance(args, dict) else None)
             return result
 
         # 步骤事件：**必须在 gather 之前、按 parsed 顺序逐条发**。两个都不能改：
@@ -751,8 +1015,13 @@ class AgentSession:
         # 若让 Trace 自己生成，调用方就得等请求结束才能拿到，首帧发不出去。
         self._trace_id = trace_id or None
         self._last_trace = None
+        # 本轮**用户实际看到的** answer（由调用方经 `record_turn` 登记）。
+        # 为什么不直接信 `self.messages` 里那条 assistant：**用户看到的 ≠ append 的**——
+        # `_stream_generate` 异常路径直接 return（不 append）、空回复兜底 append 的是
+        # 「（空回复）」占位。所以最后要用它覆盖一次（见 `session_history`）。
+        self._last_answer = ""
 
-    async def chat(self, user_msg: str) -> str:
+    async def chat(self, user_msg: str, menu_intent: str = None) -> str:
         """一轮对话：追加用户消息，先建 trace，再超预算压缩（摘要成本进 trace），最后跑 ReAct
 
         画像注入的三步顺序（清旧 → 压缩 → 注入新）**不可调换**，理由见 _inject_memory 的注释。
@@ -763,18 +1032,35 @@ class AgentSession:
         _strip_memory_injection(self.messages)  # 先清上一轮注入（防累积 + 防被当成真实用户轮次）
         await _compress_history(self.messages, MAX_HISTORY_TOKENS, trace)
         await _inject_memory(self.messages, self._user_id, user_msg)  # 压缩之后再注入
-        # 意图路由：规则命中（工具/浏览/总结）走对应处理；未命中走 ReAct（LLM 决策兜底）
-        routed = route_by_rule(user_msg)
-        if routed:
-            kind = routed[0]
-            if kind == "tool":
-                result = await _run_routed(self.messages, (routed[1], routed[2]), trace)
-            elif kind == "browse":
-                result = await _run_browse(self.messages, trace)
-            else:  # summarize
-                result = await _run_summarize(self.messages, trace)
+        # 菜单路径优先且早退（与 `stream_chat` 逐项对齐，理由见那边的注释）
+        menu_routed = route_by_menu(menu_intent, user_msg, self.messages) if menu_intent else None
+        if menu_routed and menu_routed[0] == "ask":
+            # 缺参固定反问（零 LLM）——与 `_run_menu_ask` 行为必须一致
+            result = menu_routed[2]
+            if trace:
+                trace.route_source = "菜单"
+                trace.end_reason = "正常"
+            self.messages.append({"role": "assistant", "content": result})
+        elif menu_routed and menu_routed[0] == "tool":
+            result = await _run_routed(self.messages, (menu_routed[1], menu_routed[2]), trace)
+            if trace:
+                trace.route_source = "菜单"   # 与流式版对齐（`_run_routed` 内部标的是 "规则"）
         else:
-            result = await _react_loop(self.messages, trace)
+            # 意图路由：规则命中（工具/浏览/总结）走对应处理；未命中走 ReAct（LLM 决策兜底）
+            routed = route_by_rule(user_msg)
+            if routed:
+                kind = routed[0]
+                if kind == "tool":
+                    result = await _run_routed(self.messages, (routed[1], routed[2]), trace)
+                elif kind == "browse":
+                    result = await _run_browse(self.messages, trace)
+                else:  # summarize
+                    result = await _run_summarize(self.messages, trace)
+            else:
+                result = await _react_loop(self.messages, trace)
+        # 登记本轮（`session_history()` 的语义已是「必须有登记才有内容」，非流式入口
+        # 不登记的话，将来任何复用它导出历史的路径都会**导出空历史并覆盖 Redis**）
+        self.record_turn(user_msg, result)
         METRICS.record(trace)
         print(trace)  # 每次对话打印 trace 摘要（可观测）
         # 画像抽取（后台，不阻塞返回）。Web 链路走 stream_chat，其抽取钩子在 main.py 的
@@ -783,7 +1069,54 @@ class AgentSession:
         spawn_extract(self._user_id, user_msg, result)
         return result
 
-    async def stream_chat(self, user_msg: str):
+    def record_turn(self, user_msg: str, answer: str) -> None:
+        """登记本轮**用户实际看到的** answer，供 `session_history()` 出口时覆盖用。
+
+        **必须由调用方用「SSE 聚合出来的 answer」回传**，不能从 `self.messages` 里取——
+        两者不总是相等（异常路径不 append、空回复兜底 append 的是「（空回复）」占位）。
+        """
+        self._last_answer = answer or ""
+
+    def session_history(self) -> list[dict]:
+        """导出可持久化的**干净历史** = 「压缩后的对话视图」+ 本轮权威 answer。
+
+        ⚠️ **基准必须是 `self.messages`，不能另维护一份轮次列表。**
+        压缩（`_compress_history`）改的正是 `self.messages`——它把被压的旧轮次**替换**成摘要。
+        另维护一份列表会让「摘要」和「它替换掉的原始轮次」**同时被持久化**，压缩等于白做
+        （实测：8 轮后历史 17 条，摘要和全部原文都在，token 一点没降）。
+
+        内部注入（画像 / 路由引导 / 格式要求 / 工具回填）按 `INTERNAL_MSG_PREFIXES`
+        **登记表**排除——并配一条源码静态断言（`tests/test_menu_and_session.py`）扫
+        `agent.py` 里的注入点，新增注入不登记会被测试拦下。
+
+        最后用 `record_turn` 登记的 answer **覆盖当前轮**：那才是用户实际看到的文本
+        （`self.messages` 里可能是「（空回复）」占位，异常路径甚至没有）。
+        """
+        out = []
+        for m in self.messages:
+            if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+                continue
+            if m.get("tool_calls"):
+                continue                      # ReAct 中间态：跨轮无价值
+            s = str(m.get("content") or "")
+            if not s:
+                continue
+            if s.startswith(SUMMARY_PREFIX):
+                out.append({"role": "user", "content": s})
+                continue
+            if any(s.startswith(p) for p in INTERNAL_MSG_PREFIXES):
+                continue                      # 内部注入：跨轮保存 = 自己给自己注入
+            out.append({"role": m["role"], "content": s})
+
+        if self._last_answer:
+            last_user = max((i for i, m in enumerate(out) if m["role"] == "user"), default=-1)
+            if last_user >= 0 and last_user + 1 < len(out) and out[last_user + 1]["role"] == "assistant":
+                out[last_user + 1] = {"role": "assistant", "content": self._last_answer}
+            elif last_user >= 0:
+                out.append({"role": "assistant", "content": self._last_answer})
+        return out
+
+    async def stream_chat(self, user_msg: str, menu_intent: str = None):
         """流式一轮对话。**产出二元组 `(kind, payload)`**，kind ∈ {"text", "step"}。
 
           - `("text", str)`  逐 token 的答案文本
@@ -803,6 +1136,31 @@ class AgentSession:
         _strip_memory_injection(self.messages)
         await _compress_history(self.messages, MAX_HISTORY_TOKENS, trace)
         await _inject_memory(self.messages, self._user_id, user_msg)
+        # 菜单路径**优先且早退**：它是确定性入口，命中就不再走 route_by_rule。
+        # 两者都判同一句话会冲突——菜单说「转人工」、规则层按否定词说「不转」时，
+        # 服务端没有权威裁定（这是审核查出的 B4）。
+        menu_routed = route_by_menu(menu_intent, user_msg, self.messages) if menu_intent else None
+        if menu_routed and menu_routed[0] == "ask":
+            async for ev in _run_menu_ask(self.messages, menu_routed[2], trace):
+                yield ev
+            METRICS.record(trace)
+            print(trace)
+            return
+        if menu_routed and menu_routed[0] == "tool":
+            # **复用规则路由的工具执行路径**，不另起生成器——否则会静默丢掉整套泄漏分层
+            # 防御（`on_leak` 的 regenerate/strip）、truncate、空返回埋点、step 事件与归因。
+            async for ev in _run_routed_stream(self.messages, (menu_routed[1], menu_routed[2]), trace):
+                yield ev
+            # 覆写归因：`_run_routed_stream` 内部会标 "规则"，那一轮在手打规则路由里
+            # 不可区分。而「用户点了菜单」正是本批要度量的对象（两者都计入规则路由占比）。
+            if trace:
+                trace.route_source = "菜单"
+            METRICS.record(trace)
+            print(trace)
+            return
+        # menu_routed 为 None：要么没传菜单、要么 id 不在白名单、要么被否定守卫拦下
+        # → 一律落回规则层（不报错、不降级成默认意图）。
+
         routed = route_by_rule(user_msg)
         if routed:
             kind = routed[0]

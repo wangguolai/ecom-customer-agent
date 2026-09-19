@@ -103,8 +103,12 @@ def _init_db():
 
         # trace 落盘表：同样 IF NOT EXISTS、**不参与 DROP 重建**——它是运行时累积的排障数据，
         # 丢了就再也复现不了当时发生了什么（而这张表存在的唯一意义就是复现）。
-        from src.backend.trace_store import CREATE_SQL as TRACES_DDL
+        from src.backend.trace_store import CREATE_SQL as TRACES_DDL, ensure_columns as _ensure_trace_cols
         cur.execute(TRACES_DDL)
+        # 增量列迁移：`CREATE TABLE IF NOT EXISTS` 对已存在的表什么都不做，老库不会自己长出新列。
+        # 必须在 CREATE 之后（表不存在时 ALTER 会失败），且**不吞异常**——迁移失败要让启动中止，
+        # 否则 trace_store.save() 会因 Unknown column 整条失败并静默吞掉，此后每条 trace 悄悄丢失。
+        _ensure_trace_cols(conn)
 
         # 反馈评分表：同上。评分是**用户手动产生的数据**，丢了没有任何地方能重建。
         from src.backend.feedback_store import CREATE_SQL as FEEDBACK_DDL
@@ -463,6 +467,13 @@ async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_
     user_msg = payload.get("message")
     if not isinstance(user_msg, str) or not user_msg.strip():
         raise HTTPException(status_code=400, detail="缺少 message")
+    # 菜单意图：**客户端可控的不可信输入**，与 message / session_id 同级。
+    # 这里只做类型校验 + 边界清洗，**白名单判定交给 `route_by_menu`**——
+    # 在这里再抄一份白名单就是两个真源，加菜单时必漏一处。
+    # 走 `_clean_field` 而不是裸 `.strip()`：与其它外部输入同一规范（孤立代理等非法码点
+    # 在这里降级掉）。白名单查找本身就不会让非白名单值passthrough，
+    # 但「边界上先清洗」是项目的统一纪律，不因为「反正查不到」就省掉。
+    menu_intent = _clean_field(payload.get("menu_intent"), 32) or None
     # 边界清洗：孤立代理等非法码点在流式链路（LLM/SSE）里一样会炸，进系统第一件事先降级
     user_msg = user_msg.encode("utf-8", "replace").decode("utf-8")
 
@@ -518,7 +529,7 @@ async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_
             # ⚠️ **必须显式列举，不能用 `else` 兜**：`stream_events` 内部还有
             # ("tool_calls",…) / ("usage",…) 两种事件，一旦漏穿透到这里，
             # `else` 会把它们当步骤事件下发给前端（内容是工具调用参数 JSON）。
-            async for kind, payload in session.stream_chat(user_msg):
+            async for kind, payload in session.stream_chat(user_msg, menu_intent):
                 if kind == "text":
                     answer += payload  # 累积完整答案供会话层落历史（SSE 拿不到最终文本）
                     yield f"data: {json.dumps({'delta': payload}, ensure_ascii=False)}\n\n"
@@ -570,8 +581,13 @@ async def chat_stream(request: Request, payload: dict, _: None = Depends(_limit_
                 print(f"⚠️ trace 落盘调用异常（不影响对话）：{type(e).__name__}: {e}",
                       file=sys.stderr)
 
+            # 登记本轮问答 → 由 `session_history()` 导出干净历史落库。
+            # **必须用这里聚合出来的 answer**（用户实际看到的文本），不能从 `session.messages` 取：
+            # 异常路径不 append、空回复兜底 append 的是「（空回复）」占位，两者会对不上。
+            # ⚠️ 顺序不能反：先登记（可能 no-op）再 save。
+            session.record_turn(user_msg, answer)
             # 落历史：answer 为空（断开/异常）时 save 内部直接返回，不把半截回复写进上下文
-            session_store.save(session_id, history, user_msg, answer)
+            session_store.save(session_id, session.session_history(), answer)
             # 画像抽取（后台任务，不阻塞返回）。
             # **为什么放 finally 而不是流式循环末尾**：
             #   ① answer 的聚合发生在本函数（循环里 answer += delta），stream_chat 内部拿不到完整文本；
@@ -1227,7 +1243,7 @@ def admin_feedback_detail(
 
         cur.execute(
             "SELECT trace_id, session_id, user_id, query, answer, route_source, end_reason, "
-            "       total_sec, total_tokens, cache_hit, cache_miss, llm_steps, "
+            "       total_sec, total_tokens, cache_hit, cache_miss, reasoning_tokens, llm_steps, "
             "       tool_calls, retrieved_ids, prompt_version, kb_version, created_at "
             "FROM traces WHERE trace_id=%s",
             (trace_id,),
@@ -1240,10 +1256,13 @@ def admin_feedback_detail(
                 "query": t[3], "answer": t[4],
                 "route_source": t[5], "end_reason": t[6],
                 "total_sec": t[7], "total_tokens": t[8],
-                "cache_hit": t[9], "cache_miss": t[10], "llm_steps": t[11],
-                "tool_calls": _maybe_json_list(t[12]),
-                "retrieved_ids": _maybe_json_list(t[13]),
-                "prompt_version": t[14], "kb_version": t[15], "created_at": t[16],
+                "cache_hit": t[9], "cache_miss": t[10],
+                # 推理 token（思考模式思维链，含摘要调用）。看板靠它解释「这轮为什么慢」
+                "reasoning_tokens": t[11],
+                "llm_steps": t[12],
+                "tool_calls": _maybe_json_list(t[13]),
+                "retrieved_ids": _maybe_json_list(t[14]),
+                "prompt_version": t[15], "kb_version": t[16], "created_at": t[17],
             }
     finally:
         close_conn(conn)

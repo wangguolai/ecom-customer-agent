@@ -57,14 +57,39 @@ def load(session_id: str | None) -> list[dict]:
     return out[-MAX_TURNS * 2:]
 
 
-def save(session_id: str | None, history: list[dict], user_msg: str, answer: str) -> None:
-    """把本轮问答追加到历史并写回。Redis 挂 → cache 层内部兜底（打日志不抛）。"""
+def _cap(history: list[dict]) -> list[dict]:
+    """按条数上限裁剪，但**摘要消息必须留下**。
+
+    ⚠️ 为什么不能直接写 `history[-N:]`：摘要是 role=user 且位于最前，`[-N:]` 会让它
+    **先于真实轮次被裁掉**；而 `_compress_history` 有「≤2 个真实 user 轮就不压」的早退
+    （`agent.py`），摘要丢了就**再也回不来**——静默的上下文丢失，且不打任何警告。
+    这条在压缩结果落盘之前无所谓（丢了下一轮重算），落盘之后就是不可逆的。
+    """
+    limit = MAX_TURNS * 2
+    if len(history) <= limit:
+        return history
+    from src.config.prompts import SUMMARY_PREFIX
+
+    head = history[:1] if str(history[0].get("content", "")).startswith(SUMMARY_PREFIX) else []
+    return head + history[-(limit - len(head)):]
+
+
+def save(session_id: str | None, history: list[dict], answer: str) -> None:
+    """把**已经组装好的干净历史**写回。Redis 挂 → cache 层内部兜底（打日志不抛）。
+
+    ⚠️ **契约变更（2026-09-20）**：调用方现在传 `AgentSession.session_history()`
+    ——「摘要消息 + 已登记的轮次」，**已包含本轮问答**；不再是「原始 history 再拼本轮」。
+
+    为什么必须变：旧写法存的是**请求开始时读到的原始 history**，而压缩只发生在
+    `AgentSession.messages` 这个内存副本里 → 压缩结果每轮被丢弃 → 历史单调增长
+    （2,4,6…20 条），一旦超过 `MAX_HISTORY_TOKENS` 就**每轮重新压一遍**。
+    实测代价：20 条 / 2772 token，每一轮多付一次 LLM 往返（摘要的钱花两遍、收益一遍没拿）。
+
+    `answer` 只用于**「空回复不落」的守卫**（异常/中断时不把半截回复写进上下文），
+    不再参与内容组装。
+    """
     if not session_id or not answer:
-        return  # 没 id 就是无状态模式；空 answer（异常/中断）不落，免得把半截回复写进上下文
+        return  # 没 id 就是无状态模式
     from src.backend import cache
 
-    new = history + [
-        {"role": "user", "content": user_msg},
-        {"role": "assistant", "content": answer},
-    ]
-    cache.set_json(_key(session_id), new[-MAX_TURNS * 2:], SESSION_TTL)
+    cache.set_json(_key(session_id), _cap(history), SESSION_TTL)

@@ -92,6 +92,15 @@ export interface TraceDetail {
   total_tokens: number | null
   cache_hit: number | null
   cache_miss: number | null
+  /**
+   * 思考模式的推理 token（思维链），**含摘要调用**。
+   *
+   * ⚠️ 它是 `total_tokens` 的**子集**，不是额外开销——但它是解释「这轮为什么慢」的关键：
+   * `deepseek-v4-pro` 会把大部分输出预算花在用户看不见的推理上（实测一次 `completion=1929`
+   * 里 `reasoning=1908`，占 99%）。只看 `total_tokens` 永远解释不了「20 秒只出两行字」。
+   * 旧数据（该列迁移前落盘的）为 null。
+   */
+  reasoning_tokens: number | null
   llm_steps: number | null
   /** ⚠️ 被截断时是**字符串**（截断后的 JSON 不是合法 JSON），见后端 _maybe_json_list */
   tool_calls: unknown[] | string

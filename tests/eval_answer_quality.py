@@ -13,6 +13,8 @@
   python tests/eval_answer_quality.py              # 跑 baseline，落盘 eval_results/answer_quality_baseline.json
   python tests/eval_answer_quality.py --out after  # 改造后跑，落盘 ..._after.json
   python tests/eval_answer_quality.py --diff       # 对比 baseline vs after 的逐 case 差异
+  python tests/eval_answer_quality.py --effort low --out low   # 推理强度 A/B（思考模式）
+  python tests/eval_answer_quality.py --effort none --out high # none = 不传参 = 服务端默认(high)
 
 指标：
   准确率（accuracy）    —— 回答正确回应问题的 case 比例
@@ -161,9 +163,23 @@ async def run_eval(out_suffix: str = "baseline", only_names=None, runs: int = 3)
     relevant_sum = sum(c["relevant"] for c in cases)
     parse_fail_count = sum(c["parse_fail"] for c in cases)
 
+    # A/B 要比较的量必须在 summary 里，不能只躺在逐 case 的 trace 里（否则每次对比都要手算）。
+    # ⚠️ 这里没有「首 token 延迟」——评测走的是非流式 `chat()`，测不到 TTFT。
+    # 首 token 的实测数据来自离线探针（见 docs/routing-leak-fix-plan.md §1 的实测表）。
+    from src.config import settings as _S
+    _avg_sec = round(sum(c["trace"].get("总耗时(秒)", 0) for c in cases) / total, 3) if total else 0
+    _sum_tok = sum(c["trace"].get("总 token 消耗", 0) for c in cases)
+    _sum_reason = sum(c["trace"].get("推理 token", 0) for c in cases)
+
     summary = {
         "total": total, "skipped": len(skipped), "parse_fail": parse_fail_count,
         "runs": runs,
+        # 实际生效的推理强度：**写进产物本身**，不靠文件名承载口径
+        # （`--out low` 只是命名约定，被人改名/漏传就失真）。
+        "reasoning_effort": _S.REASONING_EFFORT,
+        "avg_total_sec": _avg_sec,
+        "total_tokens": _sum_tok,
+        "reasoning_tokens": _sum_reason,
         "accuracy": round(acc_sum / total, 4) if total else 0,
         "faithfulness": round(faith_sum / total, 4) if total else 0,
         "relevance": round(rel_sum / total, 2) if total else 0,  # 平均相关性（0-5）
@@ -255,6 +271,37 @@ if __name__ == "__main__":
             idx = sys.argv.index("--runs")
             if idx + 1 < len(sys.argv):
                 runs = int(sys.argv[idx + 1])
+        # --effort none|low|high|max —— A/B 对比推理强度（思考模式）用。
+        # 运行时覆盖 settings.REASONING_EFFORT：`llm._resolve_effort()` 是**函数内 import**，
+        # 所以这里赋值后下一次 LLM 调用立即生效（顶层 import 会把值冻在 import 那一刻）。
+        #
+        # ⚠️ 下面这段的校验**不能省**——早先版本没有它，有三个静默失效：
+        #   · `--effort` 放最后 → 整段被跳过，**既不覆盖也不报错**，评测照样跑完并落盘，
+        #     数据被标成 low、实际是 high（污染的是"用来定结论的评测产物"）；
+        #   · `--effort --out low` → 把 `--out` 当强度发给服务端（`--out` 分支有
+        #     `startswith("--")` 守卫，这里口径必须一致）；
+        #   · 不校验取值域 → `--effort medium` 被服务端映射成 high，**两臂同参**，
+        #     A/B 会得出「推理强度无影响」的假结论。
+        # 取值域不含 `off`：全局关思考会让主循环也失去推理（实测长句答案 358→62 字符），
+        # 与 settings 的取值域保持一致，避免两处宣示两套规则。
+        if "--effort" in sys.argv:
+            idx = sys.argv.index("--effort")
+            val = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else None
+            allowed = {"none", "low", "high", "max"}
+            if val is None or val.startswith("--") or val.lower() not in allowed:
+                print(f"❌ 用法：--effort {'|'.join(sorted(allowed))}（当前值：{val!r}）",
+                      file=sys.stderr)
+                print("   取值域刻意与 settings.REASONING_EFFORT 一致，不含 'off'"
+                      "（全局关思考会打崩主循环答案质量）。", file=sys.stderr)
+                sys.exit(1)
+            from src.config import settings as _S
+            _S.REASONING_EFFORT = None if val.lower() == "none" else val.lower()
+            print(f"🔧 推理强度覆盖：REASONING_EFFORT = {_S.REASONING_EFFORT!r}"
+                  f"（None = 不传参数，用服务端默认 = 思考开启）")
+        else:
+            from src.config import settings as _S
+            print(f"🔧 推理强度：用 settings 默认 {_S.REASONING_EFFORT!r}"
+                  f"（None = 不传参数，用服务端默认 = 思考开启）")
         from src.infra.warmup import warmup_models
         warmup_models()  # 主线程预热 embedding + rerank，避免 to_thread 里首次加载 CUDA 死锁
         asyncio.run(run_eval(out_suffix, only_names, runs))

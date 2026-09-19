@@ -144,6 +144,11 @@ function TraceBlock({ trace }: { trace: TraceDetail }) {
         <dd>
           {trace.total_sec ?? '—'} 秒 · {trace.total_tokens ?? 0} token
           （缓存命中 {trace.cache_hit ?? 0} / 未命中 {trace.cache_miss ?? 0}）
+          {/* 推理 token 是「这轮为什么慢」的直接答案：它是 total_tokens 的子集，
+              但模型把它花在了用户看不见的思维链上。迁移前的旧数据为 null，显示「—」。 */}
+          {trace.reasoning_tokens != null && (
+            <span className="admin-muted"> · 其中推理 {trace.reasoning_tokens}</span>
+          )}
         </dd>
         <dt>LLM 步数</dt><dd>{trace.llm_steps ?? '—'}</dd>
         <dt>工具调用</dt><dd><JsonList value={trace.tool_calls} empty="未调用工具" /></dd>

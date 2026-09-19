@@ -65,7 +65,7 @@ export function useChatStream() {
     }))
   }, [stepTexts, generating, streaming])
 
-  const send = useCallback(async (raw: string) => {
+  const send = useCallback(async (raw: string, menuIntent?: string) => {
     const text = raw.trim()
     if (!text || inFlight.current) return
     inFlight.current = true
@@ -95,7 +95,14 @@ export function useChatStream() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         // session_id 让后端把本轮接进该会话的上下文（Redis 存历史，30 分钟滑动过期）
-        body: JSON.stringify({ message: text, session_id: sidRef.current }),
+        // menu_intent：**只在点了菜单时带**。手打的同名字符串不该享受「确定性入口」待遇——
+        // 后端会用白名单校验它，命中则走规则路由（缺参固定反问、有参直通工具），不再让
+        // 一次 LLM 决策去猜「用户是不是想查订单」。
+        body: JSON.stringify({
+          message: text,
+          session_id: sidRef.current,
+          ...(menuIntent ? { menu_intent: menuIntent } : {}),
+        }),
         signal: ctrl.signal,
       })
       if (!resp.ok) {

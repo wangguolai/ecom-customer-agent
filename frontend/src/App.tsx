@@ -72,16 +72,23 @@ export default function App() {
   }, [])
 
   const submit = useCallback(
-    (text: string) => {
+    (text: string, menuIntent?: string) => {
       setDraft('')
-      void send(text)
+      void send(text, menuIntent)
     },
     [send],
   )
 
-  // 菜单点击 = 直接发意图句。会话层落地后「缺参数」不再是问题——
-  // agent 反问、用户在下一轮补上，上下文接得住，所以不用再让用户多点一次发送。
-  const pickMenu = useCallback((item: MenuItem) => submit(item.text), [submit])
+  // 菜单点击 = 直接发意图句，**并带上菜单 id**。
+  //
+  // 带 id 的原因（2026-09-20 实测）：不带的话服务端只能把「查订单」当普通消息，
+  // 规则层要求「订单号 + 关键词」双命中，裸意图词拦不住 → 掉 LLM 决策，
+  // 实测一次 6.5 秒、工具一次没调（就为了反问一句「你要查哪个订单」）。
+  // 带上 id 后服务端走确定性路由：有参数直通工具 / 没参数**固定反问（零 LLM）**。
+  //
+  // ⚠️ 只传**菜单 id**，不传工具名——`menu_intent` 是客户端可控输入，
+  // 传工具名等于给任意工具调用开入口。白名单在 `src/config/rules.py`。
+  const pickMenu = useCallback((item: MenuItem) => submit(item.text, item.intent), [submit])
 
   // 侧栏点订单号 = **只填入输入框，不发送**。
   // 与伪菜单刻意不同：伪菜单给的是完整意图（「查订单」），用户不需要改；

@@ -46,6 +46,7 @@ CREATE_SQL = (
     "total_tokens INT,"
     "cache_hit INT,"
     "cache_miss INT,"
+    "reasoning_tokens INT,"
     "llm_steps INT,"
     "tool_calls VARCHAR(512),"
     "retrieved_ids VARCHAR(512),"
@@ -56,6 +57,37 @@ CREATE_SQL = (
     "KEY idx_session (session_id)"
     ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 )
+
+
+# 增量列（只增不改；历史行留 NULL）。加列时必须同时改 `CREATE_SQL` 和 `save()` 的列清单，
+# 三者是同一份 schema 的三个副本，漏一个就会「新库能跑、老库炸」。
+_ENSURE_COLUMNS = (
+    ("reasoning_tokens", "INT"),
+)
+
+
+def ensure_columns(conn) -> None:
+    """幂等迁移：给**已存在**的 traces 表补新列。
+
+    **为什么必需**：`CREATE TABLE IF NOT EXISTS` 对已存在的表**什么都不做**——DDL 里加了列，
+    老库不会自己长出来。而 `save()` 的 INSERT 会因 `Unknown column` 整条失败，且 `save()`
+    吞掉所有异常只打一行 stderr → **此后每条 trace 静默丢失**，而后台照常显示旧数据，
+    看板看不出任何异常。这正是「静默降级比崩溃更难查」的形态。
+
+    ⚠️ 用 `SHOW COLUMNS ... LIKE`（作用域是连接的默认库，天然不跨库误命中），
+      不用 `information_schema` + `TABLE_SCHEMA=DATABASE()`——多一层拼接就多一个写错的机会。
+    ⚠️ 迁移后**必须回读校验**：把校验失败留给 `save()` 去吞 = 白做。
+    ⚠️ 调用点必须在 `_init_db` 里 `CREATE TABLE IF NOT EXISTS` **之后**（表不存在时
+      SHOW COLUMNS 查不到、ALTER 会失败）。
+    """
+    cur = conn.cursor()
+    for col, col_ddl in _ENSURE_COLUMNS:
+        cur.execute(f"SHOW COLUMNS FROM traces LIKE '{col}'")
+        if cur.fetchone() is None:
+            cur.execute(f"ALTER TABLE traces ADD COLUMN {col} {col_ddl}")
+    # 回读校验：迁移没生效就让调用方（启动流程）炸掉，别等到落盘时静默丢数据
+    cols = ", ".join(c for c, _ in _ENSURE_COLUMNS)
+    cur.execute(f"SELECT {cols} FROM traces LIMIT 0")
 
 
 def _kb_version() -> str:
@@ -115,8 +147,11 @@ def save(trace, session_id: str, user_id: str, query: str, answer: str) -> bool:
 
         s = trace.summary()
         tool_calls_json, tc_truncated = _truncate_json(
-            [{"name": n, "elapsed": round(e, 3), "empty": bool(emp)}
-             for n, e, _step, emp in trace.tool_calls]
+            # category = 该次检索锁的类别（含「类别下沉」注入的）。None=没锁。
+            # 排障要点：跨轮混类时，必须能看到当时**锁了什么**，而不只是「检索错了」。
+            [{"name": tc[0], "elapsed": round(tc[1], 3), "empty": bool(tc[3]),
+              **(({"category": tc[4]}) if len(tc) > 4 and tc[4] else {})}
+             for tc in trace.tool_calls]
         )
         retrieved_json, rid_truncated = _truncate_json(trace.retrieved_ids)
         # 截断留痕：读到 end_reason 带这个后缀就知道 tool_calls/retrieved_ids 不是全量
@@ -128,8 +163,9 @@ def save(trace, session_id: str, user_id: str, query: str, answer: str) -> bool:
             cur.execute(
                 "INSERT INTO traces (trace_id, session_id, user_id, query, answer, "
                 "route_source, end_reason, total_sec, total_tokens, cache_hit, cache_miss, "
-                "llm_steps, tool_calls, retrieved_ids, prompt_version, kb_version, created_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "reasoning_tokens, llm_steps, tool_calls, retrieved_ids, prompt_version, "
+                "kb_version, created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     _clean(trace.trace_id, 36),
                     _clean(session_id, 64),
@@ -142,6 +178,7 @@ def save(trace, session_id: str, user_id: str, query: str, answer: str) -> bool:
                     int(s["总 token 消耗"]),
                     int(s["缓存命中 token"]),
                     int(s["缓存未命中 token"]),
+                    int(s["推理 token"]),           # 思考模式思维链消耗（主循环 + 摘要）
                     int(s["LLM 调用次数"]),
                     tool_calls_json,
                     retrieved_json,

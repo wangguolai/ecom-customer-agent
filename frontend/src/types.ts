@@ -52,4 +52,12 @@ export interface StreamEvent {
 export interface MenuItem {
   label: string
   text: string
+  /**
+   * 后端白名单里的**菜单 id**（`orders` / `logistics` / …），**不是工具名**。
+   *
+   * 服务端只拿它决定路由，**不信任 `text` 做路由判断**——`menu_intent` 与 `message`
+   * 一样是客户端可控输入，传工具名等于开放任意工具调用入口。
+   * id 的单一真源在 `src/config/rules.py` 的 `MENU_INTENTS`。
+   */
+  intent: string
 }

@@ -131,6 +131,7 @@ def _usage_dict(usage) -> dict:
 # 裁判（语义层）：判 accuracy + relevance + faithfulness
 # 裁判提示词已移到 src/config/prompts.py（提示词统一处），此处只引用
 from src.config.prompts import JUDGE_SYSTEM
+from src.config.settings import REASONING_EFFORT_MECHANICAL
 
 
 async def _judge(query: str, answer: str, expected: str) -> dict:
@@ -141,6 +142,12 @@ async def _judge(query: str, answer: str, expected: str) -> dict:
         msg, usage = await chat_with_usage(
             [{"role": "system", "content": JUDGE_SYSTEM}, {"role": "user", "content": user}],
             temperature=0.0,
+            # ⚠️ 裁判是**测量仪器，必须钉死**，不能跟着被测系统的旋钮走。
+            # 曾经这里不传 effort → 走 `settings.REASONING_EFFORT` 全局值 → 跑
+            # `--effort low` 做 A/B 时**裁判本身也被切到 low**，两臂的**评分标准不同**，
+            # 分数不可比（这是个方法学缺陷，不是风格问题）。
+            # 传常量而非默认值，才真正解耦。
+            reasoning_effort=REASONING_EFFORT_MECHANICAL,
         )
         verdict = _parse_judge(msg.content or "")
         verdict["usage"] = _usage_dict(usage)  # token 消耗落盘，让评测成本可见
